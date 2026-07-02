@@ -8,6 +8,12 @@
 
 发起智能文档内容导出任务（异步）。传入 `docid` 或 `url` 和 `content_type`，返回 `task_id`。
 
+### 命令
+
+```bash
+wecom-cli doc smartpage_export_task '<JSON 参数>'
+```
+
 ### 技能定义
 
 ```json
@@ -82,6 +88,12 @@
 ## 第二步：smartpage_get_export_result — 查询导出结果
 
 查询智能文档导出任务进度。传入 `task_id` 进行轮询，当 `task_done` 为 `true` 时返回完整文档内容。
+
+### 命令
+
+```bash
+wecom-cli doc smartpage_get_export_result '<JSON 参数>'
+```
 
 ### 技能定义
 
