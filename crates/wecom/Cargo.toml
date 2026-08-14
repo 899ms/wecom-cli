@@ -1,0 +1,49 @@
+[package]
+name = "wecom"
+version = "1.1.0"
+edition = "2024"
+
+[features]
+custom-endpoint = []
+
+[lib]
+name = "wecom"
+path = "src/lib.rs"
+
+[dependencies]
+anstyle = "1"
+base64 = "0.23"
+clap = { version = "4.6.5", features = ["derive", "string"] }
+dirs = "6.0.0"
+futures = "0.3.33"
+indexmap = { workspace = true }
+rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "stream", "rustls"] }
+schemars = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+tempfile = { workspace = true }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt", "time", "sync", "fs", "macros", "rt-multi-thread"] }
+tracing = { workspace = true }
+wecom-transport = { path = "../wecom-transport", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+jsonrepair-rs = { version = "0.2", features = ["serde"] }
+strsim = "0.11.1"
+
+[dev-dependencies]
+assert-json-diff = "2"
+filetime = "0.2"
+mockito = "1"
+http = "1"
+tempfile = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["json", "registry", "fmt"] }
+wiremock = "0.6"
+
+[build-dependencies]
+time = { version = "0.3", features = ["formatting"] }
+
+[[test]]
+name = "e2e"
+path = "test-e2e/run.rs"

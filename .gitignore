@@ -27,3 +27,5 @@ packages/darwin-arm64/bin/
 packages/darwin-x64/bin/
 packages/linux-x64/bin/
 packages/win32-x64/bin/
+prompts.md
+aibot_send_skills.md

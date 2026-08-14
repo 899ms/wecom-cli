@@ -1,0 +1,62 @@
+/// P0：CliRun::resolver() per-run 覆盖 PathResolver
+/// 条件：Client 无全局 resolver，run 时注入映射 "virtual://<rest>" → "<physical_dir>/<rest>"
+/// 断言：文件创建在物理目录下，DownloadResult.file_path 为物理路径
+#[tokio::test]
+async fn run() {
+    let server = wiremock::MockServer::start().await;
+    setup_discovery_mocks(&server).await;
+
+    setup_method_mock(
+        &server,
+        "/department/list",
+        api_response(&json!({"departments": [{"id": "2"}]})),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let physical_dir = tmp.path().to_path_buf();
+
+    let resolver: PathResolver = Arc::new(move |p: &Path| {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("virtual://") {
+            Ok(physical_dir.join(rest))
+        } else {
+            Ok(p.to_path_buf())
+        }
+    });
+
+    let buf = SharedBuf::new();
+    // Client built without global resolver
+    let client = wecom::Client::builder()
+        .home_dir(tmp.path())
+        .tmp_dir(tmp.path())
+        .transport(build_test_http_transport("test-token", &server.uri()))
+        .writable_dirs(vec![tmp.path().to_path_buf()])
+        .build()
+        .unwrap();
+
+    let result = client
+        .run(hr_dept_list_argv(&["--output", "virtual://run_out.json"]))
+        .resolver(resolver)
+        .output(wecom::CliRunOutput::new(buf.clone()))
+        .await;
+    assert_cli_ok(&result, &buf, "path resolver via CliRun");
+
+    // CLI stdout should be DownloadResult with mapped physical path
+    let v = assert_download_result(&buf, "application/json");
+    let file_path = v["file_path"].as_str().unwrap();
+    assert!(
+        !file_path.starts_with("virtual://"),
+        "file_path should be a physical path, got: {file_path}"
+    );
+    assert!(
+        file_path.contains("run_out.json"),
+        "file_path should contain run_out.json, got: {file_path}"
+    );
+
+    // FS: file exists at the mapped physical path
+    let expected = tmp.path().join("run_out.json");
+    let content = assert_file_exists(&expected);
+    let file_v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert!(file_v["departments"].is_array());
+}

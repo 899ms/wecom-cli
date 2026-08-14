@@ -3,8 +3,7 @@
   "version": "0.1.9",
   "description": "The official CLI for WeCom",
   "keywords": [
-    "wecom-cli",
-    "mcp"
+    "wecom-cli"
   ],
   "homepage": "https://github.com/WecomTeam/wecom-cli#readme",
   "bugs": {
@@ -24,7 +23,12 @@
     "README.md"
   ],
   "scripts": {
-    "prepare": "git config core.hooksPath .githooks"
+    "check": "cargo check --workspace --all-targets",
+    "fmt": "git ls-files '*.rs' | xargs rustfmt +nightly",
+    "fmt:check": "git ls-files '*.rs' | xargs rustfmt +nightly --check",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "prepare": "lefthook install",
+    "test": "cargo test --workspace --all-targets --features custom-endpoint"
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
@@ -37,11 +41,12 @@
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.5",
     "globals": "^17.4.0",
+    "lefthook": "^2.1.4",
     "prettier": "^3.8.1",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.57.2"
   },
-  "packageManager": "pnpm@10.32.1",
+  "packageManager": "pnpm@11.21.0",
   "engines": {
     "node": ">=18"
   }
