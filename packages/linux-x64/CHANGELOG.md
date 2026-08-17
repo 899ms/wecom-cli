@@ -1,5 +1,7 @@
 # @wecom/cli-linux-x64
 
+## 1.1.0
+
 ## 0.1.9
 
 ### Patch Changes
