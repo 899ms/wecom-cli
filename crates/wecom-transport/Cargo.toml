@@ -1,7 +1,11 @@
 [package]
 name = "wecom-transport"
-version = "1.1.0"
+version.workspace = true
 edition = "2024"
+description = "Transport layer for the WeCom CLI: HTTP backend, endpoint catalog and long-task polling"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 bytes = "1"
