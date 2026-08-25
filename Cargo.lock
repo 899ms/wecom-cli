@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "wecom"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anstyle",
  "assert-json-diff",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "wecom-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "wecom-transport"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "assert-json-diff",
  "bytes",
