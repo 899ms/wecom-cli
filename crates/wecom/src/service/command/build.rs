@@ -336,6 +336,8 @@ mod tests {
             skills: vec![],
             base_url: Some("https://api.test".to_string()),
             schemas: indexmap::IndexMap::new(),
+            id: None,
+            remote_doc: None,
             resource_tree: ServiceResource {
                 methods: indexmap::IndexMap::new(),
                 resources: top_resources,
@@ -357,6 +359,7 @@ mod tests {
             name: "contact".into(),
             description: String::new(),
             hidden: false,
+            alias: vec![],
         };
         let schema = build_contact_schema();
         let cmd = build_service_cmd(&empty_helpers(), &info, Some(&schema));
@@ -395,6 +398,8 @@ mod tests {
             skills: vec![],
             base_url: Some("https://api.test".to_string()),
             schemas: indexmap::IndexMap::new(),
+            id: None,
+            remote_doc: None,
             resource_tree: ServiceResource {
                 methods: indexmap::IndexMap::new(),
                 resources: top_resources,
@@ -405,11 +410,46 @@ mod tests {
             name: "contact".into(),
             description: String::new(),
             hidden: false,
+            alias: vec![],
         };
         let cmd = build_service_cmd(&empty_helpers(), &info, Some(&schema));
         let users_cmd = cmd.find_subcommand("users").unwrap();
         // 真实 resource 不应被隐藏
         assert!(!users_cmd.is_hide_set());
+    }
+
+    /// P0：[build_service_cmd] service 级 --help 由 clap 自动 help 处理
+    /// 条件：无 schema 的 service 命令执行 `try_get_matches_from(["hr", "--help"])`
+    /// 断言：返回 DisplayHelp（run.rs 据此拦截做 remote_doc 远程帮助 / 本地帮助渲染）
+    #[test]
+    fn build_service_cmd_help_returns_display_help() {
+        let info = ServiceInfo {
+            name: "hr".into(),
+            description: "HR service".into(),
+            hidden: false,
+            alias: vec![],
+        };
+        let cmd = build_service_cmd(&empty_helpers(), &info, None);
+        let err = cmd.try_get_matches_from(["hr", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    /// P0：[build_service_cmd] resource group 级 --help 正常下钻
+    /// 条件：含 users 资源的服务命令执行 `try_get_matches_from(["c", "users", "--help"])`
+    /// 断言：返回 DisplayHelp（--help 下钻到 resource group 的自动 help，而非被 service 级拦截）
+    #[test]
+    fn build_service_cmd_resource_help_drills_down() {
+        let info = ServiceInfo {
+            name: "contact".into(),
+            description: String::new(),
+            hidden: false,
+            alias: vec![],
+        };
+        let cmd = build_service_cmd(&empty_helpers(), &info, Some(&build_contact_schema()));
+        let err = cmd
+            .try_get_matches_from(["contact", "users", "--help"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     /// P0：[augment_alias_cmds] alias 中间段 reuse 现有 group，仅在末段新增 hidden 叶子
@@ -437,6 +477,8 @@ mod tests {
             skills: vec![],
             base_url: Some("https://api.test".to_string()),
             schemas: indexmap::IndexMap::new(),
+            id: None,
+            remote_doc: None,
             resource_tree: ServiceResource {
                 methods: indexmap::IndexMap::new(),
                 resources: top_resources,
@@ -447,6 +489,7 @@ mod tests {
             name: "contact".into(),
             description: String::new(),
             hidden: false,
+            alias: vec![],
         };
         let cmd = build_service_cmd(&empty_helpers(), &info, Some(&schema));
 

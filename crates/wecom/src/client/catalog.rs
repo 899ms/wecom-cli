@@ -7,7 +7,7 @@
 //! [`CatalogKey::builtin_default`]，保证默认行为与现状逐字段一致。目录机制
 //! （覆写 / 变换）由 [`wecom_transport::EndpointCatalog`] 泛型实现提供。
 
-use wecom_transport::{CatalogKey, Endpoint, HttpEndpoint, RequestEnvelope};
+use wecom_transport::{CatalogKey, Endpoint, EndpointHttpExt, HttpEndpoint, RequestEnvelope};
 
 /// WeCom HTTP 网关请求信封：`{"payload": "<json-string>"}`。
 ///
@@ -43,6 +43,8 @@ pub enum EndpointKey {
     TaskQuery,
     /// schema 驱动方法的默认能力袋。
     ServiceMethod,
+    /// 远程文档生成（`remote_doc`）：`--doc` / `--help` / `--schema` 的远端渲染。
+    RemoteDoc,
 }
 
 impl CatalogKey for EndpointKey {
@@ -52,6 +54,7 @@ impl CatalogKey for EndpointKey {
         EndpointKey::ServiceDiscovery,
         EndpointKey::TaskQuery,
         EndpointKey::ServiceMethod,
+        EndpointKey::RemoteDoc,
     ];
 
     /// 内建默认表：登记各内置 endpoint 的默认值，未覆写的 key 回退到内建默认。
@@ -72,6 +75,10 @@ impl CatalogKey for EndpointKey {
             EndpointKey::ServiceMethod => {
                 Endpoint::new().with(HttpEndpoint::new("").with_req_envelope(PayloadStringReq))
             }
+            // 远程文档：请求 `{"id": ..., "type": doc|help|schema}`，响应 result 为 `{"doc": <文档文本>}`。
+            EndpointKey::RemoteDoc => Endpoint::new()
+                .with(HttpEndpoint::new("/remote_doc/get"))
+                .with_req_envelope(PayloadStringReq),
         }
     }
 }
@@ -113,6 +120,23 @@ mod tests {
         assert_eq!(ep.base_url(), "");
     }
 
+    /// P0：[PayloadStringReq::name] 返回 "payload-string"
+    /// 条件：调用 PayloadStringReq.name()
+    /// 断言：返回策略标签 "payload-string"
+    #[test]
+    fn payload_string_req_name() {
+        assert_eq!(PayloadStringReq.name(), "payload-string");
+    }
+
+    /// P0：[PayloadStringReq::encode] 将 payload 包进 JSON 字符串信封
+    /// 条件：encode({"a": 1})
+    /// 断言：返回 {"payload": "{\"a\":1}"}
+    #[test]
+    fn payload_string_req_encodes_payload_as_string() {
+        let encoded = PayloadStringReq.encode(serde_json::json!({"a": 1}));
+        assert_eq!(encoded, serde_json::json!({ "payload": "{\"a\":1}" }));
+    }
+
     /// P1：[EndpointCatalog::resolve] ServiceMethod 默认请求信封为 payload-string
     /// 条件：默认 catalog，resolve(ServiceMethod)
     /// 断言：path 为空串经规范化后为 "/"（由 MethodHandle 以 schema path 派生），
@@ -124,5 +148,19 @@ mod tests {
         assert_eq!(ep.path(), "/");
         assert_eq!(ep.req_envelope().name(), "payload-string");
         assert_eq!(ep.res_envelope().name(), "gateway");
+    }
+
+    /// P0：[EndpointCatalog::resolve] RemoteDoc 默认 endpoint
+    /// 条件：默认 catalog，resolve(RemoteDoc)
+    /// 断言：path == "/remote_doc/get"，base_url 为空（transport 执行时回填
+    ///       默认），req 信封为 payload-string
+    #[test]
+    fn resolve_remote_doc_defaults() {
+        let catalog = EndpointCatalog::default();
+        let ep = catalog.resolve(EndpointKey::RemoteDoc);
+        assert_eq!(ep.path(), "/remote_doc/get");
+        // base_url is None — transport fills at execution time.
+        assert_eq!(ep.base_url(), "");
+        assert_eq!(ep.req_envelope().name(), "payload-string");
     }
 }

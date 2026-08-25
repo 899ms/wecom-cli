@@ -30,18 +30,22 @@ pub fn check_has_octet_stream(schema: &schema::JsonSchema) -> bool {
     false
 }
 
+/// 提取 multipart 上传的文件字段名集合（供构建表单与再次构建闭包复用）。
+pub fn multipart_file_fields(directives: &[Directive<'_>]) -> HashSet<String> {
+    directives
+        .iter()
+        .filter_map(|d| match d {
+            Directive::UploadMultipart { path, .. } => Some(json_path::segments_to_path(path)),
+            _ => None,
+        })
+        .collect()
+}
+
 pub async fn build_multipart_form(
     fs: &fs::Fs,
     payload: &serde_json::Value,
-    directives: &[Directive<'_>],
+    file_fields: &HashSet<String>,
 ) -> Result<reqwest::multipart::Form> {
-    let mut file_fields = HashSet::new();
-    for d in directives {
-        if let Directive::UploadMultipart { path, .. } = d {
-            file_fields.insert(json_path::segments_to_path(path));
-        }
-    }
-
     let parts = json_path::flatten_value(payload);
     let mut form = reqwest::multipart::Form::new();
 
@@ -154,13 +158,41 @@ mod tests {
     // ── build_multipart_form ──
 
     /// P0：[build_multipart_form] 普通文本字段构建为 text 表单
-    /// 条件：payload 含 key=value 文本字段，无 UploadMultipart directive
-    /// 断言：返回的 Form 包含 text 字段
+    /// 条件：payload 含 key=value 文本字段，无文件字段集合
+    /// 断言：返回的 Form 构建成功
     #[tokio::test]
     async fn build_multipart_form_text_only() {
         let tmp = tempfile::tempdir().unwrap();
         let fs = crate::fs::Fs::new(tmp.path());
         let payload = serde_json::json!({"name": "test.txt"});
-        let _form = build_multipart_form(&fs, &payload, &[]).await.unwrap();
+        let file_fields = HashSet::new();
+        let _form = build_multipart_form(&fs, &payload, &file_fields)
+            .await
+            .unwrap();
+    }
+
+    /// P0：[multipart_file_fields] 提取 UploadMultipart 指令中的文件字段名
+    /// 条件：directives 含两个 UploadMultipart（path 分别为 ["file"] 与 ["nested","data"]）
+    /// 断言：返回集合含 "file" 与 "nested.data"
+    #[test]
+    fn multipart_file_fields_extracts_paths() {
+        use crate::json_path::PathSegment;
+
+        let directives = vec![
+            Directive::UploadMultipart {
+                path: vec![PathSegment::Key("file".into())],
+                file_path: "/tmp/a.bin".into(),
+            },
+            Directive::UploadMultipart {
+                path: vec![
+                    PathSegment::Key("nested".into()),
+                    PathSegment::Key("data".into()),
+                ],
+                file_path: "/tmp/b.bin".into(),
+            },
+        ];
+        let fields = multipart_file_fields(&directives);
+        assert!(fields.contains("file"));
+        assert!(fields.contains("nested.data"));
     }
 }

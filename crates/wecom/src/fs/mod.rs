@@ -72,6 +72,7 @@ pub type PathResolver = Arc<dyn Fn(&Path) -> Result<PathBuf> + Send + Sync>;
 ///     Some(&["/project"]),                      // writable
 /// );
 /// ```
+#[derive(Clone)]
 pub struct Fs {
     cwd: PathBuf,
     readable_dirs: Option<Vec<PathBuf>>,

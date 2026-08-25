@@ -8,7 +8,9 @@ use std::sync::Arc;
 use super::endpoint::{EndpointHttpExt, HttpEndpoint};
 use super::envelope::ResponseEnvelope;
 use super::{HttpTransportBackend, polling, protocol, resumable};
-use crate::http_client::{HttpRequest, HttpRequestPayload};
+use crate::http_client::{
+    HttpRequest, HttpRequestBody, HttpRequestPayload, HttpRequestPayloadKind,
+};
 use crate::traits::TransportResponse;
 use crate::{Endpoint, Error, ExecuteOutput, HttpClient, RequestOptions, Result, WireOptions};
 
@@ -18,34 +20,52 @@ use crate::{Endpoint, Error, ExecuteOutput, HttpClient, RequestOptions, Result, 
 /// wrapping to a JSON payload (e.g. the wecom HTTP gateway expects the
 /// business JSON serialized as a string under a `payload` key, i.e.
 /// `{"payload": "<json-string>"}`). Endpoints without a request envelope and
-/// multipart forms are passed through unchanged. Applied before ranged replay
-/// is computed so resumed segments replay the wrapped body.
-pub fn apply_request_envelope<'a>(
+/// multipart forms are passed through unchanged. Composed into the
+/// [`HttpRequestPayload`] by [`with_request_envelope`] at the [`pipeline_execute`]
+/// entry — the protocol pipeline's single composition point.
+pub fn apply_request_envelope(endpoint: &Endpoint, data: HttpRequestBody) -> HttpRequestBody {
+    match data {
+        HttpRequestBody::Json(value) => HttpRequestBody::Json(Arc::new(
+            endpoint.req_envelope().encode(value.as_ref().clone()),
+        )),
+        form => form,
+    }
+}
+
+/// Compose the endpoint's request-side envelope wrapping into a
+/// [`HttpRequestPayload`]: build the inner factory → [`apply_request_envelope`] →
+/// yield. Composition is closure stacking (lazy materialization): forms pass
+/// through `apply_request_envelope` unchanged and are never materialized
+/// early; JSON is wrapped once per build, so replays produce byte-identical
+/// bodies.
+///
+/// Called exactly once at the [`pipeline_execute`] entry; callers always pass
+/// the raw, unwrapped factory. Raw posts
+/// ([`HttpTransportBackend::post`](crate::HttpTransportBackend::post)) bypass
+/// the pipeline and are therefore never wrapped.
+pub fn with_request_envelope(
     endpoint: &Endpoint,
-    payload: HttpRequestPayload<'a>,
-) -> HttpRequestPayload<'a> {
-    let value = match payload {
-        HttpRequestPayload::Json(value) => value,
-        form => return form,
-    };
-    HttpRequestPayload::Json(Cow::Owned(
-        endpoint.req_envelope().encode(value.into_owned()),
-    ))
+    payload: HttpRequestPayload,
+) -> HttpRequestPayload {
+    let endpoint = endpoint.clone();
+    // 组合工厂透传内层 kind：Form 组合后仍是 Form（信封恒等透传），Json 仍为 Json。
+    HttpRequestPayload::new(payload.kind(), move || {
+        let inner = payload.clone();
+        let endpoint = endpoint.clone();
+        async move { Ok(apply_request_envelope(&endpoint, inner.build().await?)) }
+    })
 }
 
 // ── Ranged download ───────────────────────────────────────────────
 
-/// Compute `(clamped chunk size, replay payload)` for an eligible ranged
-/// download. Eligible only for JSON payloads (multipart cannot be replayed)
-/// carrying a positive `range_size` on the endpoint's [`HttpEndpoint`].
-pub fn compute_ranged(
-    endpoint: &Endpoint,
-    payload: &HttpRequestPayload<'_>,
-) -> Option<(u64, serde_json::Value)> {
-    match (endpoint.range_size(), payload) {
-        (Some(raw), HttpRequestPayload::Json(cow)) if raw > 0 => {
-            Some((resumable::clamp_size(raw), (**cow).clone()))
-        }
+/// Compute the clamped chunk size for an eligible ranged download.
+/// Eligible only for JSON payloads (multipart uploads are not eligible)
+/// carrying a positive `range_size` on the endpoint's [`HttpEndpoint`]. The
+/// payload kind is known at factory construction time, so this never
+/// materializes the payload; it only answers "chunk size".
+pub fn compute_ranged(endpoint: &Endpoint, payload: &HttpRequestPayload) -> Option<u64> {
+    match (endpoint.range_size(), payload.kind()) {
+        (Some(raw), HttpRequestPayloadKind::Json) if raw > 0 => Some(resumable::clamp_size(raw)),
         _ => None,
     }
 }
@@ -81,37 +101,45 @@ pub struct PollDefaults<'a> {
     pub base_url: &'a str,
 }
 
-/// 唯一一份 HTTP 协议流水线：请求信封 wrap → range 回填 → 发送（签名等
-/// 发送前加工由 [`HttpClient`] 实现自行内联）→ 二进制/续传 → 响应信封 parse →
-/// 长任务轮询 → 抽取。
+/// The single HTTP protocol pipeline: compose the request-side envelope wrap
+/// into the [`HttpRequestPayload`] at the entry (closure stacking, lazy
+/// materialization) → derive the first-segment `Range` header from the
+/// endpoint's `range_size` (JSON payloads only) → build the `HttpRequest`
+/// → binary/resumable download (segments re-materialized via the composed
+/// factory, each segment declares its own `Range` header) → response envelope
+/// parse → long-task polling → extraction.
 pub async fn pipeline_execute<'a>(
     client: Arc<dyn HttpClient>,
     endpoint: &'a Endpoint,
-    payload: HttpRequestPayload<'a>,
+    payload: HttpRequestPayload,
     options: RequestOptions,
     defaults: PollDefaults<'a>,
 ) -> Result<TransportResponse> {
-    // 请求信封 wrap + range 回填。
-    let payload = apply_request_envelope(endpoint, payload);
+    // Single composition point for the envelope wrap: the downstream
+    // `HttpRequest` and the `pipeline_binary` resume segments all use the
+    // composed factory; raw posts bypass this path and stay unwrapped.
+    let payload = with_request_envelope(endpoint, payload);
     let ranged = compute_ranged(endpoint, &payload);
 
+    // 首段 Range 由 pipeline 派生（endpoint 能力声明 + JSON 载荷判定），
+    // 只在局部 wire 上生效；续传段由 pipeline_binary 闭包自行声明。
     let mut wire = options.wire.clone();
-    if let Some((size, _)) = ranged.as_ref() {
+    if let Some(size) = ranged {
         wire.headers.insert(
             reqwest::header::RANGE,
-            resumable::range_header_value(0, *size)?,
+            resumable::range_header_value(0, size)?,
         );
     }
-
-    let req = HttpRequest::new(&*client, Cow::Borrowed(endpoint), payload).with_options(wire);
+    let req =
+        HttpRequest::new(&*client, Cow::Borrowed(endpoint), payload.clone()).with_options(wire);
     let response = req.await?;
 
-    // 非 JSON → 二进制透传（可选续传）。
     if !response.is_json() {
         return Ok(pipeline_binary(
             client,
             response,
             ranged,
+            payload,
             endpoint.clone(),
             options.wire,
         ));
@@ -125,26 +153,29 @@ pub async fn pipeline_execute<'a>(
 /// When the first response is partial (`206` or carries `Content-Range`)
 /// and a ranged download was requested, its body is replaced with an
 /// auto-resuming stream that replays the request (through the cloned
-/// [`HttpClient`]) for each Range segment; otherwise the response is passed
-/// through untouched.
+/// [`HttpClient`] and the [`HttpRequestPayload`], re-materialized per segment)
+/// for each Range segment; otherwise the response is passed through
+/// untouched.
 pub(super) fn pipeline_binary(
     client: Arc<dyn HttpClient>,
     response: crate::http_client::HttpResponse,
-    ranged: Option<(u64, serde_json::Value)>,
+    ranged: Option<u64>,
+    payload: HttpRequestPayload,
     endpoint: Endpoint,
     wire: WireOptions,
 ) -> TransportResponse {
     let is_partial = response.status().as_u16() == 206 || response.content_range().is_some();
-    let Some((size, replay)) = ranged.filter(|_| is_partial) else {
+    let Some(size) = ranged.filter(|_| is_partial) else {
         return TransportResponse::Binary(response);
     };
 
     let resumable = resumable::into_resumable(response, size, move |start, chunk| {
         let client = client.clone();
         let endpoint = endpoint.clone();
-        let payload = replay.clone();
+        let payload = payload.clone();
         let mut wire = wire.clone();
         async move {
+            // 续传段自行构造 Range 头（Range 由调用方声明，发送链纯透传）。
             wire.headers.insert(
                 reqwest::header::RANGE,
                 resumable::range_header_value(start, chunk)?,
@@ -250,28 +281,31 @@ pub(super) fn decode_result(
 #[allow(clippy::needless_update)]
 #[cfg(test)]
 mod tests {
-    //! ## 模块摘要：http::request（执行流水线）
+    //! ## Module summary: http::request (execution pipeline)
     //!
-    //! ### 关键接口
-    //! - [apply_request_envelope] — 应用 endpoint 信封策略的请求侧封装
-    //! - [compute_ranged] — 计算分片下载的 chunk size 与可重放 payload
-    //! - [resolve_endpoint_defaults] — 用 transport 级默认值填充 endpoint
-    //! - [pipeline_binary] — 非 JSON 响应→ Binary，进入续拉流（可选）
-    //! - [poll_if_long_task] — 长任务轮询，无 taskid 时 no-op
-    //! - [decode_result] — 提取 API 响应 `result` 字段并解析为业务 JSON
+    //! ### Key interfaces
+    //! - [apply_request_envelope] — apply the endpoint's request-side envelope wrapping
+    //! - [with_request_envelope] — compose the request-side envelope wrap into a
+    //!   HttpRequestPayload (single composition point at the pipeline entry)
+    //! - [compute_ranged] — compute the chunk size for a segmented download
+    //! - [resolve_endpoint_defaults] — fill the endpoint with transport-level defaults
+    //! - [pipeline_binary] — non-JSON response → Binary, optionally into the resumable stream
+    //! - [poll_if_long_task] — long-task polling; no-op without a taskid
+    //! - [decode_result] — extract the API response `result` field into business JSON
     //!
-    //! ### 关键分支与异常路径
-    //! - execute 普通 JSON 成功 → TransportResponse::Json
-    //! - execute 非 JSON Content-Type → TransportResponse::Binary（含 Range 续拉）
-    //! - execute error.code != 0 → Error::Api
-    //! - execute result 缺失/非法 JSON → Error::Parse
-    //! - execute header_error 短路 → 立即返回错误
-    //! - 长任务轮询透传 transport.headers + 请求级 headers
-    //! - ranged 下载：range_size=Some(n>0) + JSON payload 进入续拉，0/multipart 为 no-op
+    //! ### Key branches and error paths
+    //! - plain JSON success → TransportResponse::Json
+    //! - non-JSON Content-Type → TransportResponse::Binary (incl. Range resume)
+    //! - error.code != 0 → Error::Api
+    //! - missing/invalid-JSON result → Error::Parse
+    //! - header_error short-circuit → returns the error immediately
+    //! - long-task polling forwards transport.headers + request-level headers
+    //! - ranged download: range_size=Some(n>0) + JSON payload enters the resume
+    //!   stream; 0/multipart is a no-op
     //!
-    //! ### 上下游交互
-    //! - 上游：[super::HttpTransportBackend] 的 execute() 方法
-    //! - 下游：polling、protocol、resumable 子模块
+    //! ### Upstream/downstream
+    //! - upstream: the execute() method of [super::HttpTransportBackend]
+    //! - downstream: the polling, protocol, and resumable submodules
 
     use std::borrow::Cow;
     use std::sync::Arc;
@@ -329,6 +363,15 @@ mod tests {
     impl Match for HeaderEq {
         fn matches(&self, request: &Request) -> bool {
             request.headers.get(self.name).and_then(|v| v.to_str().ok()) == Some(self.value)
+        }
+    }
+
+    /// 断言 `range` 头恰好一个值——`HeaderEq` 的 `get` 只取第一个值，
+    /// 双头 `[bytes=10-19, bytes=0-9]` 也会命中；数量断言保证续传段不携带重复 Range。
+    struct SingleRangeHeader;
+    impl Match for SingleRangeHeader {
+        fn matches(&self, request: &Request) -> bool {
+            request.headers.get_all("range").iter().count() == 1
         }
     }
 
@@ -451,6 +494,8 @@ mod tests {
                 name: "range",
                 value: "bytes=10-19",
             })
+            // 续传段必须恰好一个 Range 头（修复前双头会在此失败）。
+            .and(SingleRangeHeader)
             .respond_with(
                 ResponseTemplate::new(206)
                     .insert_header("Content-Type", "application/octet-stream")
@@ -463,6 +508,83 @@ mod tests {
 
         let transport = make_transport();
         let endpoint = ep(&server.uri(), "/dl").with_range_size(Some(10));
+        let resp = transport.invoke(&endpoint, json!({})).await.unwrap();
+
+        let mut stream = resp.into_binary().unwrap().bytes_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), 20);
+    }
+
+    /// P0: [TransportRequest] resuming a download on an endpoint with a
+    ///     request envelope wraps every segment exactly once.
+    /// Setup: WrapPayloadReq + range_size=Some(10); first segment 206 → resume
+    /// the second segment.
+    /// Assert: both the first and the resumed segment carry a single-wrapped
+    /// wire body `{"payload":"{}"}` (composed-factory path: resumed segments
+    /// are re-sent via raw post — neither double-wrapped nor unwrapped); the
+    /// Range header stays correct and unique per segment.
+    #[tokio::test]
+    async fn execute_ranged_with_envelope_wraps_each_segment_exactly_once() {
+        /// Assert the body is single-wrapped (unwrapped = raw JSON, double
+        /// wrap = payload nested inside payload; neither matches).
+        struct WrappedOnce;
+        impl Match for WrappedOnce {
+            fn matches(&self, request: &Request) -> bool {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .map(|b| b == json!({ "payload": json!({}).to_string() }))
+                    .unwrap_or(false)
+            }
+        }
+
+        let server = MockServer::start().await;
+        let seg0 = vec![0xA5u8; 10];
+        let seg1 = vec![0x5Au8; 10];
+        let mut expected = seg0.clone();
+        expected.extend_from_slice(&seg1);
+
+        Mock::given(method("POST"))
+            .and(path("/dl"))
+            .and(WrappedOnce)
+            .and(HeaderEq {
+                name: "range",
+                value: "bytes=0-9",
+            })
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .insert_header("Content-Range", "bytes 0-9/20")
+                    .set_body_bytes(seg0),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/dl"))
+            .and(WrappedOnce)
+            .and(HeaderEq {
+                name: "range",
+                value: "bytes=10-19",
+            })
+            .and(SingleRangeHeader)
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .insert_header("Content-Range", "bytes 10-19/20")
+                    .set_body_bytes(seg1),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = make_transport();
+        let endpoint = ep(&server.uri(), "/dl")
+            .with_req_envelope(WrapPayloadReq)
+            .with_range_size(Some(10));
         let resp = transport.invoke(&endpoint, json!({})).await.unwrap();
 
         let mut stream = resp.into_binary().unwrap().bytes_stream();
@@ -503,6 +625,74 @@ mod tests {
         }
         assert_eq!(buf, body);
         assert_eq!(buf.len(), 8);
+    }
+
+    // ── pipeline 首段 Range 派生（endpoint.range_size + JSON 载荷）──
+
+    /// P0：[pipeline_execute] ranged endpoint + JSON 响应时首段带默认 Range 头
+    /// 条件：endpoint range_size=Some(10)，JSON payload，mock 返回 JSON 200
+    /// 断言：wire 上 Range 恰为 bytes=0-9 且数量 == 1（由 pipeline 派生）
+    #[tokio::test]
+    async fn ranged_endpoint_json_response_first_segment_range() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dl"))
+            .and(HeaderEq {
+                name: "range",
+                value: "bytes=0-9",
+            })
+            .and(SingleRangeHeader)
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": "{\"ok\":true}"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = make_transport();
+        let endpoint = ep(&server.uri(), "/dl").with_range_size(Some(10));
+        let resp = transport.invoke(&endpoint, json!({})).await.unwrap();
+        assert!(matches!(resp, TransportResponse::Json(_)));
+    }
+
+    /// P0：[HttpTransportBackend::post] raw post 纯透传，调用方 headers 中的 Range 照发
+    /// 条件：headers 手工带 Range: bytes=10-19，端点无 range_size
+    /// 断言：wire 上 Range 恰为 bytes=10-19（发送链不再派生，也不剥离）
+    #[tokio::test]
+    async fn raw_post_headers_range_passthrough() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dl"))
+            .and(HeaderEq {
+                name: "range",
+                value: "bytes=10-19",
+            })
+            .and(SingleRangeHeader)
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": "{\"ok\":true}"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = make_transport();
+        let endpoint = ep(&server.uri(), "/dl");
+        let resp = transport
+            .post(&endpoint, json!({}))
+            .with_options(WireOptions {
+                headers: {
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(
+                        reqwest::header::RANGE,
+                        reqwest::header::HeaderValue::from_static("bytes=10-19"),
+                    );
+                    headers
+                },
+                ..WireOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
     }
 
     /// P1：[TransportRequest] ranged(1) 最小分片单字节精确终止
@@ -557,9 +747,12 @@ mod tests {
             .mount(&server)
             .await;
 
+        use crate::http_client::HttpRequestPayload;
         let transport = make_transport();
         let endpoint = ep(&server.uri(), "/dl").with_range_size(Some(10));
-        let form = reqwest::multipart::Form::new().text("k", "v");
+        let form = HttpRequestPayload::form(|| async {
+            Ok(reqwest::multipart::Form::new().text("k", "v"))
+        });
         let resp = transport.invoke(&endpoint, form).await.unwrap();
         assert!(matches!(resp, TransportResponse::Binary(_)));
 
@@ -602,6 +795,8 @@ mod tests {
                 name: "range",
                 value: "bytes=10-19",
             })
+            // 续传段必须恰好一个 Range 头（修复前双头会在此失败）。
+            .and(SingleRangeHeader)
             .respond_with(
                 ResponseTemplate::new(206)
                     .insert_header("Content-Type", "application/octet-stream")
@@ -654,6 +849,8 @@ mod tests {
                 name: "range",
                 value: "bytes=10-19",
             })
+            // 续传段必须恰好一个 Range 头（修复前双头会在此失败）。
+            .and(SingleRangeHeader)
             .respond_with(ResponseTemplate::new(416))
             .up_to_n_times(1)
             .mount(&server)
@@ -1040,8 +1237,11 @@ mod tests {
 
     // ── Envelope-driven body wrapping ─────────────────────────
 
-    /// P0：[HttpTransportBackend::execute] endpoint 挂自定义请求信封（wrap-payload）时把
-    ///      JSON body 包裹为 `{"payload": "<json-string>"}`
+    /// P0: [HttpTransportBackend::execute] an endpoint opted into a custom
+    ///     request envelope (wrap-payload) wraps the JSON body as
+    ///     `{"payload": "<json-string>"}`; the exact body-equality assertion
+    ///     also pins "wrapped exactly once" (composed-factory path — a double
+    ///     wrap would nest payload inside payload and fail).
     #[tokio::test]
     async fn execute_wraps_payload_when_endpoint_opts_in() {
         struct BodyMatcher(serde_json::Value);
@@ -1104,13 +1304,15 @@ mod tests {
     /// P0：[apply_request_envelope] 自定义请求信封（wrap-payload）的 endpoint 将 JSON 包裹进信封
     #[test]
     fn wrap_payload_enabled_wraps_json_envelope() {
-        use crate::http_client::HttpRequestPayload;
+        use std::sync::Arc;
+
+        use crate::http_client::HttpRequestBody;
         let endpoint = ep("https://x.com", "/p").with_req_envelope(WrapPayloadReq);
-        let payload = HttpRequestPayload::Json(Cow::Owned(json!({"a": 1})));
+        let payload = HttpRequestBody::Json(Arc::new(json!({"a": 1})));
         let result = apply_request_envelope(&endpoint, payload);
         match result {
-            HttpRequestPayload::Json(cow) => {
-                assert_eq!(cow["payload"], json!({"a": 1}).to_string());
+            HttpRequestBody::Json(value) => {
+                assert_eq!(value["payload"], json!({"a": 1}).to_string());
             }
             _ => panic!("expected Json payload, got Form"),
         }
@@ -1119,58 +1321,113 @@ mod tests {
     /// P0：[apply_request_envelope] 无 envelope（默认）时不做包裹
     #[test]
     fn wrap_payload_disabled_passes_through() {
-        use crate::http_client::HttpRequestPayload;
+        use std::sync::Arc;
+
+        use crate::http_client::HttpRequestBody;
         let endpoint = ep("https://x.com", "/p");
-        let payload = HttpRequestPayload::Json(Cow::Owned(json!({"a": 1})));
+        let payload = HttpRequestBody::Json(Arc::new(json!({"a": 1})));
         let result = apply_request_envelope(&endpoint, payload);
         match result {
-            HttpRequestPayload::Json(cow) => {
-                assert_eq!(*cow, json!({"a": 1}));
+            HttpRequestBody::Json(value) => {
+                assert_eq!(value.as_ref(), &json!({"a": 1}));
             }
             _ => panic!("expected Json payload"),
         }
     }
 
+    // ── with_request_envelope ───────────────────────────────
+
+    /// P0: [with_request_envelope] the composed factory wraps exactly once
+    ///     per build, and replays are byte-identical.
+    #[tokio::test]
+    async fn composed_factory_wraps_exactly_once_per_build() {
+        let endpoint = ep("https://x.com", "/p").with_req_envelope(WrapPayloadReq);
+        let composed = with_request_envelope(&endpoint, HttpRequestPayload::json(json!({"a": 1})));
+
+        let expected = json!({ "payload": json!({"a": 1}).to_string() });
+        for factory in [composed.clone(), composed] {
+            let HttpRequestBody::Json(value) = factory.build().await.unwrap() else {
+                panic!("expected Json payload");
+            };
+            assert_eq!(
+                value.as_ref(),
+                &expected,
+                "wrapped exactly once (no nested payload), byte-identical across replays"
+            );
+        }
+    }
+
+    /// P1: [with_request_envelope] an inner-factory build failure propagates
+    ///     its Err through the composed factory unchanged.
+    #[tokio::test]
+    async fn composed_factory_propagates_build_error() {
+        let endpoint = ep("https://x.com", "/p").with_req_envelope(WrapPayloadReq);
+        let inner = HttpRequestPayload::new(HttpRequestPayloadKind::Json, || async {
+            Err::<HttpRequestBody, _>(Error::Other("boom".into()))
+        });
+        let composed = with_request_envelope(&endpoint, inner);
+        let err = composed.build().await.unwrap_err();
+        assert!(matches!(err, Error::Other(_)));
+    }
+
+    /// P1: [with_request_envelope] a form factory passes through the
+    ///     composition unchanged and is never materialized into JSON early.
+    ///     Its `HttpRequestPayloadKind` is preserved (Form stays Form), so ranged
+    ///     eligibility keeps rejecting multipart.
+    #[tokio::test]
+    async fn composed_factory_form_passes_through() {
+        let endpoint = ep("https://x.com", "/p").with_req_envelope(WrapPayloadReq);
+        let form = HttpRequestPayload::form(|| async {
+            Ok(reqwest::multipart::Form::new().text("k", "v"))
+        });
+        let composed = with_request_envelope(&endpoint, form);
+        assert_eq!(composed.kind(), HttpRequestPayloadKind::Form);
+        assert!(matches!(
+            composed.build().await.unwrap(),
+            HttpRequestBody::Form(_)
+        ));
+    }
+
     // ── compute_ranged ────────────────────────────────────────
 
-    /// P0：[compute_ranged] range_size=Some(n>0) + JSON payload 时返回 Some
+    /// P0：[compute_ranged] range_size=Some(n>0) + JSON 载荷时返回分块大小
+    /// 条件：endpoint 挂 range_size=Some(10)，payload 为 JSON 工厂
+    /// 断言：返回 Some(10)
     #[test]
     fn compute_ranged_returns_some_for_json_with_positive_range() {
-        use crate::http_client::HttpRequestPayload;
         let endpoint = ep("https://x.com", "/p").with_range_size(Some(10));
-        let payload = HttpRequestPayload::Json(Cow::Owned(json!({"a": 1})));
+        let payload = HttpRequestPayload::json(json!({"a": 1}));
         let result = compute_ranged(&endpoint, &payload);
-        assert!(result.is_some());
-        let (size, replay) = result.unwrap();
-        assert_eq!(size, 10);
-        assert_eq!(replay, json!({"a": 1}));
+        assert_eq!(result, Some(10));
     }
 
     /// P0：[compute_ranged] range_size=None 时返回 None
+    /// 条件：endpoint 未挂 range_size，payload 为 JSON 工厂
+    /// 断言：返回 None
     #[test]
     fn compute_ranged_returns_none_for_missing_range_size() {
-        use crate::http_client::HttpRequestPayload;
         let endpoint = ep("https://x.com", "/p");
-        let payload = HttpRequestPayload::Json(Cow::Owned(json!({"a": 1})));
+        let payload = HttpRequestPayload::json(json!({"a": 1}));
         assert!(compute_ranged(&endpoint, &payload).is_none());
     }
 
     /// P0：[compute_ranged] range_size=Some(0) 时返回 None
+    /// 条件：endpoint 挂 range_size=Some(0)，payload 为 JSON 工厂
+    /// 断言：返回 None（0 视为 no-op）
     #[test]
     fn compute_ranged_zero_size_is_none() {
-        use crate::http_client::HttpRequestPayload;
         let endpoint = ep("https://x.com", "/p").with_range_size(Some(0));
-        let payload = HttpRequestPayload::Json(Cow::Owned(json!({"a": 1})));
+        let payload = HttpRequestPayload::json(json!({"a": 1}));
         assert!(compute_ranged(&endpoint, &payload).is_none());
     }
 
-    /// P1：[compute_ranged] Form payload + range_size=Some(n) 时返回 None
+    /// P1：[compute_ranged] Form 载荷 + range_size=Some(n) 时返回 None
+    /// 条件：endpoint 挂 range_size=Some(10)，payload 为 Form 工厂
+    /// 断言：返回 None（multipart 不可重放）
     #[test]
     fn compute_ranged_returns_none_for_form_payload() {
-        use crate::http_client::HttpRequestPayload;
         let endpoint = ep("https://x.com", "/p").with_range_size(Some(10));
-        let form = reqwest::multipart::Form::new();
-        let payload = HttpRequestPayload::Form(form);
+        let payload = HttpRequestPayload::form(|| async { Ok(reqwest::multipart::Form::new()) });
         assert!(compute_ranged(&endpoint, &payload).is_none());
     }
 

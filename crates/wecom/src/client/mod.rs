@@ -200,6 +200,10 @@ impl Client {
     /// Fetches the service description (with caching) and returns a
     /// [`service::ServiceHandle`] whose methods are all synchronous.
     ///
+    /// # Errors
+    /// Returns [`Error::Validation`] if `name` matches no service in the
+    /// discovery catalog (checked by exact name first, then alias).
+    ///
     /// # Example
     /// ```ignore
     /// let svc = client.service("contact").await?;
@@ -259,13 +263,28 @@ impl Client {
         name: &str,
         options: &RequestOptions,
     ) -> Result<service::ServiceHandle<'_>> {
+        // 先通过 catalog 解析 alias → 原始 service name
+        let catalog = self
+            .service_cache
+            .lock()
+            .await
+            .get_or_fetch_catalog(self, options)
+            .await?;
+
+        // 先精确匹配 name，再匹配 alias；catalog 未命中视为无效服务名，直接报错
+        let info = registry::find_service_by_name(&catalog.items, name)
+            .cloned()
+            .ok_or_else(|| Error::Validation(format!("找不到服务 '{name}'")))
+            .inspect_err(|e| tracing::error!(error = %e, "service not found in catalog"))?;
+
         let schema = self
             .service_cache
             .lock()
             .await
-            .get_or_fetch_detail(self, name, options)
+            .get_or_fetch_detail(self, &info.name, options)
             .await?;
-        Ok(service::ServiceHandle::new(self, name.to_string(), schema))
+
+        Ok(service::ServiceHandle::new(self, info, schema).with_input_name(name))
     }
 
     /// [`method`](Self::method) 的带请求 options 变体：schema 拉取请求
@@ -331,10 +350,15 @@ mod tests {
     //! - 上游：外部调用方直接使用 Client 作为入口
     //! - 下游：委托 [ServiceCache] 加载 schema，再委托 [service::ServiceHandle::method] 解析路径
 
+    use std::sync::Mutex;
+
     use tempfile::TempDir;
+    use tracing_subscriber::prelude::*;
     use wecom_transport::EndpointHttpExt;
 
     use super::*;
+    use crate::telemetry::contract::method_alias as ctr_alias;
+    use crate::telemetry::{CaptureScope, ClientEvent, EventExt, TelemetryLayer};
 
     // ── helpers ──
 
@@ -356,6 +380,11 @@ mod tests {
     /// - top-level method: `list`
     /// - resource `users` with method `get`
     fn seed_service_cache(root: &std::path::Path, service: &str) {
+        seed_service_cache_with_aliases(root, service, &[]);
+    }
+
+    /// [`seed_service_cache`] 的 alias 变体：catalog 中的服务声明 `aliases`。
+    fn seed_service_cache_with_aliases(root: &std::path::Path, service: &str, aliases: &[&str]) {
         let cache_dir = root.join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         let schema = serde_json::json!({
@@ -382,6 +411,19 @@ mod tests {
         let file = cache_dir.join(format!("service_{}.json", fs::sanitize_filename(service)));
         #[allow(clippy::disallowed_methods)] // Test helper: write fixture outside sandbox
         std::fs::write(file, serde_json::to_string(&schema).unwrap()).unwrap();
+
+        // Also seed the catalog cache so service_with_options can resolve aliases.
+        let catalog = serde_json::json!({
+            "items": [{
+                "name": service,
+                "description": "",
+                "hidden": false,
+                "alias": aliases
+            }]
+        });
+        let catalog_file = cache_dir.join("catalog.json");
+        #[allow(clippy::disallowed_methods)] // Test helper: write fixture outside sandbox
+        std::fs::write(catalog_file, serde_json::to_string(&catalog).unwrap()).unwrap();
     }
 
     // ── Client::method ──
@@ -458,6 +500,100 @@ mod tests {
         seed_service_cache(tmp.path(), "svc");
         let client = build_client(tmp.path());
         assert!(client.method(&["svc", "orders", "list"]).await.is_err());
+    }
+
+    /// P1：[Client::service] 服务名未命中 catalog 时返回 Err(Validation)
+    /// 条件：缓存 catalog 仅含 "svc"，以 "unknown" 调 service()
+    /// 断言：返回 Err，错误信息包含 "找不到服务 'unknown'"（不发起 detail 拉取）
+    #[tokio::test]
+    async fn service_with_unknown_name_returns_validation_error() {
+        let tmp = TempDir::new().unwrap();
+        seed_service_cache(tmp.path(), "svc");
+        let client = build_client(tmp.path());
+        let err = client.service("unknown").await.err().unwrap();
+        assert!(
+            err.to_string().contains("找不到服务 'unknown'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// P1：[Client::method] 服务名未命中 catalog 时返回 Err(Validation)
+    /// 条件：缓存 catalog 仅含 "svc"，传入 &["unknown", "list"]
+    /// 断言：返回 Err，错误信息包含 "找不到服务"（与 method rustdoc 契约一致）
+    #[tokio::test]
+    async fn method_with_unknown_service_returns_validation_error() {
+        let tmp = TempDir::new().unwrap();
+        seed_service_cache(tmp.path(), "svc");
+        let client = build_client(tmp.path());
+        let err = client.method(&["unknown", "list"]).await.err().unwrap();
+        assert!(
+            err.to_string().contains("找不到服务"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── Client::method（method_alias 遥测，SDK 侧 wiring） ──
+
+    /// P0：[Client::method] 服务别名命中时发射一条合并 method_alias 事件
+    /// 条件：缓存 catalog 中 "hr" 服务声明 alias ["human-resources"]，调 method(&["human-resources", "list"])
+    /// 断言：方法解析成功（name()=="list"），且捕获一条 method_alias 事件
+    /// （input="human-resources list"，resolved="hr list"）
+    #[tokio::test]
+    async fn method_via_service_alias_emits_event() {
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
+        );
+        let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
+        let c = collected.clone();
+        let scope = CaptureScope::new();
+        scope.on_event(move |ev: ClientEvent| {
+            c.lock().unwrap().push(ev);
+        });
+        let _enter = scope.span().enter();
+
+        let tmp = TempDir::new().unwrap();
+        seed_service_cache_with_aliases(tmp.path(), "hr", &["human-resources"]);
+        let client = build_client(tmp.path());
+        let handle = client.method(&["human-resources", "list"]).await.unwrap();
+        drop(_enter);
+
+        assert_eq!(handle.name(), "list");
+        let snaps = std::mem::take(&mut *collected.lock().unwrap());
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].kind, ctr_alias::KIND);
+        assert_json_diff::assert_json_eq!(
+            snaps[0].payload,
+            serde_json::json!({
+                ctr_alias::FIELD_INPUT: "human-resources list",
+                ctr_alias::FIELD_RESOLVED: "hr list",
+            })
+        );
+    }
+
+    /// P1：[Client::method] 规范服务名 + 真实路径时不发射 method_alias 事件
+    /// 条件：缓存 catalog 中 "hr" 服务声明 alias ["human-resources"]，调 method(&["hr", "list"])
+    /// 断言：方法解析成功，且未捕获到任何事件
+    #[tokio::test]
+    async fn method_via_canonical_path_stays_silent() {
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
+        );
+        let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
+        let c = collected.clone();
+        let scope = CaptureScope::new();
+        scope.on_event(move |ev: ClientEvent| {
+            c.lock().unwrap().push(ev);
+        });
+        let _enter = scope.span().enter();
+
+        let tmp = TempDir::new().unwrap();
+        seed_service_cache_with_aliases(tmp.path(), "hr", &["human-resources"]);
+        let client = build_client(tmp.path());
+        let handle = client.method(&["hr", "list"]).await.unwrap();
+        drop(_enter);
+
+        assert_eq!(handle.name(), "list");
+        assert!(collected.lock().unwrap().is_empty());
     }
 
     // ── Client::endpoint ──

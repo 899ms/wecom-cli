@@ -26,7 +26,7 @@
     "check": "cargo check --workspace --all-targets",
     "fmt": "git ls-files '*.rs' | xargs rustfmt +nightly",
     "fmt:check": "git ls-files '*.rs' | xargs rustfmt +nightly --check",
-    "lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "lint": "cargo clippy --workspace --all-targets --features custom-endpoint -- -D warnings",
     "prepare": "lefthook install",
     "test": "cargo test --workspace --all-targets --features custom-endpoint"
   },

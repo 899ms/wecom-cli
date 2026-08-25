@@ -288,9 +288,11 @@ mod tests {
         );
 
         ServiceSchema {
+            id: None,
+            base_url: Some("https://api.example.com".to_string()),
             description: Some("HR service".to_string()),
             skills: vec![],
-            base_url: Some("https://api.example.com".to_string()),
+            remote_doc: None,
             schemas,
             resource_tree: ServiceResource {
                 methods,

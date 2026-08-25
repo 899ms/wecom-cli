@@ -33,27 +33,36 @@ pub mod polling {
 /// HTTP Range resumable-download assembly.
 ///
 /// [`into_resumable`] wraps a partial (`206` / `Content-Range`) first response
-/// into an auto-resuming stream; the caller builds each segment's `Range`
-/// header via [`range_header_value`] and owns per-request signing / routing.
+/// into an auto-resuming stream; the caller's resume closure builds the
+/// `Range` header itself (via [`range_header_value`]) and owns per-request
+/// signing / routing.
 pub mod resumable {
     pub use crate::http::resumable::{into_resumable, range_header_value};
 }
 
-/// WeCom HTTP gateway request-envelope helpers, applied before a request goes out.
+/// WeCom HTTP gateway request-envelope helpers.
 ///
-/// [`apply_request_envelope`] applies the endpoint's request-side envelope
-/// wrapping (e.g. `{"payload": "<json-string>"}`); [`compute_ranged`]
-/// precomputes the clamped chunk size and replay payload for an eligible
-/// ranged download.
+/// [`with_request_envelope`] composes the endpoint's request-side envelope
+/// wrapping (e.g. `{"payload": "<json-string>"}`) into a
+/// [`HttpRequestPayload`](crate::HttpRequestPayload) at the pipeline entry (the single
+/// composition point); [`apply_request_envelope`] is the one-shot wrapping it
+/// builds on. [`compute_ranged`] computes the clamped chunk size for an
+/// eligible ranged download from the endpoint's `range_size` and the payload
+/// kind (no materialization).
 pub mod envelope {
-    pub use crate::http::{apply_request_envelope, compute_ranged};
+    pub use crate::http::{apply_request_envelope, compute_ranged, with_request_envelope};
 }
 
-/// 唯一一份 HTTP 协议流水线。
+/// The single HTTP protocol pipeline.
 ///
-/// [`pipeline_execute`] 统一承载：请求信封 wrap → 发送（签名等发送前加工由
-/// [`crate::HttpClient`] 实现内联）→ 二进制/续传 → 响应信封 parse（从 endpoint
-/// 读取）→ 长任务轮询 → 抽取。`HttpTransportBackend` 及自定义后端均复用它。
+/// [`pipeline_execute`] covers: composing the request-envelope wrap at the
+/// entry (closure stacking over the factory, lazy materialization) → deriving
+/// the first-segment `Range` header from the endpoint's `range_size` (JSON
+/// payloads only) → building the `HttpRequest` → binary/resumable download
+/// (segments re-materialized via the composed factory, each declaring its own
+/// `Range` header) → response envelope parse (strategy read from the endpoint)
+/// → long-task polling → result extraction. Shared by `HttpTransportBackend`
+/// and custom backends.
 pub mod pipeline {
     pub use crate::http::request::{PollDefaults, pipeline_execute};
 }

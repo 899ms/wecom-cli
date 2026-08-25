@@ -255,7 +255,7 @@ mod tests {
         fn execute<'a>(
             &'a self,
             _endpoint: std::borrow::Cow<'a, wecom_transport::Endpoint>,
-            _payload: wecom_transport::HttpRequestPayload<'a>,
+            _payload: wecom_transport::HttpRequestPayload,
             options: wecom_transport::RequestOptions,
         ) -> std::pin::Pin<
             Box<

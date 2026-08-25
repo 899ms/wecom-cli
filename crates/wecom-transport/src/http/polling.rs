@@ -226,6 +226,28 @@ mod tests {
         }
     }
 
+    /// Test-only request-side envelope (same shape as the WrapPayloadReq in
+    /// request.rs; copied locally to avoid cross-module test-fixture coupling).
+    #[derive(Debug, Clone, Copy, Default)]
+    struct WrapPayloadReq;
+    impl crate::http::envelope::RequestEnvelope for WrapPayloadReq {
+        fn encode(&self, payload: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({ "payload": payload.to_string() })
+        }
+        fn name(&self) -> &'static str {
+            "wrap-payload"
+        }
+    }
+
+    /// Assert the request carries no Range header (polling is not a segmented
+    /// download).
+    struct NoRangeHeader;
+    impl wiremock::Match for NoRangeHeader {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            request.headers.get("range").is_none()
+        }
+    }
+
     // ── LongTaskPollData trait 测试 ──
 
     /// P1：[ApiResponse] ApiResponse 的 long_task_poll 缺失时 poll_info 返回 None
@@ -534,6 +556,96 @@ mod tests {
             &biz_endpoint,
         );
         let _ = poll_long_task(&ctx, "task_poll_cap").await.unwrap();
+    }
+
+    /// P0: [poll_long_task] TaskQuery-mode poll requests are not
+    ///     envelope-wrapped and carry no Range header.
+    /// Setup: the PollEndpoint capability endpoint explicitly opts into
+    /// WrapPayloadReq + range_size=Some(10).
+    /// Assert: the wire body keeps the unwrapped shape (a wrap would add a
+    /// nesting level and fail the exact body_json match); no Range header
+    /// (a poll request is not a segmented download — it bypasses
+    /// `pipeline_execute` and the sending chain never derives Range headers).
+    #[tokio::test]
+    async fn poll_task_query_not_wrapped_and_no_range_header() {
+        let server = MockServer::start().await;
+        let transport = build_http_transport(server.uri());
+
+        let expected_body = serde_json::json!({
+            "method": "PollClawLongTask",
+            "payload": serde_json::json!({ "taskid": "task_no_wrap" }).to_string(),
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/custom/poll"))
+            .and(body_json(&expected_body))
+            .and(NoRangeHeader)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "{}",
+                "long_task_poll": { "done": true }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let poll_ep = Endpoint::new().with(
+            HttpEndpoint::new("/custom/poll")
+                .with_req_envelope(WrapPayloadReq)
+                .with_range_size(Some(10)),
+        );
+        let biz_endpoint = Endpoint::new().with(PollEndpoint(poll_ep));
+        let headers = empty_headers();
+        let ctx = ctx_for_with(
+            transport.http_client(),
+            headers,
+            &transport.base_url,
+            &biz_endpoint,
+        );
+        let _ = poll_long_task(&ctx, "task_no_wrap").await.unwrap();
+    }
+
+    /// P0: [poll_long_task] ReuseEndpoint-mode poll requests are not
+    ///     envelope-wrapped and carry no Range header.
+    /// Setup: the business endpoint itself opts into WrapPayloadReq +
+    /// range_size=Some(10); poll_mode = ReuseEndpoint.
+    /// Assert: the wire body is the raw `{}`, the x-long-poll-taskid header is
+    /// present, and no Range header is sent.
+    #[tokio::test]
+    async fn poll_reuse_endpoint_not_wrapped_and_no_range_header() {
+        let server = MockServer::start().await;
+        let transport = build_http_transport(server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/biz/reuse"))
+            .and(body_json(serde_json::json!({})))
+            .and(wiremock::matchers::header(
+                "x-long-poll-taskid",
+                "task_reuse",
+            ))
+            .and(NoRangeHeader)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "{}",
+                "long_task_poll": { "done": true }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let reuse_endpoint = Endpoint::new().with(
+            HttpEndpoint::new("/biz/reuse")
+                .with_base_url(transport.base_url.clone())
+                .with_req_envelope(WrapPayloadReq)
+                .with_range_size(Some(10)),
+        );
+        let headers = empty_headers();
+        let mut ctx = ctx_for_with(
+            transport.http_client(),
+            headers,
+            &transport.base_url,
+            &reuse_endpoint,
+        );
+        ctx.poll_mode = PollMode::ReuseEndpoint;
+        let _ = poll_long_task(&ctx, "task_reuse").await.unwrap();
     }
 
     /// P1：轮询请求体恰好只有 method 和 payload 两个字段，且对特殊字符 taskid 仍能正确嵌入

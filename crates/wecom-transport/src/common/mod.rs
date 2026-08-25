@@ -7,7 +7,6 @@ mod extensions;
 mod header;
 pub mod options;
 mod poll;
-mod types;
 
 pub use catalog::{CatalogKey, EndpointCatalog};
 pub use debug::MaskedHeaders;
@@ -17,7 +16,6 @@ pub use extensions::{Extension, Extensions};
 pub use header::{IntoHeaderName, IntoHeaderValue};
 pub use options::{RequestOptions, WireOptions};
 pub use poll::PollEndpoint;
-pub use types::IntoCowValue;
 
 // Re-export capability types and extension traits from their home modules.
 // These are public API used by downstream crates; suppress "unused" within the

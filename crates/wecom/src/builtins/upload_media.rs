@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use wecom_transport::RequestOptions;
+use wecom_transport::{HttpRequestPayload, RequestOptions};
 
 use crate::client::EndpointKey;
 use crate::{Client, Error, Result, fs};
@@ -23,10 +23,22 @@ pub(crate) async fn upload_media(
 ) -> Result<UploadMediaResponse> {
     tracing::info!(%file_path, "upload_media begin");
 
-    let part = fs.open_as_multipart_part(file_path).await?;
-    let form = reqwest::multipart::Form::new()
-        .part("media", part)
-        .text("type", "file");
+    // multipart 经工厂包装（延迟物化）：每次发送/重放时重新打开文件构建独立表单。
+    let fs = fs.clone();
+    let file_path = file_path.to_string();
+    let form = HttpRequestPayload::form(move || {
+        let fs = fs.clone();
+        let file_path = file_path.clone();
+        async move {
+            let part = fs
+                .open_as_multipart_part(&file_path)
+                .await
+                .map_err(crate::util::to_transport_error)?;
+            Ok(reqwest::multipart::Form::new()
+                .part("media", part)
+                .text("type", "file"))
+        }
+    });
 
     let response = client
         .transport()
@@ -95,6 +107,74 @@ mod tests {
             .transport(transport)
             .build()
             .unwrap()
+    }
+
+    /// P0：[HttpRequestPayload] 同一 multipart 工厂经真实发送链连发两次，body 各自完整且 boundary 独立
+    /// 条件：HttpRequestPayload::form 读取临时文件；raw post 连发两次到 mock（两次均捕获请求体）
+    /// 断言：两次请求体均含完整文件内容；两次首行 boundary 不同（各自重建而非复用已消费表单）
+    #[tokio::test]
+    async fn multipart_factory_double_send_produces_complete_bodies() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let test_file = tmp.path().join("photo.jpg");
+        std::fs::write(&test_file, b"fake-jpeg-bytes").unwrap();
+        let file_path_str = test_file.to_string_lossy().to_string();
+
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let bodies_sink = bodies.clone();
+        Mock::given(method("POST"))
+            .and(path("/file/upload"))
+            .respond_with(move |req: &wiremock::Request| {
+                bodies_sink.lock().unwrap().push(req.body.clone());
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": "{\"media_id\":\"M\"}"}))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let fs = crate::fs::Fs::new(tmp.path());
+        let factory = wecom_transport::HttpRequestPayload::form(move || {
+            let fs = fs.clone();
+            let file_path = file_path_str.clone();
+            async move {
+                let part = fs
+                    .open_as_multipart_part(&file_path)
+                    .await
+                    .map_err(crate::util::to_transport_error)?;
+                Ok(reqwest::multipart::Form::new()
+                    .part("media", part)
+                    .text("type", "file"))
+            }
+        });
+
+        let backend = wecom_transport::HttpTransportBackend::default();
+        let endpoint = wecom_transport::Endpoint::new()
+            .with(wecom_transport::HttpEndpoint::new("/file/upload").with_base_url(server.uri()));
+        backend.post(&endpoint, factory.clone()).await.unwrap();
+        backend.post(&endpoint, factory).await.unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "expected exactly two sends");
+        let boundary_of = |body: &[u8]| {
+            String::from_utf8_lossy(body)
+                .lines()
+                .next()
+                .expect("multipart body has boundary line")
+                .to_owned()
+        };
+        for (i, body) in bodies.iter().enumerate() {
+            let text = String::from_utf8_lossy(body);
+            assert!(
+                text.contains("fake-jpeg-bytes"),
+                "send #{i} body incomplete: {text}"
+            );
+        }
+        assert_ne!(
+            boundary_of(&bodies[0]),
+            boundary_of(&bodies[1]),
+            "each send must materialize an independent form (distinct boundaries)"
+        );
     }
 
     /// P0：[upload_media] HTTP 路径成功上传

@@ -77,11 +77,11 @@ pub type PollCallback = std::sync::Arc<dyn Fn(&PollEvent<'_>) + Send + Sync + 's
 /// `invoke()` methods.
 pub struct TransportRequest<'a> {
     /// Transport backend to dispatch to.
-    pub(crate) backend: &'a (dyn crate::traits::TransportBackend + 'a),
+    pub(crate) backend: &'a (dyn crate::traits::TransportBackend + 'static),
     /// Common request addressing.
     pub(crate) endpoint: std::borrow::Cow<'a, Endpoint>,
-    /// Request payload — JSON or multipart form.
-    pub(crate) payload: HttpRequestPayload<'a>,
+    /// Request payload — 统一工厂（延迟物化，发送链 build）。
+    pub(crate) payload: HttpRequestPayload,
     /// ── Builder state (operated on by impl_request_builder!) ──
     pub(crate) header_error: Option<Error>,
     /// Request options.

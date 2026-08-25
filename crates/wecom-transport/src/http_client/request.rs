@@ -1,16 +1,21 @@
 use std::borrow::Cow;
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use super::response;
-use crate::{Endpoint, Error, HttpClient, IntoCowValue, Result};
+use crate::{Endpoint, Error, HttpClient, Result};
 
-/// HTTP 请求 payload 类型。
-pub enum HttpRequestPayload<'a> {
-    Json(Cow<'a, serde_json::Value>),
+/// payload 工厂的产出物（发送层消费的一次性数据）。
+///
+/// `Form` 持有流式 body 不可克隆——工厂每次 build 产出独立实例。
+#[derive(Debug)]
+pub enum HttpRequestBody {
+    Json(Arc<serde_json::Value>),
     Form(reqwest::multipart::Form),
 }
 
-impl std::fmt::Display for HttpRequestPayload<'_> {
+impl std::fmt::Display for HttpRequestBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Json(value) => write!(f, "{}", value.as_ref()),
@@ -19,34 +24,106 @@ impl std::fmt::Display for HttpRequestPayload<'_> {
     }
 }
 
-/// Trait for types that can be converted into an [`HttpRequestPayload`].
+/// payload 工厂构建函数签名（供 [`HttpRequestPayload`] 内部持有）。
+type HttpRequestPayloadBuildFn =
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<HttpRequestBody>> + Send>> + Send + Sync;
+
+/// payload 种类标记（构造期已知，零成本）。
 ///
-/// Enables [`HttpTransportBackend::post`] to accept both JSON payloads
-/// (`&Value`, `Value`, `Cow<Value>`) and `reqwest::multipart::Form`
-/// through a single `payload` parameter.
-pub trait IntoRequestPayload<'a> {
-    fn into_http_request_payload(self) -> HttpRequestPayload<'a>;
+/// 供 [`compute_ranged`](crate::compute_ranged) 的分段下载准入判定使用——
+/// 无需物化 payload 即可区分 JSON 与 multipart。仅 crate 内部使用（`kind()`
+/// 与 `HttpRequestPayload::new` 同收窄），不参与公开 API。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HttpRequestPayloadKind {
+    Json,
+    Form,
 }
 
-// Blanket impl: any IntoCowValue can be used as a JSON payload.
-impl<'a, V> IntoRequestPayload<'a> for V
-where
-    V: IntoCowValue<'a>,
-{
-    fn into_http_request_payload(self) -> HttpRequestPayload<'a> {
-        HttpRequestPayload::Json(self.into_cow_value())
+/// payload 统一工厂：每次 build 产出全新 [`HttpRequestBody`]。
+///
+/// JSON（Arc 持有）与 multipart（再次构建闭包，重新打开文件）在同一模型下表达。
+/// 工厂可克隆（Arc 零成本）；重放 = clone 工厂 → 再次 build（build 幂等、
+/// 无副作用，每次发送恰好物化一次）。
+#[derive(Clone)]
+pub struct HttpRequestPayload {
+    build: Arc<HttpRequestPayloadBuildFn>,
+    kind: HttpRequestPayloadKind,
+}
+
+impl HttpRequestPayload {
+    /// 底层通用构造：`kind` 显式声明工厂种类（供分段下载准入判定）；
+    /// multipart 请用 [`HttpRequestPayload::form`] 便捷构造。仅 crate 内部使用。
+    pub(crate) fn new<F, Fut>(kind: HttpRequestPayloadKind, build: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<HttpRequestBody>> + Send + 'static,
+    {
+        Self {
+            build: Arc::new(move || Box::pin(build())),
+            kind,
+        }
+    }
+
+    /// payload 种类（构造期确定，零成本）。仅 crate 内部使用。
+    pub(crate) fn kind(&self) -> HttpRequestPayloadKind {
+        self.kind
+    }
+
+    /// JSON 构造：构造时一次 `Arc::new`，build 时 `Arc::clone` 重放（零拷贝）。
+    pub fn json(value: serde_json::Value) -> Self {
+        let value = Arc::new(value);
+        Self::new(HttpRequestPayloadKind::Json, move || {
+            let value = Arc::clone(&value);
+            async move { Ok(HttpRequestBody::Json(value)) }
+        })
+    }
+
+    /// multipart 便捷构造（闭包每次再次构建表单，重新打开文件）。
+    ///
+    /// 注意：先调用 `make_form()` 取得 future 再移入 `async move`——
+    /// `make_form` 是 `Fn` 闭包（可多次调用），不能在 async 块内被移动。
+    pub fn form<F, Fut>(make_form: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<reqwest::multipart::Form>> + Send + 'static,
+    {
+        Self::new(HttpRequestPayloadKind::Form, move || {
+            let fut = make_form();
+            async move { Ok(HttpRequestBody::Form(fut.await?)) }
+        })
+    }
+
+    /// 物化 payload（每次调用产出全新实例）。
+    pub async fn build(&self) -> Result<HttpRequestBody> {
+        (self.build)().await
     }
 }
 
-impl<'a> IntoRequestPayload<'a> for reqwest::multipart::Form {
-    fn into_http_request_payload(self) -> HttpRequestPayload<'a> {
-        HttpRequestPayload::Form(self)
-    }
+/// Trait for types that can be converted into a [`HttpRequestPayload`]。
+///
+/// JSON 值（`Value`/`&Value`）直接包装；工厂自身幂等透传。裸
+/// `reqwest::multipart::Form` 不实现本 trait——multipart 必须经
+/// [`HttpRequestPayload::form`] 包装，保证所有载荷均可参与 token 失效重放。
+pub trait IntoHttpRequestPayload {
+    fn into_http_request_payload(self) -> HttpRequestPayload;
 }
 
-impl<'a> IntoRequestPayload<'a> for HttpRequestPayload<'a> {
-    fn into_http_request_payload(self) -> HttpRequestPayload<'a> {
+impl IntoHttpRequestPayload for HttpRequestPayload {
+    fn into_http_request_payload(self) -> HttpRequestPayload {
         self
+    }
+}
+
+impl IntoHttpRequestPayload for serde_json::Value {
+    fn into_http_request_payload(self) -> HttpRequestPayload {
+        HttpRequestPayload::json(self)
+    }
+}
+
+impl IntoHttpRequestPayload for &serde_json::Value {
+    fn into_http_request_payload(self) -> HttpRequestPayload {
+        // 构造时一次深拷贝（与现状 `json(self.clone())` 等量）；闭包只 Arc clone。
+        HttpRequestPayload::json(self.clone())
     }
 }
 
@@ -54,10 +131,16 @@ impl<'a> IntoRequestPayload<'a> for HttpRequestPayload<'a> {
 ///
 /// Created via [`HttpTransportBackend::post`]. Chain `.headers()`, `.header()`,
 /// `.timeout()` or just `.await`.
+///
+/// The payload is a [`HttpRequestPayload`] (deferred materialization):
+/// materialization happens in the sending chain (`reqwest_send`); the
+/// envelope wrap is composed into the factory at the pipeline entry (raw
+/// posts are never wrapped), and the first-segment `Range` header is derived
+/// by `pipeline_execute` from the endpoint's `range_size` (JSON payloads only).
 pub struct HttpRequest<'a> {
     pub(crate) http_client: &'a dyn HttpClient,
     pub(crate) endpoint: Cow<'a, Endpoint>,
-    pub(crate) payload: HttpRequestPayload<'a>,
+    pub(crate) payload: HttpRequestPayload,
     pub(crate) header_error: Option<Error>,
     pub(crate) options: crate::WireOptions,
 }
@@ -68,7 +151,7 @@ impl<'a> HttpRequest<'a> {
     pub fn new(
         http_client: &'a dyn HttpClient,
         endpoint: Cow<'a, Endpoint>,
-        payload: HttpRequestPayload<'a>,
+        payload: HttpRequestPayload,
     ) -> Self {
         Self {
             http_client,
@@ -121,6 +204,7 @@ mod tests {
     //! ### 关键接口
     //! - [HttpRequest] — HTTP 请求 builder，支持 [IntoFuture]
     //! - [HttpRequest::headers] — 附加额外 HTTP 头
+    //! - [HttpRequestPayload] — payload 统一工厂（延迟物化）
     //!
     //! ### 关键分支与异常路径
     //! - [HttpRequest::headers] 传入空 HeaderMap → headers 仍为 None
@@ -138,6 +222,11 @@ mod tests {
         Endpoint::new().with(http)
     }
 
+    /// 测试 helper：构造 JSON payload 工厂。
+    fn json_factory(value: serde_json::Value) -> HttpRequestPayload {
+        HttpRequestPayload::json(value)
+    }
+
     // ── HttpRequest::headers ──
 
     /// P0：headers() 设置非空 headers 后 headers 为 Some 且内容正确
@@ -147,18 +236,14 @@ mod tests {
     fn headers_sets_headers() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
         let mut extra = reqwest::header::HeaderMap::new();
         extra.insert(
             reqwest::header::HeaderName::from_static("x-extra"),
             reqwest::header::HeaderValue::from_static("val"),
         );
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.headers(&extra);
         let headers = req.get_headers();
         assert_eq!(headers.len(), 1);
@@ -172,7 +257,7 @@ mod tests {
     fn headers_sets_multiple_headers_correctly() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
         let mut extra = reqwest::header::HeaderMap::new();
         extra.insert(
             reqwest::header::HeaderName::from_static("x-token"),
@@ -183,11 +268,7 @@ mod tests {
             reqwest::header::HeaderValue::from_static("req-001"),
         );
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.headers(&extra);
         let headers = req.get_headers();
         assert_eq!(headers.len(), 2);
@@ -205,14 +286,10 @@ mod tests {
     fn headers_empty_map_stays_none() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
         let empty = reqwest::header::HeaderMap::new();
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.headers(&empty);
         assert!(req.get_headers().is_empty());
     }
@@ -224,7 +301,7 @@ mod tests {
     fn headers_extends_instead_of_replace() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
         let mut first = reqwest::header::HeaderMap::new();
         first.insert(
             reqwest::header::HeaderName::from_static("x-a"),
@@ -236,11 +313,7 @@ mod tests {
             reqwest::header::HeaderValue::from_static("b-val"),
         );
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.headers(&first).headers(&second);
         let headers = req.get_headers();
         assert_eq!(headers.len(), 2);
@@ -257,13 +330,9 @@ mod tests {
     fn header_adds_single_header() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.header("x-single", "val");
         assert!(req.header_error.is_none());
         let headers = req.get_headers();
@@ -278,13 +347,9 @@ mod tests {
     fn header_chain_multiple() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.header("x-a", "1").header("x-b", "2");
         assert!(req.header_error.is_none());
         let headers = req.get_headers();
@@ -300,18 +365,14 @@ mod tests {
     fn header_and_headers_mixed() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
         let mut batch = reqwest::header::HeaderMap::new();
         batch.insert(
             reqwest::header::HeaderName::from_static("x-b"),
             reqwest::header::HeaderValue::from_static("b-val"),
         );
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req
             .header("x-a", "a-val")
             .headers(&batch)
@@ -331,13 +392,9 @@ mod tests {
     fn header_rejects_invalid_name() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.header("", "value");
         assert!(req.header_error.is_some());
     }
@@ -349,15 +406,30 @@ mod tests {
     fn header_rejects_invalid_value() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
+        let payload = json_factory(json!({}));
+
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
+        let req = req.header("x-name", "\0\0\0invalid");
+        assert!(req.header_error.is_some());
+    }
+
+    /// P1：[HttpRequest::execute] header_error 为 Some 时直接返回 Err
+    /// 条件：header 非法 → header_error Some，调用 execute().await
+    /// 断言：返回 Err，不发起网络请求
+    #[tokio::test]
+    async fn execute_returns_header_error() {
+        let transport = crate::HttpTransportBackend::default();
+        let endpoint = ep("http://test", "/");
         let payload = json!({});
 
         let req = HttpRequest::new(
             &*transport.http_client,
             Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
+            HttpRequestPayload::json(payload),
         );
-        let req = req.header("x-name", "\0\0\0invalid");
-        assert!(req.header_error.is_some());
+        let req = req.header("", "value");
+        let result = req.execute().await;
+        assert!(result.is_err());
     }
 
     // ── HttpRequest::timeout ──
@@ -369,13 +441,9 @@ mod tests {
     fn timeout_sets_field() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req.timeout(std::time::Duration::from_secs(30));
         assert_eq!(req.get_timeout(), Some(std::time::Duration::from_secs(30)));
     }
@@ -387,13 +455,9 @@ mod tests {
     fn timeout_default_none() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         assert!(req.get_timeout().is_none());
     }
 
@@ -404,18 +468,14 @@ mod tests {
     fn timeout_and_headers_chain() {
         let transport = crate::HttpTransportBackend::default();
         let endpoint = ep("http://test", "/");
-        let payload = json!({});
+        let payload = json_factory(json!({}));
         let mut extra = reqwest::header::HeaderMap::new();
         extra.insert(
             reqwest::header::HeaderName::from_static("x-chain"),
             reqwest::header::HeaderValue::from_static("val"),
         );
 
-        let req = HttpRequest::new(
-            &*transport.http_client,
-            Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
-        );
+        let req = HttpRequest::new(&*transport.http_client, Cow::Borrowed(&endpoint), payload);
         let req = req
             .timeout(std::time::Duration::from_secs(10))
             .headers(&extra);
@@ -429,7 +489,7 @@ mod tests {
     /// 条件：transport 只提供 http_client（不含任何 headers）；.headers 追加 x-extra=extra-val
     /// 断言：wire 请求包含 x-extra（transport 级 headers 不再由 HttpRequest::execute 自动合并）
     #[tokio::test]
-    async fn into_future_merges_transport_and_headers() {
+    async fn into_future_sends_only_request_headers() {
         use wiremock::matchers::{method, path};
         use wiremock::{Match, Mock, Request, ResponseTemplate};
 
@@ -459,12 +519,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let payload = json!({});
         let endpoint = ep(&server.uri(), "/merge");
         let req = HttpRequest::new(
             &*transport.http_client,
             Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
+            json_factory(json!({})),
         );
         let _ = req.headers(&extra).await.unwrap();
     }
@@ -502,12 +561,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let payload = json!({});
         let endpoint = ep(&server.uri(), "/only");
         let req = HttpRequest::new(
             &*transport.http_client,
             Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
+            json_factory(json!({})),
         );
         let _ = req.await.unwrap();
     }
@@ -516,7 +574,7 @@ mod tests {
     /// 条件：先 .headers({x-first:val1}) 再 .headers({x-second:val2})
     /// 断言：wire 请求同时包含 x-first 和 x-second
     #[tokio::test]
-    async fn into_future_additional_overrides_transport() {
+    async fn into_future_extends_multiple_headers() {
         use wiremock::matchers::{method, path};
         use wiremock::{Match, Mock, Request, ResponseTemplate};
 
@@ -533,6 +591,19 @@ mod tests {
                 first && second
             }
         }
+
+        let mut first_only = wiremock::http::HeaderMap::new();
+        first_only.insert(
+            wiremock::http::HeaderName::from_static("x-first"),
+            wiremock::http::HeaderValue::from_static("val1"),
+        );
+        let request = Request {
+            url: wiremock::http::Url::parse("http://localhost").unwrap(),
+            method: wiremock::http::Method::POST,
+            headers: first_only,
+            body: Vec::new(),
+        };
+        assert!(!BothMatcher.matches(&request));
 
         let server = MockServer::start().await;
         let transport = crate::HttpTransportBackend::default();
@@ -558,48 +629,157 @@ mod tests {
             .mount(&server)
             .await;
 
-        let payload = json!({});
         let endpoint = ep(&server.uri(), "/override");
         let req = HttpRequest::new(
             &*transport.http_client,
             Cow::Borrowed(&endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(&payload)),
+            json_factory(json!({})),
         );
         let _ = req.headers(&first).headers(&second).await.unwrap();
     }
 
-    // ── HttpRequestPayload::Display ──
+    // ── HttpRequestBody ──
 
-    /// P1：[HttpRequestPayload::Display] Form 变体显示为 [multipart/form-data]
-    /// 条件：构造 HttpRequestPayload::Form 包含一个 text 字段
+    /// P1：[HttpRequestBody::Display] Form 形态显示为 [multipart/form-data]
+    /// 条件：构造 HttpRequestBody::Form
     /// 断言：Display 格式化为 "[multipart/form-data]"
     #[test]
     fn display_form_variant() {
-        let form = reqwest::multipart::Form::new().text("key", "value");
-        let payload = HttpRequestPayload::Form(form);
-        let s = format!("{payload}");
+        let data = HttpRequestBody::Form(reqwest::multipart::Form::new().text("key", "value"));
+        let s = format!("{data}");
         assert_eq!(s, "[multipart/form-data]");
     }
 
-    // ── IntoRequestPayload ──
-
-    /// P1：[IntoRequestPayload] reqwest::multipart::Form 转换为 Form 变体
-    /// 条件：构造 reqwest::multipart::Form 并调用 into_http_request_payload()
-    /// 断言：返回 HttpRequestPayload::Form 变体
+    /// P1：[HttpRequestBody::Display] Json 形态显示为 JSON 字符串
+    /// 条件：构造 HttpRequestBody::Json
+    /// 断言：Display 格式化为 JSON 内容
     #[test]
-    fn into_request_payload_for_form() {
-        let form = reqwest::multipart::Form::new().text("field", "data");
-        let payload = form.into_http_request_payload();
-        assert!(matches!(payload, HttpRequestPayload::Form(_)));
+    fn display_json_variant() {
+        let data = HttpRequestBody::Json(std::sync::Arc::new(json!({"key": "value"})));
+        let s = format!("{data}");
+        assert_eq!(s, r#"{"key":"value"}"#);
     }
 
-    /// P1：[IntoRequestPayload] HttpRequestPayload 透传（identity）
-    /// 条件：构造 HttpRequestPayload::Json 并调用 into_http_request_payload()
-    /// 断言：返回相同 HttpRequestPayload::Json 变体
+    // ── HttpRequestPayload ──
+
+    /// P0：[HttpRequestPayload::json] build 返回 Arc 持有的 JSON
+    /// 条件：构造 json 工厂并 build
+    /// 断言：HttpRequestBody::Json 且内容一致
+    #[tokio::test]
+    async fn payload_json_build() {
+        let factory = HttpRequestPayload::json(json!({"a": 1}));
+        match factory.build().await.unwrap() {
+            HttpRequestBody::Json(value) => assert_eq!(value.as_ref(), &json!({"a": 1})),
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    /// P0：[HttpRequestPayload::form] 每次 build 产出独立 Form 实例
+    /// 条件：构造 form 工厂（text 字段）；连续 build 两次
+    /// 断言：两次均成功；实例指针不同（再次构建而非复用）
+    #[tokio::test]
+    async fn payload_form_build_produces_independent_forms() {
+        let factory = HttpRequestPayload::form(|| async {
+            Ok(reqwest::multipart::Form::new().text("key", "value"))
+        });
+        let first = match factory.build().await.unwrap() {
+            HttpRequestBody::Form(form) => form,
+            other => panic!("expected Form, got {other:?}"),
+        };
+        let second = match factory.build().await.unwrap() {
+            HttpRequestBody::Form(form) => form,
+            other => panic!("expected Form, got {other:?}"),
+        };
+        assert!(!std::ptr::eq(&first, &second));
+    }
+
+    /// P1：[HttpRequestPayload] 工厂返回错误时 build 透传
+    /// 条件：工厂恒返回 Err(Error::Other)
+    /// 断言：build() 返回该错误
+    #[tokio::test]
+    async fn payload_build_passthrough_error() {
+        let factory = HttpRequestPayload::new(HttpRequestPayloadKind::Json, || async {
+            Err::<HttpRequestBody, _>(crate::Error::Other("boom".into()))
+        });
+        let err = factory.build().await.unwrap_err();
+        assert!(matches!(err, crate::Error::Other(_)));
+    }
+
+    // ── HttpRequestPayloadKind（构造期种类标记）──
+
+    /// P0：[HttpRequestPayload::json] 构造的工厂 kind 为 Json
+    /// 条件：json({"a":1}) 构造
+    /// 断言：kind() == HttpRequestPayloadKind::Json
     #[test]
-    fn into_request_payload_identity() {
-        let payload = HttpRequestPayload::Json(Cow::Owned(json!({"a": 1})));
-        let same = payload.into_http_request_payload();
-        assert!(matches!(same, HttpRequestPayload::Json(_)));
+    fn payload_factory_kind_json() {
+        let factory = HttpRequestPayload::json(json!({"a": 1}));
+        assert_eq!(factory.kind(), HttpRequestPayloadKind::Json);
+    }
+
+    /// P0：[HttpRequestPayload::form] 构造的工厂 kind 为 Form
+    /// 条件：form(|| async { Ok(Form::new()) }) 构造
+    /// 断言：kind() == HttpRequestPayloadKind::Form
+    #[test]
+    fn payload_factory_kind_form() {
+        let factory = HttpRequestPayload::form(|| async { Ok(reqwest::multipart::Form::new()) });
+        assert_eq!(factory.kind(), HttpRequestPayloadKind::Form);
+    }
+
+    /// P0：[HttpRequestPayload::new] 显式 kind 参数生效且闭包可物化 body
+    /// 条件：new(HttpRequestPayloadKind::Json, 返回 Json body 的闭包) 构造并 build
+    /// 断言：kind() == HttpRequestPayloadKind::Json，build() 返回 Json body
+    #[tokio::test]
+    async fn payload_factory_new_explicit_kind() {
+        let factory = HttpRequestPayload::new(HttpRequestPayloadKind::Json, || async {
+            Ok::<HttpRequestBody, crate::Error>(HttpRequestBody::Json(std::sync::Arc::new(json!(
+                {}
+            ))))
+        });
+        assert_eq!(factory.kind(), HttpRequestPayloadKind::Json);
+        assert!(matches!(
+            factory.build().await.unwrap(),
+            HttpRequestBody::Json(_)
+        ));
+    }
+
+    /// P1：[HttpRequestPayload] 克隆共享同一构建闭包（Arc 零成本）
+    /// 条件：clone 工厂后两次 build
+    /// 断言：两次均成功（克隆不影响构建）
+    #[tokio::test]
+    async fn payload_clone_shared() {
+        let factory = HttpRequestPayload::json(json!({"a": 1}));
+        let cloned = factory.clone();
+        assert!(cloned.build().await.is_ok());
+        assert!(factory.build().await.is_ok());
+    }
+
+    /// P0：[HttpRequestPayload::json] 直值构造的工厂重放零拷贝
+    /// 条件：json(Value) 构造；连续两次 build
+    /// 断言：两次产出指向同一堆分配（零拷贝重放），且值一致
+    #[tokio::test]
+    async fn payload_json_replay_zero_copy() {
+        let factory = HttpRequestPayload::json(json!({"a": 1}));
+        let first = match factory.build().await.unwrap() {
+            HttpRequestBody::Json(v) => v,
+            other => panic!("expected Json, got {other:?}"),
+        };
+        let second = match factory.build().await.unwrap() {
+            HttpRequestBody::Json(v) => v,
+            other => panic!("expected Json, got {other:?}"),
+        };
+        assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
+        assert_json_diff::assert_json_eq!(first.as_ref(), &json!({"a": 1}));
+    }
+
+    // ── IntoHttpRequestPayload ──
+
+    /// P1：[IntoHttpRequestPayload] 工厂自身幂等透传
+    /// 条件：构造 HttpRequestPayload 并调用 into_http_request_payload()
+    /// 断言：返回的工厂可正常 build
+    #[tokio::test]
+    async fn into_http_request_payload_identity() {
+        let factory = HttpRequestPayload::json(json!({"a": 1}));
+        let same = factory.clone().into_http_request_payload();
+        assert!(same.build().await.is_ok());
     }
 }

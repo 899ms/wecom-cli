@@ -196,7 +196,7 @@ async fn init_with_bot(
         spinner.stop("鉴权未返回访问令牌");
         return Err(Error::protocol(
             "鉴权成功但未获取到访问令牌，请重试或检查账号状态",
-            &auth_endpoint,
+            wecom_transport::EndpointHttpExt::full_url(&auth_endpoint),
             serde_json::to_value(resp).unwrap_or_default(),
         ));
     };

@@ -148,9 +148,10 @@ pub fn env_or_config(env_name: &str, cfg_val: Option<&str>) -> Option<String> {
 /// [`TransportBuilder`], regardless of its backend type.
 ///
 /// The `Authorization` token is intentionally NOT baked here: it is injected
-/// per-request by the transport backend when the endpoint carries the
-/// [`AuthRequirement`](crate::transport::capability::AuthRequirement) capability
+/// per-request by the transport backend whenever a token is available
 /// (see [`crate::transport::backend::WecomBackend`]).
+/// Endpoints marked with `RequireAuth` additionally enforce a pre-request
+/// gate that rejects calls without a token.
 ///
 /// All header validation errors are deferred to [`TransportBuilder::build`].
 pub fn apply_transport_config<B: TransportBackend + 'static>(

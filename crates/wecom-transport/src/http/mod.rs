@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 pub use endpoint::{EndpointHttpExt, HttpEndpoint};
 pub use envelope::{GatewayRes, PassthroughReq, RequestEnvelope, ResponseEnvelope};
-pub use request::{apply_request_envelope, compute_ranged};
+pub use request::{apply_request_envelope, compute_ranged, with_request_envelope};
 
 use crate::http_client::{HttpClient, HttpRequest, HttpRequestPayload};
 use crate::traits::{TransportBackend, TransportResponse};
 use crate::{
-    Endpoint, IntoCowEndpoint, IntoRequestPayload, RequestOptions, Result, TransportBuilder,
+    Endpoint, IntoCowEndpoint, IntoHttpRequestPayload, RequestOptions, Result, TransportBuilder,
     TransportRequest,
 };
 
@@ -127,13 +127,14 @@ impl HttpTransportBackend {
 
     /// Build a raw HTTP request (no protocol-layer wrapping).
     ///
-    /// Accepts JSON values or `reqwest::multipart::Form` as payload.
+    /// Accepts JSON values, or a [`HttpRequestPayload`] (multipart forms must be
+    /// wrapped via [`HttpRequestPayload::form`] so they stay replayable).
     /// Per-request options (headers, timeout) are set on the returned
     /// [`HttpRequest`] via its builder methods.
     pub fn post<'a, E, P>(&'a self, endpoint: E, payload: P) -> HttpRequest<'a>
     where
         E: IntoCowEndpoint<'a>,
-        P: IntoRequestPayload<'a>,
+        P: IntoHttpRequestPayload,
     {
         HttpRequest::new(
             &*self.http_client,
@@ -149,13 +150,13 @@ impl HttpTransportBackend {
     pub fn invoke<'a, E, P>(&'a self, endpoint: E, payload: P) -> TransportRequest<'a>
     where
         E: IntoCowEndpoint<'a>,
-        P: IntoRequestPayload<'a>,
+        P: IntoHttpRequestPayload,
     {
         let endpoint = endpoint.into_cow_endpoint();
         let payload = payload.into_http_request_payload();
 
         TransportRequest {
-            backend: self as &(dyn crate::traits::TransportBackend + 'a),
+            backend: self as &(dyn crate::traits::TransportBackend + 'static),
             endpoint,
             payload,
             header_error: None,
@@ -190,7 +191,7 @@ impl TransportBackend for HttpTransportBackend {
     fn execute<'a>(
         &'a self,
         endpoint: Cow<'a, Endpoint>,
-        payload: HttpRequestPayload<'a>,
+        payload: HttpRequestPayload,
         options: RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<TransportResponse>> + Send + 'a>> {
         Box::pin(async move {
@@ -228,7 +229,7 @@ mod tests {
     //!
     //! ### 关键分支与异常路径
     //! - post 接受 IntoCowEndpoint（&Endpoint 走 Borrowed，Endpoint 走 Owned，Cow<Endpoint> 原样透传）
-    //! - post 接受 IntoRequestPayload：IntoCowValue 类型走 JSON 路径，reqwest::multipart::Form 走 multipart 路径
+    //! - post 接受 IntoHttpRequestPayload：Value/&Value 走 JSON 工厂路径；HttpRequestPayload 幂等透传（裸 Form 须经 HttpRequestPayload::form）
     //!
     //! ### 上下游交互
     //! - 上游：调用方通过 [HttpTransportBackend::post] 构建请求
@@ -282,52 +283,53 @@ mod tests {
         assert!(matches!(req.endpoint, Cow::Owned(_)));
     }
 
-    // ── IntoCowValue payload 形态 ──
+    // ── payload 工厂形态 ──
 
-    /// P0：[HttpTransportBackend::post] 接受 `&Value`，HttpRequest 内部 payload 为 Cow::Borrowed
+    /// P0：[HttpTransportBackend::post] 接受 `&Value`，构造 Json 工厂且内容一致
     /// 条件：以引用形式传入 payload
-    /// 断言：HttpRequestPayload::Json 内部为 Cow::Borrowed
-    #[test]
-    fn post_accepts_borrowed_value() {
-        use crate::http_client::HttpRequestPayload;
+    /// 断言：build 产出 HttpRequestBody::Json 且值一致
+    #[tokio::test]
+    async fn post_accepts_borrowed_value() {
+        use crate::http_client::HttpRequestBody;
         let transport = make_transport();
         let endpoint = ep("https://x.com", "/p");
         let payload = serde_json::json!({"a": 1});
         let req = transport.post(&endpoint, &payload);
-        match req.payload {
-            HttpRequestPayload::Json(Cow::Borrowed(_)) => {}
-            _ => panic!("expected Cow::Borrowed payload"),
+        match req.payload.build().await.unwrap() {
+            HttpRequestBody::Json(value) => assert_eq!(value.as_ref(), &payload),
+            other => panic!("expected Json payload, got {other:?}"),
         }
     }
 
-    /// P0：[HttpTransportBackend::post] 接受 owned `Value`，HttpRequest 内部 payload 为 Cow::Owned
+    /// P0：[HttpTransportBackend::post] 接受 owned `Value`，构造 Json 工厂且内容一致
     /// 条件：以所有权形式传入 payload
-    /// 断言：HttpRequestPayload::Json 内部为 Cow::Owned
-    #[test]
-    fn post_accepts_owned_value() {
-        use crate::http_client::HttpRequestPayload;
+    /// 断言：build 产出 HttpRequestBody::Json 且值一致
+    #[tokio::test]
+    async fn post_accepts_owned_value() {
+        use crate::http_client::HttpRequestBody;
         let transport = make_transport();
         let endpoint = ep("https://x.com", "/p");
-        let req = transport.post(&endpoint, serde_json::json!({"a": 1}));
-        match req.payload {
-            HttpRequestPayload::Json(Cow::Owned(_)) => {}
-            _ => panic!("expected Cow::Owned payload"),
+        let payload = serde_json::json!({"a": 1});
+        let req = transport.post(&endpoint, payload.clone());
+        match req.payload.build().await.unwrap() {
+            HttpRequestBody::Json(value) => assert_eq!(value.as_ref(), &payload),
+            other => panic!("expected Json payload, got {other:?}"),
         }
     }
 
-    /// P0：[HttpTransportBackend::post] 接受 `Cow<Value>` 透传，保留原 Borrowed/Owned 形态
-    /// 条件：以 Cow::Owned 形式传入 payload（模拟 TransportRequest 内部已持有 Cow）
-    /// 断言：HttpRequestPayload::Json 仍为 Cow::Owned（透传未克隆）
-    #[test]
-    fn post_accepts_cow_value_passthrough() {
-        use crate::http_client::HttpRequestPayload;
+    /// P0：[HttpTransportBackend::post] 接受 `HttpRequestPayload` 幂等透传
+    /// 条件：直接传入工厂
+    /// 断言：build 产出 Json 且值一致
+    #[tokio::test]
+    async fn post_accepts_payload_factory() {
+        use crate::http_client::{HttpRequestBody, HttpRequestPayload};
         let transport = make_transport();
         let endpoint = ep("https://x.com", "/p");
-        let cow: Cow<'_, serde_json::Value> = Cow::Owned(serde_json::json!({"a": 1}));
-        let req = transport.post(&endpoint, cow);
-        match req.payload {
-            HttpRequestPayload::Json(Cow::Owned(_)) => {}
-            _ => panic!("expected Cow::Owned payload (passthrough)"),
+        let payload = serde_json::json!({"a": 1});
+        let req = transport.post(&endpoint, HttpRequestPayload::json(payload.clone()));
+        match req.payload.build().await.unwrap() {
+            HttpRequestBody::Json(value) => assert_eq!(value.as_ref(), &payload),
+            other => panic!("expected Json payload, got {other:?}"),
         }
     }
 
@@ -374,19 +376,8 @@ mod tests {
     /// 断言：wire 请求同时包含 x-base 与 x-extra
     #[tokio::test]
     async fn invoke_combines_transport_headers_and_request_level_headers() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
-
-        struct BothHeadersMatcher;
-        impl Match for BothHeadersMatcher {
-            fn matches(&self, request: &Request) -> bool {
-                let base =
-                    request.headers.get("x-base").and_then(|v| v.to_str().ok()) == Some("base-val");
-                let extra = request.headers.get("x-extra").and_then(|v| v.to_str().ok())
-                    == Some("extra-val");
-                base && extra
-            }
-        }
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let transport = {
@@ -402,7 +393,8 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/invoke-combine"))
-            .and(BothHeadersMatcher)
+            .and(header("x-base", "base-val"))
+            .and(header("x-extra", "extra-val"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": "{\"ok\":true}"
             })))

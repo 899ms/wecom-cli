@@ -35,7 +35,11 @@ pub const ERRCODE_SHOW_HELP: i64 = 10021;
 #[non_exhaustive]
 pub enum Error {
     /// Transport-layer error (network, HTTP, parse, API, other).
-    Transport(#[from] wecom_transport::Error),
+    ///
+    /// The manual [`From<wecom_transport::Error>`] impl (not `#[from]`)
+    /// additionally recovers wecom-layer errors that round-tripped through
+    /// [`wecom_transport::Error::Other`] — see [`crate::util::to_transport_error`].
+    Transport(#[source] wecom_transport::Error),
 
     /// Input validation failed (e.g. missing required field, empty method path).
     Validation(String),
@@ -79,6 +83,25 @@ impl From<std::io::Error> for Error {
         Error::Io {
             message: e.to_string(),
             source: e,
+        }
+    }
+}
+
+impl From<wecom_transport::Error> for Error {
+    /// Recover wecom-layer errors that round-tripped through the transport
+    /// boundary: [`crate::util::to_transport_error`] boxes non-`Transport`
+    /// variants into [`wecom_transport::Error::Other`] (payload factories must
+    /// return transport errors), and downcasting here restores the original
+    /// variant so `code` / `type` / structured rendering survive the trip.
+    /// Foreign `Other` payloads (plain strings, reqwest internals) keep the
+    /// `Transport` wrapper unchanged.
+    fn from(e: wecom_transport::Error) -> Self {
+        match e {
+            wecom_transport::Error::Other(inner) => match inner.downcast::<Error>() {
+                Ok(original) => *original,
+                Err(other) => Error::Transport(wecom_transport::Error::Other(other)),
+            },
+            other => Error::Transport(other),
         }
     }
 }
@@ -282,8 +305,12 @@ mod tests {
     //! - [Error::exit_code] — 返回建议的进程退出码（CliOutput 用自身 code，其余为 1）
     //! - [Error::code] — 返回该错误对应的 893xxx 分类码（Transport 子变体映射到 E_NETWORK/E_HTTP/E_PARSE/E_OTHER，Api 直接透传后台错误码）
     //! - `From<std::io::Error> for Error` — 将 io::Error 自动转换为 Error::Io 变体
+    //! - `From<wecom_transport::Error> for Error` — Transport 变体透传；`Other` 内
+    //!   经 [crate::util::to_transport_error] 装箱的 wecom::Error 负载 downcast 还原
     //!
     //! ### 关键分支与异常路径
+    //! - From<transport>：Other(boxed wecom::Error) → 还原原始变体（code/type 恢复）；
+    //!   Other(外部负载) / 其余变体 → 保持 Error::Transport 包装
     //! - to_json：Transport 委托内层；CliOutput 返回结构化 JSON（含 code/type/字段）
     //! - render：Transport 委托内层 render；CliOutput 直接返回预渲染 message（忽略 source）；其余调用 to_json → to_string_pretty
     //! - exit_code：CliOutput 返回 code 字段，其他变体统一返回 1
@@ -1037,6 +1064,78 @@ mod tests {
         let e: Error = transport_err.into();
         assert!(matches!(e, Error::Transport(_)));
         assert_eq!(e.message(), "wrapped");
+    }
+
+    /// P0：[From<wecom_transport::Error>] 经 to_transport_error 装箱的 Permission 错误被还原
+    /// 条件：Error::Permission 经 crate::util::to_transport_error 装箱为 transport::Other 后再经 From 转回
+    /// 断言：还原为 Error::Permission，code() == E_PERMISSION，to_json 恢复 PermissionError 结构
+    #[test]
+    fn from_transport_recovers_round_tripped_permission() {
+        let original = Error::Permission("路径超出沙箱".into());
+        let round_tripped: Error = crate::util::to_transport_error(original).into();
+        assert!(matches!(round_tripped, Error::Permission(_)));
+        assert_eq!(round_tripped.code(), E_PERMISSION);
+        assert_eq!(
+            round_tripped.to_json(),
+            json!({
+                "error": {
+                    "type": "PermissionError",
+                    "code": E_PERMISSION,
+                    "message": "路径超出沙箱"
+                }
+            })
+        );
+    }
+
+    /// P0：[From<wecom_transport::Error>] 经 to_transport_error 装箱的 Io 错误被还原且 message 无重复 code 尾巴
+    /// 条件：Error::Io 经 crate::util::to_transport_error 装箱为 transport::Other 后再经 From 转回
+    /// 断言：还原为 Error::Io，code() == E_IO，message() 为原始消息（不含 Display 的 [code=…] 后缀）
+    #[test]
+    fn from_transport_recovers_round_tripped_io() {
+        let original = Error::io(
+            "Failed to open /tmp/x",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        );
+        let round_tripped: Error = crate::util::to_transport_error(original).into();
+        assert!(matches!(round_tripped, Error::Io { .. }));
+        assert_eq!(round_tripped.code(), E_IO);
+        assert_eq!(
+            round_tripped.message(),
+            "Failed to open /tmp/x: no such file"
+        );
+    }
+
+    /// P1：[From<wecom_transport::Error>] Transport 变体装箱后拆包再转回保持 Transport 语义
+    /// 条件：Error::Transport(Http) 经 to_transport_error 拆包为 Http，再经 From 转回
+    /// 断言：结果为 Error::Transport(Http)，code() == E_HTTP（不经过 Other 还原路径）
+    #[test]
+    fn from_transport_round_tripped_transport_variant() {
+        let original = Error::Transport(wecom_transport::Error::Http {
+            message: "not found".into(),
+            endpoint: "https://example.com/api".into(),
+            status: 404,
+        });
+        let round_tripped: Error = crate::util::to_transport_error(original).into();
+        assert!(matches!(
+            round_tripped,
+            Error::Transport(wecom_transport::Error::Http { status: 404, .. })
+        ));
+        assert_eq!(round_tripped.code(), E_HTTP);
+    }
+
+    /// P1：[From<wecom_transport::Error>] Other 内非 wecom::Error 负载不还原
+    /// 条件：transport::Other 内装箱 io::Error（外部错误），经 From 转换
+    /// 断言：结果保持 Error::Transport(Other)，code() == E_OTHER
+    #[test]
+    fn from_transport_foreign_other_payload_not_recovered() {
+        let foreign = wecom_transport::Error::Other(Box::new(std::io::Error::other("disk full")));
+        let e: Error = foreign.into();
+        assert!(matches!(
+            e,
+            Error::Transport(wecom_transport::Error::Other(_))
+        ));
+        assert_eq!(e.code(), E_OTHER);
+        assert_eq!(e.message(), "disk full");
     }
 
     // ── CliOutput code 分支 ──

@@ -6,6 +6,7 @@ mod handler;
 mod method_handle;
 mod output;
 mod preview;
+pub(crate) mod remote_doc;
 mod schema_util;
 mod service_handle;
 mod types;

@@ -41,8 +41,7 @@ pub use builder::TransportBuilder;
 pub use common::error::*;
 pub use common::{
     CatalogKey, Endpoint, EndpointCatalog, EndpointExt, Extension, Extensions, IntoCowEndpoint,
-    IntoCowValue, IntoHeaderName, IntoHeaderValue, MaskedHeaders, PollEndpoint, RequestOptions,
-    WireOptions,
+    IntoHeaderName, IntoHeaderValue, MaskedHeaders, PollEndpoint, RequestOptions, WireOptions,
 };
 pub use dispatch::{ExecuteOutput, PollCallback, PollEvent, TransportRequest};
 pub use http::{
@@ -50,8 +49,8 @@ pub use http::{
     RequestEnvelope, ResponseEnvelope,
 };
 pub use http_client::{
-    ByteStream, ContentRange, HttpClient, HttpRequest, HttpRequestPayload, HttpResponse,
-    IntoRequestPayload,
+    ByteStream, ContentRange, HttpClient, HttpRequest, HttpRequestBody, HttpRequestPayload,
+    HttpResponse, IntoHttpRequestPayload,
 };
 pub use traits::{TransportBackend, TransportResponse};
 pub use transport::Transport;
