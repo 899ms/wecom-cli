@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{ArgMatches, Command, FromArgMatches};
 
-use super::RunOptions;
 use super::command::{self, HelperCmdArgs, MethodCmdArgs, ServiceCmdArgs};
+use super::{RunOptions, remote_doc};
 use crate::client::CliRun;
 use crate::{Error, Result};
 
@@ -16,6 +16,7 @@ use crate::{Error, Result};
 pub async fn handle_service_cmd(
     run: &CliRun<'_>,
     name: &str,
+    input_name: &str,
     matches: &ArgMatches,
     cmd: &Command,
 ) -> Result<()> {
@@ -25,18 +26,29 @@ pub async fn handle_service_cmd(
     let args = ServiceCmdArgs::from_arg_matches(matches)
         .map_err(|e| Error::Other(format!("参数解析错误: {e:#}").into()))?;
 
-    let svc = client.service_with_options(name, run.get_options()).await?;
+    // name 来自 clap matches（别名已归一化为规范名）；input_name 是用户原始
+    // 输入的 argv token，保留给 method() 的 method_alias 遥测还原 input。
+    let svc = client
+        .service_with_options(name, run.get_options())
+        .await?
+        .with_input_name(input_name);
 
     // service --doc
     if args.doc == Some(true) {
-        tracing::info!(service = %name, "display service doc");
+        tracing::info!(service = %name, remote = svc.remote_doc_id().is_some(), "display service doc");
+        if let Some(id) = svc.remote_doc_id() {
+            return print_remote_doc(run, id, "doc").await;
+        }
         output.print_styled(&svc.doc());
         return Ok(());
     }
 
     // service --schema
     if args.schema == Some(true) {
-        tracing::info!(service = %name, "display service schema");
+        tracing::info!(service = %name, remote = svc.remote_doc_id().is_some(), "display service schema");
+        if let Some(id) = svc.remote_doc_id() {
+            return print_remote_doc(run, id, "schema").await;
+        }
         output.print(&serde_json::to_string_pretty(&svc.schema()).unwrap_or_default());
         return Ok(());
     }
@@ -85,10 +97,12 @@ pub async fn handle_service_cmd(
         return Ok(());
     }
 
-    // Lookup method BEFORE parsing MethodCmdArgs so that unknown subcommands
-    // (captured as external subcommands via `.allow_external_subcommands(true)`)
-    // fail with a skill-aware `Error::CliOutput` instead of panicking in
-    // `from_arg_matches` over undefined arg ids.
+    // Look up the method BEFORE parsing `MethodCmdArgs`: the alias rewrite
+    // inside `svc.method` must resolve the real method first (payload assembly
+    // needs its schema), and `from_arg_matches` must never run against an
+    // undefined method. Unknown subcommands are already rejected by clap as
+    // `InvalidSubcommand` in `CliRun::execute` and handled via
+    // `handle_parse_error` (skill-aware `Error::CliOutput`).
     let method = svc.method(&cmd_path_strs)?;
 
     let mut args = MethodCmdArgs::from_arg_matches(cmd_matches)
@@ -100,21 +114,30 @@ pub async fn handle_service_cmd(
 
     // ── 分派（装配后，schema 第一优先级）──
     if args.help == Some(true) {
-        tracing::info!(service = %name, method = ?cmd_path_strs, "display method help");
+        tracing::info!(service = %name, method = ?cmd_path_strs, remote = method.remote_doc_id().is_some(), "display method help");
+        if let Some(id) = method.remote_doc_id() {
+            return print_remote_doc(run, id, "help").await;
+        }
         output.print(&run.render_leaf_help(cmd, &full_path, None));
         return Ok(());
     }
 
     // --schema
     if args.schema == Some(true) {
-        tracing::info!(service = %name, method = ?cmd_path_strs, "display method schema");
+        tracing::info!(service = %name, method = ?cmd_path_strs, remote = method.remote_doc_id().is_some(), "display method schema");
+        if let Some(id) = method.remote_doc_id() {
+            return print_remote_doc(run, id, "schema").await;
+        }
         output.print(&serde_json::to_string_pretty(&method.schema()).unwrap_or_default());
         return Ok(());
     }
 
     // --doc
     if args.doc == Some(true) {
-        tracing::info!(service = %name, method = ?cmd_path_strs, "display method doc");
+        tracing::info!(service = %name, method = ?cmd_path_strs, remote = method.remote_doc_id().is_some(), "display method doc");
+        if let Some(id) = method.remote_doc_id() {
+            return print_remote_doc(run, id, "doc").await;
+        }
         output.print_styled(&method.doc());
         return Ok(());
     }
@@ -146,6 +169,15 @@ pub async fn handle_service_cmd(
 
 // ── 辅助函数 ────────────────────────────────────────────────
 
+/// Fetch the remotely generated document for the node identified by `id` and
+/// print it verbatim to stdout. 调用方保证 `remote_doc` 生效（见
+/// [crate::service::remote_doc::resolve_node]）。
+async fn print_remote_doc(run: &CliRun<'_>, id: &str, doc_type: &str) -> Result<()> {
+    let doc = remote_doc::fetch_remote_doc(run, id, doc_type).await?;
+    run.get_output().print(&doc);
+    Ok(())
+}
+
 fn get_subcmd_path(matches: &ArgMatches) -> Result<(Vec<String>, &ArgMatches)> {
     let mut path = vec![];
     let mut matches = matches;
@@ -154,4 +186,47 @@ fn get_subcmd_path(matches: &ArgMatches) -> Result<(Vec<String>, &ArgMatches)> {
         matches = sub_matches;
     }
     Ok((path, matches))
+}
+
+#[cfg(test)]
+mod tests {
+    //! ## 模块摘要：handler（service 命令分发）
+    //!
+    //! ### 关键接口
+    //! - [get_subcmd_path] — 从 clap ArgMatches 提取子命令路径
+    //!
+    //! ### 关键分支与异常路径
+    //! - 嵌套子命令 → 逐层提取路径
+    //! - 无子命令 → 返回空路径
+    //!
+    //! ### 上下游交互
+    //! - 上游：handle_service_cmd 在路由 helper / method 前解析子命令路径
+    //! - 下游：clap::ArgMatches::subcommand
+
+    use super::*;
+
+    /// P0：[get_subcmd_path] 提取嵌套子命令路径
+    /// 条件：ArgMatches 含 media → download 两级子命令
+    /// 断言：返回 ["media", "download"]
+    #[test]
+    fn get_subcmd_path_extracts_nested_path() {
+        let cmd = Command::new("wecom")
+            .subcommand(Command::new("media").subcommand(Command::new("download")));
+        let matches = cmd
+            .try_get_matches_from(["wecom", "media", "download"])
+            .unwrap();
+        let (path, _) = get_subcmd_path(&matches).unwrap();
+        assert_eq!(path, vec!["media".to_string(), "download".to_string()]);
+    }
+
+    /// P1：[get_subcmd_path] 无子命令时返回空路径
+    /// 条件：ArgMatches 不含任何子命令
+    /// 断言：返回空 Vec
+    #[test]
+    fn get_subcmd_path_empty_when_no_subcommand() {
+        let cmd = Command::new("wecom");
+        let matches = cmd.try_get_matches_from(["wecom"]).unwrap();
+        let (path, _) = get_subcmd_path(&matches).unwrap();
+        assert!(path.is_empty());
+    }
 }

@@ -1,7 +1,10 @@
 use std::future::IntoFuture;
 use std::sync::Arc;
 
-use super::{MethodSchemaInfo, RequestInfo, RunOptions, doc, execute, preview, schema_util};
+use super::{
+    MethodSchemaInfo, RequestInfo, RunOptions, doc, execute, preview, remote_doc, schema_util,
+};
+use crate::client::EndpointKey;
 use crate::schema::JsonSchema;
 use crate::{Client, Error, Result, directive, registry};
 
@@ -61,7 +64,7 @@ impl MethodHandle<'_> {
     pub fn endpoint(&self) -> wecom_transport::Endpoint {
         let mut ep = self
             .client
-            .resolve_builtin_endpoint(crate::client::EndpointKey::ServiceMethod)
+            .resolve_builtin_endpoint(EndpointKey::ServiceMethod)
             .map::<wecom_transport::HttpEndpoint>(|h| {
                 h.with_path_derived(self.schema.path.as_str())
                     .with_range_size(self.range_size())
@@ -75,6 +78,20 @@ impl MethodHandle<'_> {
     /// Method description.
     pub fn description(&self) -> Option<&str> {
         self.schema.description.as_deref()
+    }
+
+    /// The `id` to use in a remote doc request, or `None` when remote doc is
+    /// not in effect for this method (either `remote_doc` resolves to false,
+    /// or no `id` is declared — both fall back to local rendering).
+    ///
+    /// Effective `remote_doc` value: method → parent resources → service
+    /// → `false` (nearest `Some` wins), and the method must declare an `id`.
+    pub fn remote_doc_id(&self) -> Option<&str> {
+        let segs: Vec<&str> = self.method_path_segments[1..]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        remote_doc::resolve_remote_doc_id(&self.service_schema, &segs)
     }
 
     /// Resolve the request JSON Schema for this method (if any).
@@ -391,6 +408,8 @@ mod tests {
             skills: vec![],
             base_url: Some(base_url.to_string()),
             schemas: indexmap::IndexMap::new(),
+            id: None,
+            remote_doc: None,
             resource_tree: registry::ServiceResource {
                 methods: indexmap::IndexMap::new(),
                 resources: indexmap::IndexMap::new(),
@@ -533,6 +552,8 @@ mod tests {
             skills: vec![],
             base_url: Some("https://api.test".to_string()),
             schemas: indexmap::IndexMap::new(),
+            id: None,
+            remote_doc: None,
             resource_tree: registry::ServiceResource {
                 methods: indexmap::IndexMap::new(),
                 resources: indexmap::IndexMap::new(),
@@ -556,6 +577,97 @@ mod tests {
             schema: method_schema,
         };
         assert_eq!(h.description(), Some("List all users"));
+    }
+
+    /// P0：MethodHandle::remote_doc_id 在 method 声明 remote_doc=true 且带 id 时返回 id
+    /// 条件：service schema 中 department.list 声明 remote_doc=true 且带 id
+    /// 断言：remote_doc_id() 返回 Some("m-list")
+    #[test]
+    fn remote_doc_true_when_method_declares() {
+        let service_schema: registry::ServiceSchema = serde_json::from_str(
+            r#"{
+                "base_url": "https://api.test",
+                "resources": {
+                    "department": {
+                        "methods": {
+                            "list": {
+                                "id": "m-list",
+                                "path": "/list",
+                                "http_method": "GET",
+                                "remote_doc": true
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let method_schema =
+            service_schema.resource_tree.resources["department"].methods["list"].clone();
+        let h = MethodHandle {
+            client: &TEST_CLIENT,
+            service_schema: Arc::new(service_schema),
+            method_name: "list".to_string(),
+            method_path_segments: vec![
+                "hr".to_string(),
+                "department".to_string(),
+                "list".to_string(),
+            ],
+            schema: method_schema,
+        };
+        assert_eq!(h.remote_doc_id(), Some("m-list"));
+    }
+
+    /// P1：MethodHandle::remote_doc_id 在 remote_doc=true 但 method 缺 id 时返回 None
+    /// 条件：service schema 中 department.list 声明 remote_doc=true 但无 id
+    /// 断言：remote_doc_id() 返回 None（缺 id 视为未配置，回退本地渲染）
+    #[test]
+    fn remote_doc_false_when_id_missing() {
+        let service_schema: registry::ServiceSchema = serde_json::from_str(
+            r#"{
+                "base_url": "https://api.test",
+                "resources": {
+                    "department": {
+                        "methods": {
+                            "list": {
+                                "path": "/list",
+                                "http_method": "GET",
+                                "remote_doc": true
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let method_schema =
+            service_schema.resource_tree.resources["department"].methods["list"].clone();
+        let h = MethodHandle {
+            client: &TEST_CLIENT,
+            service_schema: Arc::new(service_schema),
+            method_name: "list".to_string(),
+            method_path_segments: vec![
+                "hr".to_string(),
+                "department".to_string(),
+                "list".to_string(),
+            ],
+            schema: method_schema,
+        };
+        assert_eq!(h.remote_doc_id(), None);
+    }
+
+    /// P1：MethodHandle::remote_doc_id 在各层均未声明时返回 None
+    /// 条件：夹具 schema 不含任何 remote_doc 声明
+    /// 断言：remote_doc_id() 返回 None
+    #[test]
+    fn remote_doc_false_when_unset() {
+        let h = make_test_method_handle(
+            "https://api.test",
+            vec!["svc".to_string(), "list".to_string()],
+            "/list",
+            "GET",
+        );
+        assert_eq!(h.remote_doc_id(), None);
     }
 
     /// P0：MethodHandle::url 正确拼接基础 URL 和路径

@@ -22,13 +22,14 @@ use super::bot::Bot;
 /// 鉴权引导端点（botid+secret 签名调用换取 Bearer token），默认 product/正式环境。
 const DEFAULT_AUTH_ENDPOINT: &str = "https://qyapi.weixin.qq.com/cgi-bin/aibot/cli/get_cli_config";
 
-/// 解析鉴权引导端点：`custom-endpoint` feature 下按
-/// `WECOM_CLI_AUTH_ENDPOINT` env > `config.json` 的 `auth_endpoint` > 默认 解析。
+/// 解析并装配鉴权引导端点：`custom-endpoint` feature 下按
+/// `WECOM_CLI_AUTH_ENDPOINT` env > `config.json` 的 `auth_endpoint` > 默认
+/// 解析 URL，再经 [`auth_endpoint`] 装配（扁平信封 + 抑制注入）。
 ///
 /// `cfg` 为调用方已加载（或经 Client 扩展袋注入）的配置，可缺省：
 /// `None`（未注入）时直接回退默认端点，不报错。
 #[cfg_attr(not(feature = "custom-endpoint"), allow(unused_variables))]
-pub fn resolve_auth_endpoint(cfg: Option<&crate::config::ConfigFile>) -> String {
+pub fn resolve_auth_endpoint(cfg: Option<&crate::config::ConfigFile>) -> wecom_transport::Endpoint {
     #[cfg(feature = "custom-endpoint")]
     let resolved = crate::config::env_or_config(
         crate::env::AUTH_ENDPOINT,
@@ -37,7 +38,25 @@ pub fn resolve_auth_endpoint(cfg: Option<&crate::config::ConfigFile>) -> String 
     .unwrap_or_else(|| DEFAULT_AUTH_ENDPOINT.to_string());
     #[cfg(not(feature = "custom-endpoint"))]
     let resolved = DEFAULT_AUTH_ENDPOINT.to_string();
-    resolved
+    auth_endpoint(&resolved)
+}
+
+/// 按 URL 装配鉴权引导端点（换取 Bearer token 的专用 Endpoint）——引导端点
+/// 的唯一装配原语；产品流程请走 [`resolve_auth_endpoint`]（含 URL 解析），
+/// 本函数主要供测试注入 mock URL。
+///
+/// 使用产品层自定义的 [`FlatRes`](crate::transport::envelope::FlatRes) 扁平
+/// 响应信封（整体 JSON body 即业务结果 `{errcode, errmsg, token}`），并挂
+/// [`SuppressAuth`](crate::transport::SuppressAuth) 抑制标记——即使持有
+/// token 也不携带 Authorization 头（换取 token 的引导请求不得带失效 token，
+/// 否则 853004 刷新会自死锁）。
+pub fn auth_endpoint(url: &str) -> wecom_transport::Endpoint {
+    wecom_transport::Endpoint::new()
+        .with(
+            wecom_transport::HttpEndpoint::from_url(url)
+                .with_res_envelope(crate::transport::FlatRes),
+        )
+        .with(crate::transport::SuppressAuth)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,11 +171,8 @@ fn sha256_hex(input: &str) -> String {
 /// Fetch the auth bootstrap config from the server (signed request), returning
 /// the Bearer token for the caller to persist.
 ///
-/// 复用 `Client::transport` 的请求能力：endpoint 使用产品层自定义的
-/// [`FlatRes`](crate::transport::envelope::FlatRes) 扁平响应信封——不携带
-/// Authorization 头（未挂
-/// [`AuthRequirement`](crate::transport::capability::AuthRequirement)
-/// 能力，默认不注入）、整体 JSON body 即业务结果（`{errcode, errmsg, token}`）。
+/// 复用 `Client::transport` 的请求能力；`endpoint` 由调用方经
+/// [`resolve_auth_endpoint`] 构造（信封与鉴权抑制标记由它保证）。
 ///
 /// 错误统一返回 [`crate::Error`]：网络/HTTP/解析经三层嵌套
 /// `Error::Wecom(wecom::Error::Transport(_))`；业务错误（`errcode != 0`）由
@@ -168,7 +184,7 @@ pub async fn fetch_auth(
     transport: &wecom_transport::Transport,
     bot: &Bot,
     bind_source: BindSource,
-    auth_endpoint: &str,
+    endpoint: &wecom_transport::Endpoint,
 ) -> Result<FetchAuthResponse> {
     tracing::debug!(bind_source = ?bind_source, "auth bootstrap request");
     let request = FetchAuthRequest::build(bot, bind_source)
@@ -177,17 +193,12 @@ pub async fn fetch_auth(
     // 纯字符串字段的结构体序列化失败为意料之外的系统级失败，归入兜底 Other。
     let payload = serde_json::to_value(&request).map_err(|e| Error::Other(e.into()))?;
 
-    let endpoint = wecom_transport::Endpoint::new().with(
-        wecom_transport::HttpEndpoint::from_url(auth_endpoint)
-            .with_res_envelope(crate::transport::FlatRes),
-    );
-
-    let value = transport.invoke(&endpoint, &payload).await?.into_result()?;
+    let value = transport.invoke(endpoint, &payload).await?.into_result()?;
 
     let resp = FetchAuthResponse::deserialize(&value).map_err(|e| {
         Error::from(wecom_transport::Error::Parse {
             message: format!("鉴权响应格式异常: {e}"),
-            endpoint: auth_endpoint.to_string(),
+            endpoint: wecom_transport::EndpointHttpExt::full_url(endpoint),
             body: Box::new(value),
             source: Some(e),
         })
@@ -216,6 +227,8 @@ mod tests {
     //! - 引导 Endpoint 用 `FlatRes` 信封：经 `HttpEndpoint::from_url` 组装，整体 body 即结果（信封层校验 errcode），不携带授权
 
     use std::sync::Mutex;
+
+    use wecom_transport::EndpointHttpExt;
 
     use crate::config::ConfigFile;
 
@@ -320,7 +333,7 @@ mod tests {
     fn auth_endpoint_defaults_to_product() {
         with_env("WECOM_CLI_AUTH_ENDPOINT", None, || {
             assert_eq!(
-                resolve_auth_endpoint(Some(&ConfigFile::default())),
+                resolve_auth_endpoint(Some(&ConfigFile::default())).full_url(),
                 "https://qyapi.weixin.qq.com/cgi-bin/aibot/cli/get_cli_config"
             );
         });
@@ -333,7 +346,7 @@ mod tests {
     fn auth_endpoint_none_falls_back_to_default() {
         with_env("WECOM_CLI_AUTH_ENDPOINT", None, || {
             assert_eq!(
-                resolve_auth_endpoint(None),
+                resolve_auth_endpoint(None).full_url(),
                 "https://qyapi.weixin.qq.com/cgi-bin/aibot/cli/get_cli_config"
             );
         });
@@ -350,7 +363,7 @@ mod tests {
             Some("https://example.com/cgi-bin/aibot/cli/get_cli_config"),
             || {
                 assert_eq!(
-                    resolve_auth_endpoint(Some(&ConfigFile::default())),
+                    resolve_auth_endpoint(Some(&ConfigFile::default())).full_url(),
                     "https://example.com/cgi-bin/aibot/cli/get_cli_config"
                 );
             },
@@ -369,7 +382,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                resolve_auth_endpoint(Some(&cfg)),
+                resolve_auth_endpoint(Some(&cfg)).full_url(),
                 "https://config.example.com/auth"
             );
         });

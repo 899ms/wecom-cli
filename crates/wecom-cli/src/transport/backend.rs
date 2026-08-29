@@ -6,10 +6,11 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use wecom_transport::{
-    Endpoint, HttpRequestPayload, RequestOptions, Transport, TransportBackend, TransportResponse,
+    Endpoint, EndpointHttpExt, HttpRequestPayload, RequestOptions, Transport, TransportBackend,
+    TransportResponse,
 };
 
-use super::capability::AuthRequirement;
+use super::capability::{RequireAuth, SuppressAuth};
 use crate::auth;
 use crate::error::Error;
 
@@ -19,16 +20,18 @@ pub(crate) const TOKEN_EXPIRED_ERRCODE: i64 = 853004;
 // ── wecom-cli 自有 transport backend ──────────────────────────
 
 /// wecom-cli 统一出网后端：所有请求都经它转发，负责
-/// - 按 endpoint 携带的 [`AuthRequirement`] 在调用时动态注入
-///   `Authorization: Bearer <token>`（未挂该能力不注入；`need_auth=true`
-///   无 token 时报 [`Error::Auth`](crate::error::Error)）；
+/// - 持有 token 即注入 `Authorization: Bearer <token>`（无论端点是否挂
+///   [`RequireAuth`]；无 token 则忽略不注入）；挂 [`RequireAuth`] 的端点在
+///   **前置门禁** 校验：无可用 token 直接报 [`Error::Auth`]，请求不发出。
+///   携带 [`SuppressAuth`] 的端点（换取 token 的引导接口）即使有 token 也不注入；
 /// - 捕获 853004（token 失效）→ 用 botid+secret 签名重新换取 token
-///   （落盘 + 内存缓存）→ 重放原请求一次。
+///   （落盘 + 内存缓存）→ 重放原请求一次（未注入 token 的请求不参与刷新）。
 ///
 /// 扁平响应等请求/响应封装由 wecom-transport 的 endpoint envelope 驱动，
 /// 本层不做特殊分流。
 ///
-/// 仅 JSON 载荷可重放；multipart 表单无法克隆，命中 853004 时直接返回原错误。
+/// 所有载荷均可重放：经 [`HttpRequestPayload`](wecom_transport::HttpRequestPayload)
+/// 工厂克隆（Arc 零成本），重放 = 再次 build。
 #[derive(Clone)]
 pub(crate) struct WecomBackend {
     /// 底层 HTTP 传输（信封解析 + 长任务轮询路径）。
@@ -40,8 +43,9 @@ pub(crate) struct WecomBackend {
     token: Arc<RwLock<Option<String>>>,
     /// 串行化刷新，避免并发请求重复换取 token。
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
-    /// 鉴权引导端点（`transport::build` 时从已加载的 ConfigFile 解析，token 刷新时复用）。
-    auth_endpoint: String,
+    /// 鉴权引导端点（`transport::build` 时经 `auth::resolve_auth_endpoint` 装配，
+    /// token 刷新时复用）。
+    auth_endpoint: Endpoint,
 }
 
 // 不输出 bot secret 与缓存 token。
@@ -58,7 +62,7 @@ impl WecomBackend {
         inner: Arc<dyn TransportBackend>,
         bot: Option<auth::Bot>,
         token: Option<String>,
-        auth_endpoint: String,
+        auth_endpoint: Endpoint,
     ) -> Self {
         Self {
             inner,
@@ -122,7 +126,7 @@ impl WecomBackend {
         let token = resp.token.filter(|t| !t.is_empty()).ok_or_else(|| {
             Error::protocol(
                 "token 刷新响应缺少访问令牌",
-                &self.auth_endpoint,
+                self.auth_endpoint.full_url(),
                 serde_json::Value::Null,
             )
         })?;
@@ -142,7 +146,7 @@ impl TransportBackend for WecomBackend {
     fn execute<'a>(
         &'a self,
         endpoint: Cow<'a, Endpoint>,
-        payload: HttpRequestPayload<'a>,
+        payload: HttpRequestPayload,
         options: RequestOptions,
     ) -> Pin<
         Box<
@@ -152,31 +156,32 @@ impl TransportBackend for WecomBackend {
         >,
     > {
         Box::pin(async move {
-            // 仅 JSON 载荷可克隆重放。
-            let replay_payload = match &payload {
-                HttpRequestPayload::Json(value) => Some(value.clone()),
-                HttpRequestPayload::Form(_) => None,
-            };
+            // 所有载荷均可重放：clone 工厂（Arc 零成本），重放 = 再次 build。
+            let replay_payload = payload.clone();
 
             let mut options = options;
-            // 端点声明 need_auth 时注入 Bearer token，并记下本次发送值供 853004 刷新去重。
-            let sent_token = if endpoint
-                .as_ref()
-                .get::<AuthRequirement>()
-                .is_some_and(|a| a.need_auth)
-            {
-                let Some(token) = self.cached_token() else {
+
+            // 抑制注入：换取 token 的引导端点即使持有 token 也不携带 Authorization。
+            let sent_token = if endpoint.as_ref().get::<SuppressAuth>().is_some() {
+                None
+            } else {
+                let token = self.cached_token();
+
+                // 门禁前置：挂 RequireAuth 的端点必须已有可用 token，否则请求不发出。
+                if endpoint.as_ref().get::<RequireAuth>().is_some() && token.is_none() {
                     tracing::debug!("endpoint requires auth but no token available");
                     return Err(Error::Auth(format!(
                         "该请求需要授权，请先运行 `{} auth init` 登录",
                         env!("CARGO_BIN_NAME")
                     ))
                     .into());
-                };
-                set_bearer_token(&mut options, &token);
-                Some(token)
-            } else {
-                None
+                }
+
+                // 有 token 就注入（无论是否挂 RequireAuth），无 token 则忽略；
+                // 记下本次发送值供 853004 刷新去重。
+                token
+                    .clone()
+                    .inspect(|token| set_bearer_token(&mut options, token))
             };
 
             let err = match self
@@ -190,17 +195,19 @@ impl TransportBackend for WecomBackend {
             if !is_token_expired(&err) {
                 return Err(err);
             }
-            tracing::info!("token expired (853004), attempting silent refresh");
-            let Some(json) = replay_payload else {
-                tracing::warn!("no replay payload, cannot refresh token");
+            // 未注入 token 的请求不可能因 token 过期失败（无 token / 抑制注入的
+            // 引导端点）——不参与刷新，直接返回原错误。
+            if sent_token.is_none() {
+                tracing::warn!("token expired but no token was sent");
                 return Err(err);
-            };
+            }
             // 无 bot 凭据时无法签名换取新 token，不参与自动刷新。
             if self.bot.is_none() {
                 tracing::warn!("missing bot credentials, cannot refresh token");
                 return Err(err);
             }
 
+            tracing::info!("token expired (853004), attempting silent refresh");
             match self
                 .refresh_token(sent_token.as_deref(), options.clone())
                 .await
@@ -208,9 +215,8 @@ impl TransportBackend for WecomBackend {
                 Ok(token) => {
                     tracing::info!("token refreshed, retrying the original request");
                     set_bearer_token(&mut options, &token);
-                    self.inner
-                        .execute(endpoint, HttpRequestPayload::Json(json), options)
-                        .await
+                    // 重放 = 重新走完整流水线：发送链会再次 build。
+                    self.inner.execute(endpoint, replay_payload, options).await
                 }
                 Err(refresh_err) => {
                     tracing::warn!(error = %refresh_err, "token refresh failed, returning the original error");

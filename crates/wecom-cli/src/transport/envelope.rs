@@ -81,8 +81,8 @@ impl ResponseEnvelope for NestedRes {
 /// 业务数据的位置：`results_json` 字符串 vs 顶层平铺字段（`extra`）。
 /// 供鉴权引导等「不套网关 `results_json` 信封」的接口使用：`errcode` 校验
 /// 复用 [`validate_flat_api_response`]，`extra` 即业务结果。
-/// 端点默认不带 [`AuthRequirement`](crate::transport::capability::AuthRequirement)，
-/// 天然不注入 Authorization。
+/// 引导端点须显式挂 [`SuppressAuth`](crate::transport::SuppressAuth)
+/// 抑制 Authorization 注入（换取 token 的请求不得携带 token）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FlatRes;
 

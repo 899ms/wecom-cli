@@ -18,7 +18,19 @@ pub mod event {
 
 /// Wire contract for the `method_alias` telemetry event.
 ///
-/// Emitted when a CLI command path is resolved through an alias mapping.
+/// Single emission point: [`crate::service::ServiceHandle::method`]. Emitted
+/// when resolving a method path rewrote the caller's input at either alias
+/// layer — the service-name alias (`ServiceInfo::alias`) or a method-path
+/// alias (`MethodSchema::path_alias`). At most one event per method
+/// resolution: `input` is the command path as originally typed (service
+/// alias preserved), `resolved` is the fully canonical path, so a call
+/// rewritten at both layers is still one `input` → `resolved` pair
+/// (e.g. `"human-resources search"` → `"hr users search"`).
+///
+/// Not emitted for: exact-name + real-path resolution, and entry points
+/// that never resolve a method (bare service help / `--doc` / `--schema` /
+/// `+helper`).
+///
 /// Payload fields:
 ///
 /// | Field       | Type   | Description                          |

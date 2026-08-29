@@ -2,7 +2,7 @@ use futures_util::StreamExt;
 use tracing::Instrument;
 
 use super::body_guard;
-use super::request::{HttpRequest, HttpRequestPayload};
+use super::request::{HttpRequest, HttpRequestBody};
 use super::response::HttpResponse;
 use crate::http::EndpointHttpExt;
 use crate::telemetry::contract::http_request as ctr;
@@ -48,9 +48,14 @@ pub(crate) async fn reqwest_request(
 
         let mut request = client.post(&url).headers(headers);
 
-        request = match req.payload {
-            HttpRequestPayload::Json(value) => request.json(value.as_ref()),
-            HttpRequestPayload::Form(form) => request.multipart(form),
+        // Single materialization point: build (deferred). The envelope wrap is
+        // composed into the factory at the pipeline entry, and the first-segment
+        // `Range` header is derived by `pipeline_execute` — this chain is a pure
+        // pass-through for JSON / multipart bodies.
+        let data = req.payload.build().await?;
+        request = match data {
+            HttpRequestBody::Json(value) => request.json(value.as_ref()),
+            HttpRequestBody::Form(form) => request.multipart(form),
         };
 
         let request = super::shared::finalize_request(request, req.options.timeout)?;
@@ -86,10 +91,10 @@ pub(crate) async fn reqwest_request(
         }
 
         // Map reqwest stream errors to Error::Network. The error is also recorded
-        // onto the current span here — the outer match-on-result收口 only catches
-        // failures that happen *before* HttpResponse is returned, and the stream
-        // produces errors *after* that point. The span is kept alive via
-        // `with_span` below until the body is fully consumed.
+        // onto the current span here — the outer match on the final result only
+        // catches failures that happen *before* HttpResponse is returned, and
+        // the stream produces errors *after* that point. The span is kept alive
+        // via `with_span` below until the body is fully consumed.
         let url_for_err = url.clone();
         let mapped = response.bytes_stream().map(move |result| {
             result
@@ -124,27 +129,36 @@ pub(crate) async fn reqwest_request(
 
 #[cfg(test)]
 mod tests {
-    //! ## 模块摘要：direct（reqwest 后端的纯 HTTP 透传函数 [reqwest_request]）
+    //! ## Module summary: reqwest_send (the reqwest backend's raw HTTP
+    //! transmission function [reqwest_request])
     //!
-    //! ### 关键接口
-    //! - [reqwest_request] — 用 `reqwest::Client` 发送一次 [HttpRequest]，
-    //!   返回原始 [HttpResponse]（含 endpoint / status / headers / 流式 body）
+    //! ### Key interfaces
+    //! - [reqwest_request] — send one [HttpRequest] with a `reqwest::Client`,
+    //!   returning the raw [HttpResponse] (endpoint / status / headers /
+    //!   streaming body)
     //!
-    //! ### 关键分支与异常路径
-    //! - HttpRequestPayload::Json → 以 application/json body 发送
-    //! - HttpRequestPayload::Form → 以 multipart/form-data 发送
-    //! - req.headers = Some(map) → 这些 header 被附加到出站请求
-    //! - req.headers = None → 不附加额外 header，请求仍能成功
-    //! - req.options.timeout = Some(t) 且服务端慢响应 > t → 返回 Error::Network（reqwest timeout）
-    //! - 响应 2xx → 返回 HttpResponse（status/headers 透传，不做 Content-Type 判别）
-    //! - 响应非 2xx → 返回 Error::Http（status 与 endpoint 正确）
-    //! - 目标主机不可达 → 返回 Error::Network
-    //! - 响应 body 通过 bytes_stream 暴露给上层，能完整读出
+    //! ### Key branches and error paths
+    //! - HttpRequestBody::Json → sent as an application/json body
+    //! - HttpRequestBody::Form → sent as multipart/form-data
+    //! - payload goes through the single materialization point: build
+    //!   (deferred); the envelope wrap is composed at the pipeline entry and
+    //!   the first-segment Range header is derived by `pipeline_execute`
+    //! - req.headers = Some(map) → those headers are attached to the outbound request
+    //! - req.headers = None → no extra headers attached; the request still succeeds
+    //! - req.options.timeout = Some(t) with a slow response > t → Error::Network
+    //!   (reqwest timeout)
+    //! - 2xx response → HttpResponse (status/headers passed through, no
+    //!   Content-Type discrimination)
+    //! - non-2xx response → Error::Http (correct status and endpoint)
+    //! - unreachable host → Error::Network
+    //! - the response body is exposed to upper layers via bytes_stream and can
+    //!   be read out completely
     //!
-    //! ### 上下游交互
-    //! - 上游：[HttpRequest](crate::HttpRequest) 在 Reqwest 后端时调用本函数
-    //! - 下游：reqwest::Response 的非 2xx 统一映射为 [Error::Http]、
-    //!   reqwest 发送失败统一映射为 [Error::Network]
+    //! ### Upstream/downstream
+    //! - upstream: [HttpRequest](crate::HttpRequest) calls this function on the
+    //!   reqwest backend
+    //! - downstream: non-2xx reqwest::Response maps to [Error::Http]; reqwest
+    //!   send failures map to [Error::Network]
 
     use std::borrow::Cow;
 
@@ -196,17 +210,13 @@ mod tests {
         HttpRequest::new(
             dummy_client(),
             Cow::Borrowed(endpoint),
-            HttpRequestPayload::Json(Cow::Borrowed(payload)),
+            HttpRequestPayload::json(payload.clone()),
         )
     }
 
     /// 用 multipart Form payload 构造一个 HttpRequest（不设置 headers / timeout）。
-    fn make_form_req(endpoint: &Endpoint, form: reqwest::multipart::Form) -> HttpRequest<'_> {
-        HttpRequest::new(
-            dummy_client(),
-            Cow::Borrowed(endpoint),
-            HttpRequestPayload::Form(form),
-        )
+    fn make_form_req(endpoint: &Endpoint, form: HttpRequestPayload) -> HttpRequest<'_> {
+        HttpRequest::new(dummy_client(), Cow::Borrowed(endpoint), form)
     }
 
     /// 把 `HttpResponse` 的 body 全部读出来，便于断言。
@@ -309,7 +319,9 @@ mod tests {
             .await;
 
         let endpoint = ep(&server.uri(), "/upload");
-        let form = reqwest::multipart::Form::new().text("field", "value");
+        let form = HttpRequestPayload::form(|| async {
+            Ok(reqwest::multipart::Form::new().text("field", "value"))
+        });
         let req = make_form_req(&endpoint, form);
 
         let resp = reqwest_request(&client, req).await.unwrap();
@@ -427,7 +439,9 @@ mod tests {
             .await;
 
         let endpoint = ep(&server.uri(), "/upload/headers");
-        let form = reqwest::multipart::Form::new().text("field", "value");
+        let form = HttpRequestPayload::form(|| async {
+            Ok(reqwest::multipart::Form::new().text("field", "value"))
+        });
         let mut req = make_form_req(&endpoint, form);
         let mut hdrs = reqwest::header::HeaderMap::new();
         hdrs.insert(
@@ -512,7 +526,9 @@ mod tests {
             .await;
 
         let endpoint = ep(&server.uri(), "/upload/big");
-        let form = reqwest::multipart::Form::new().text("f", "v");
+        let form = HttpRequestPayload::form(|| async {
+            Ok(reqwest::multipart::Form::new().text("f", "v"))
+        });
         let req = make_form_req(&endpoint, form);
 
         let err = reqwest_request(&client, req).await.unwrap_err();

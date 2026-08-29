@@ -437,4 +437,25 @@ mod tests {
                 .is_ok()
         );
     }
+
+    /// P1：[HelperMeta::with_request_schema] 设置原始请求 schema
+    /// 条件：传入一个自定义 JsonSchema
+    /// 断言：request 被替换为该 schema
+    #[test]
+    fn with_request_schema_sets_raw_schema() {
+        let raw = schema::JsonSchema::default();
+        let meta = HelperMeta::new("h", "d").with_request_schema(raw.clone());
+        assert_eq!(meta.request.schema_type, raw.schema_type);
+    }
+
+    /// P1：[HelperMeta::with_response_schema] 设置原始响应 schema
+    /// 条件：传入一个自定义 JsonSchema
+    /// 断言：response 为 Some 且 schema_type 一致
+    #[test]
+    fn with_response_schema_sets_raw_schema() {
+        let raw = schema::JsonSchema::default();
+        let meta = HelperMeta::new("h", "d").with_response_schema(raw.clone());
+        let resp = meta.response.expect("response should be present");
+        assert_eq!(resp.schema_type, raw.schema_type);
+    }
 }

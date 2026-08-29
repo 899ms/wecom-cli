@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::http_client::IntoRequestPayload;
+use crate::http_client::IntoHttpRequestPayload;
 use crate::{RequestOptions, TransportBackend};
 
 // ── Transport struct ──────────────────────────────────────────
@@ -255,7 +255,7 @@ impl Transport {
     pub fn invoke<'a, E, P>(&'a self, endpoint: E, payload: P) -> crate::TransportRequest<'a>
     where
         E: crate::IntoCowEndpoint<'a>,
-        P: IntoRequestPayload<'a>,
+        P: IntoHttpRequestPayload,
     {
         let endpoint = endpoint.into_cow_endpoint();
         let payload = payload.into_http_request_payload();
@@ -435,26 +435,28 @@ mod tests {
         let _ = transport.invoke(ep("http://x.com", "/y"), &payload);
     }
 
-    /// P0：[Transport::invoke] payload 接受 `&Value` / owned `Value` / `Cow<Value>` 三种形态
+    /// P0：[Transport::invoke] payload 接受 `&Value` / owned `Value` / `HttpRequestPayload` 三种形态
     /// 条件：分别用三种形式传入 payload
-    /// 断言：三次构造均成功（不 panic），覆盖 IntoCowValue 三个 impl
+    /// 断言：三次构造均成功（不 panic），覆盖 IntoHttpRequestPayload 三个 impl
     #[test]
     fn invoke_accepts_all_payload_forms() {
-        use std::borrow::Cow;
+        use crate::http_client::HttpRequestPayload;
 
         let transport = http_transport();
         let endpoint = ep("http://x.com", "/y");
 
-        // &Value → Cow::Borrowed
+        // &Value → JSON 工厂
         let borrowed = serde_json::json!({"a": 1});
         let _ = transport.invoke(&endpoint, &borrowed);
 
-        // Value → Cow::Owned
+        // Value → JSON 工厂
         let _ = transport.invoke(&endpoint, serde_json::json!({"a": 1}));
 
-        // Cow<Value> 透传
-        let cow: Cow<'_, serde_json::Value> = Cow::Owned(serde_json::json!({"a": 1}));
-        let _ = transport.invoke(&endpoint, cow);
+        // HttpRequestPayload 幂等透传
+        let _ = transport.invoke(
+            &endpoint,
+            HttpRequestPayload::json(serde_json::json!({"a": 1})),
+        );
     }
 
     // ── Transport::extensions ──
@@ -504,5 +506,78 @@ mod tests {
             req.get_extensions().get::<ExtFixture>(),
             Some(&ExtFixture(9))
         );
+    }
+
+    // ── wrap_backend / timeout ──
+
+    /// P1：[Transport::wrap_backend] 运行时包装 backend
+    /// 条件：wrap_backend(|inner| inner)（恒等包装）
+    /// 断言：name() 保持 "http"
+    #[test]
+    fn wrap_backend_wraps() {
+        let t = http_transport().wrap_backend(|inner| inner);
+        assert_eq!(t.name(), "http");
+    }
+
+    /// P0：[Transport::with_timeout] 设置默认超时
+    /// 条件：with_timeout(5s)
+    /// 断言：timeout() 返回 Some(5s)
+    #[test]
+    fn with_timeout_sets_default() {
+        let t = http_transport().with_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(t.timeout(), Some(std::time::Duration::from_secs(5)));
+    }
+
+    /// P1：[Transport::timeout] 未设置时返回 None
+    /// 条件：默认 transport
+    /// 断言：timeout() 返回 None
+    #[test]
+    fn timeout_defaults_to_none() {
+        let t = http_transport();
+        assert_eq!(t.timeout(), None);
+    }
+
+    // ── with_header / with_header_sensitive / with_headers ──
+
+    /// P0：[Transport::with_header] 设置单个默认 header
+    /// 条件：with_header("x-trace", "abc")
+    /// 断言：headers 含 x-trace=abc
+    #[test]
+    fn with_header_sets_default_header() {
+        let t = http_transport().with_header("x-trace", "abc").unwrap();
+        assert_eq!(t.headers().get("x-trace").unwrap(), "abc");
+    }
+
+    /// P0：[Transport::with_header_sensitive] 敏感 header 值标记为 sensitive
+    /// 条件：with_header_sensitive("authorization", "tok", true)
+    /// 断言：header 值 is_sensitive() 为 true
+    #[test]
+    fn with_header_sensitive_marks_value() {
+        let t = http_transport()
+            .with_header_sensitive("authorization", "tok", true)
+            .unwrap();
+        assert!(t.headers().get("authorization").unwrap().is_sensitive());
+    }
+
+    /// P1：[Transport::with_header] 非法 header value 返回 Err
+    /// 条件：with_header("x", "bad\nvalue")（value 含换行）
+    /// 断言：返回 Err
+    #[test]
+    fn with_header_invalid_value_errors() {
+        let result = http_transport().with_header("x", "bad\nvalue");
+        assert!(result.is_err());
+    }
+
+    /// P0：[Transport::with_headers] 批量设置默认 headers
+    /// 条件：with_headers(含 x-a=1, x-b=2 的 HeaderMap)
+    /// 断言：headers 含两个键
+    #[test]
+    fn with_headers_sets_default_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-a", reqwest::header::HeaderValue::from_static("1"));
+        headers.insert("x-b", reqwest::header::HeaderValue::from_static("2"));
+        let t = http_transport().with_headers(headers);
+        assert_eq!(t.headers().get("x-a").unwrap(), "1");
+        assert_eq!(t.headers().get("x-b").unwrap(), "2");
     }
 }

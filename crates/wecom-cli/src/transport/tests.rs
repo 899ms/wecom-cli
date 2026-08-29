@@ -8,7 +8,7 @@ use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 use wecom_transport::{HttpTransportBackend, RequestOptions, ResponseEnvelope, Transport};
 
 use super::backend::{TOKEN_EXPIRED_ERRCODE, is_token_expired, set_bearer_token};
-use super::capability::AuthRequirement;
+use super::capability::{RequireAuth, SuppressAuth};
 use super::envelope::{FlatRes, NestedRes};
 use super::*;
 use crate::auth;
@@ -41,7 +41,7 @@ fn wrapped_transport(
                 backend,
                 bot,
                 token.map(str::to_owned),
-                auth_endpoint.to_string(),
+                auth_ep(auth_endpoint),
             ))
         })
 }
@@ -50,6 +50,13 @@ fn wrapped_transport(
 fn ep(base: &str, path: &str) -> wecom_transport::Endpoint {
     wecom_transport::Endpoint::new()
         .with(wecom_transport::HttpEndpoint::new(path).with_service(base))
+}
+
+/// 装配鉴权引导端点（与 auth 侧引导端点等价：FlatRes 信封 + SuppressAuth）。
+fn auth_ep(url: &str) -> wecom_transport::Endpoint {
+    wecom_transport::Endpoint::new()
+        .with(wecom_transport::HttpEndpoint::from_url(url).with_res_envelope(FlatRes))
+        .with(SuppressAuth)
 }
 
 fn api_error(code: Option<i64>) -> wecom_transport::Error {
@@ -127,7 +134,7 @@ fn wrap_backend_decorates_in_place() {
             backend,
             Some(auth::Bot::new("bot1".into(), "secret1".into())),
             Some("tok-1".into()),
-            TEST_AUTH_ENDPOINT.to_string(),
+            auth_ep(TEST_AUTH_ENDPOINT),
         ))
     });
     assert_eq!(transport.name(), "http");
@@ -142,7 +149,7 @@ fn debug_does_not_leak_secrets() {
         Arc::new(HttpTransportBackend::default()),
         Some(auth::Bot::new("bot1".into(), "super-secret".into())),
         Some("cached-token".into()),
-        TEST_AUTH_ENDPOINT.to_string(),
+        auth_ep(TEST_AUTH_ENDPOINT),
     );
     let dbg = format!("{backend:?}");
     assert!(!dbg.contains("super-secret"), "secret 泄露: {dbg}");
@@ -158,7 +165,7 @@ fn no_bot_credentials_token_cached() {
         Arc::new(HttpTransportBackend::default()),
         None,
         Some("cached-token".into()),
-        TEST_AUTH_ENDPOINT.to_string(),
+        auth_ep(TEST_AUTH_ENDPOINT),
     );
     assert!(backend.bot.is_none());
     assert_eq!(backend.cached_token().as_deref(), Some("cached-token"));
@@ -166,11 +173,11 @@ fn no_bot_credentials_token_cached() {
 
 // ── 动态 Authorization 注入 ───────────────────────────────
 
-/// P0：[WecomBackend] need_auth=true + 有 token → 调用时注入 Authorization 头
-/// 条件：endpoint need_auth=true，token=tok-x；mock 要求 authorization: Bearer tok-x
+/// P0：[WecomBackend] 挂 RequireAuth + 有 token → 调用时注入 Authorization 头
+/// 条件：endpoint 挂 RequireAuth，token=tok-x；mock 要求 authorization: Bearer tok-x
 /// 断言：invoke 成功，into_result()=={"ok":true}，mock 命中
 #[tokio::test]
-async fn injects_auth_when_need_auth_and_token_available() {
+async fn injects_auth_when_require_auth_and_token_available() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/auth"))
@@ -181,7 +188,7 @@ async fn injects_auth_when_need_auth_and_token_available() {
         .await;
 
     let transport = wrapped_transport(&server.uri(), None, Some("tok-x"), TEST_AUTH_ENDPOINT);
-    let endpoint = ep(&server.uri(), "/auth").with(AuthRequirement::new(true));
+    let endpoint = ep(&server.uri(), "/auth").with(RequireAuth);
     let v = transport
         .invoke(&endpoint, json!({}))
         .await
@@ -192,11 +199,11 @@ async fn injects_auth_when_need_auth_and_token_available() {
     server.verify().await;
 }
 
-/// P0：[WecomBackend] AuthRequirement{need_auth:true} + 无 token → Err(Error::Auth)，请求不发出
-/// 条件：endpoint 挂 AuthRequirement::new(true)，无 token；mock expect(0)
+/// P0：[WecomBackend] 挂 RequireAuth + 无 token → Err(Error::Auth)，请求不发出
+/// 条件：endpoint 挂 RequireAuth，无 token；mock expect(0)
 /// 断言：invoke 返回 Err(wecom_transport::Error::Other(CliError::Auth))，mock 未被调用
 #[tokio::test]
-async fn rejects_need_auth_without_token() {
+async fn rejects_require_auth_without_token() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/auth"))
@@ -206,7 +213,7 @@ async fn rejects_need_auth_without_token() {
         .await;
 
     let transport = wrapped_transport(&server.uri(), None, None, TEST_AUTH_ENDPOINT);
-    let endpoint = ep(&server.uri(), "/auth").with(AuthRequirement::new(true));
+    let endpoint = ep(&server.uri(), "/auth").with(RequireAuth);
     let err = transport.invoke(&endpoint, json!({})).await.unwrap_err();
     match err {
         wecom_transport::Error::Other(e) => {
@@ -221,11 +228,39 @@ async fn rejects_need_auth_without_token() {
     server.verify().await;
 }
 
-/// P0：[WecomBackend] 未挂 AuthRequirement 能力（need_auth=false）+ 有 token → 不注入 Authorization 头
-/// 条件：endpoint 不挂 AuthRequirement，token=tok-x；mock 要求无 Authorization 头
-/// 断言：invoke 成功，into_result()=={"ok":true}，mock 命中（证明未注入）
+/// P0：[WecomBackend] 未挂 RequireAuth 能力 + 有 token → 仍注入 Authorization 头
+/// 条件：endpoint 不挂 RequireAuth（如 ServiceDiscovery），token=tok-x；
+///       mock 要求 authorization: Bearer tok-x
+/// 断言：invoke 成功，into_result()=={"ok":true}，mock 命中（证明注入）
 #[tokio::test]
-async fn does_not_inject_auth_when_need_auth_false() {
+async fn injects_auth_on_endpoint_without_require_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open"))
+        .and(wiremock::matchers::header("authorization", "Bearer tok-x"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": "{\"ok\":true}"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let transport = wrapped_transport(&server.uri(), None, Some("tok-x"), TEST_AUTH_ENDPOINT);
+    let endpoint = ep(&server.uri(), "/open");
+    let v = transport
+        .invoke(&endpoint, json!({}))
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    assert_json_eq!(v, json!({"ok": true}));
+    server.verify().await;
+}
+
+/// P0：[WecomBackend] 无 token + 未挂 RequireAuth 门禁（如未登录时的 ServiceDiscovery）
+/// → 不注入 Authorization 头，请求正常发出
+/// 条件：endpoint 不挂 RequireAuth，无 token；mock 要求无 Authorization 头
+/// 断言：invoke 成功，into_result()=={"ok":true}，mock 命中
+#[tokio::test]
+async fn no_token_no_require_auth_omits_auth_header() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/open"))
@@ -235,7 +270,7 @@ async fn does_not_inject_auth_when_need_auth_false() {
         .mount(&server)
         .await;
 
-    let transport = wrapped_transport(&server.uri(), None, Some("tok-x"), TEST_AUTH_ENDPOINT);
+    let transport = wrapped_transport(&server.uri(), None, None, TEST_AUTH_ENDPOINT);
     let endpoint = ep(&server.uri(), "/open");
     let v = transport
         .invoke(&endpoint, json!({}))
@@ -323,11 +358,12 @@ fn results_json_res_inner_api_error_is_validated() {
 
 // ── FlatRes（扁平响应）───────────────────────────────
 
-/// P0：[WecomBackend] FlatRes 端点顶层平铺字段（extra）即结果，且不注入 Authorization
-/// 条件：endpoint 配 FlatRes envelope，有旧 token；mock 返回 {errcode:0, token:"t1"} 且要求无 Authorization
+/// P0：[WecomBackend] FlatRes 引导端点挂 SuppressAuth → 即使有 token 也不注入 Authorization
+/// 条件：endpoint 配 FlatRes envelope + SuppressAuth，有旧 token；
+///       mock 返回 {errcode:0, token:"t1"} 且要求无 Authorization
 /// 断言：into_result() == {"token":"t1"}；mock 命中（未注入 token）
 #[tokio::test]
-async fn flat_envelope_returns_extra_without_auth() {
+async fn flat_envelope_bootstrap_suppresses_auth() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/bootstrap"))
@@ -345,6 +381,7 @@ async fn flat_envelope_returns_extra_without_auth() {
             .with_service(server.uri())
             .with_res_envelope(FlatRes),
     );
+    let endpoint = endpoint.with(SuppressAuth);
     let v = transport
         .invoke(&endpoint, json!({}))
         .await
@@ -424,7 +461,7 @@ async fn refresh_reuses_execute_options_without_stale_auth() {
             Some("tok-old"),
             &auth_url,
         );
-        let endpoint = ep(&server.uri(), "/api").with(AuthRequirement::new(true));
+        let endpoint = ep(&server.uri(), "/api").with(RequireAuth);
 
         let v = transport
             .invoke(&endpoint, json!({}))

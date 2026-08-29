@@ -1,4 +1,4 @@
-// E2E tests for [`HttpTransportBackend::post`] —— 协议无关的原始 HTTP 通道。
+// 本组 E2E 用例基于 [`HttpTransportBackend::post`] —— 协议无关的原始 HTTP 通道。
 //
 // 在新架构里：
 // - [`HttpTransportBackend::post`]：纯 HTTP 透传，不做 ApiResponse 解析、long_task 轮询、

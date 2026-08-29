@@ -48,6 +48,9 @@ pub(crate) fn clamp_size(size: u64) -> u64 {
 ///
 /// `size` must be `>= 1` (use `clamp_size` first); the byte range is pure
 /// ASCII digits so the resulting value is always header-safe.
+///
+/// Callers (e.g. the `pipeline_binary` resume closure) build the header
+/// directly and attach it via `wire.headers`.
 pub fn range_header_value(start: u64, size: u64) -> Result<reqwest::header::HeaderValue> {
     let end = start + size - 1;
     reqwest::header::HeaderValue::from_str(&format!("bytes={start}-{end}"))

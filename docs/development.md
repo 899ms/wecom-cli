@@ -9,7 +9,7 @@
 | 路径 | 说明 |
 | --- | --- |
 | `crates/wecom/` | 核心库（lib）：`Client`/`ClientBuilder`、discovery 服务发现与缓存、schema 指令（`x-wecom-*`）、builtins（媒体上传/下载）、HelperRegistry、端点目录（`EndpointKey`/`EndpointCatalog`）、网关扁平信封（`PayloadStringReq`/`NestedRes`） |
-| `crates/wecom-cli/` | 二进制（bin）：`main.rs` 组装 Client 并 `run`；`auth` 鉴权体系（bot 凭据/扫码/签名引导/凭据加密）；`WecomBackend`（按 `need_auth` 动态注入 Bearer token + 853004 静默刷新）；config/env/logging；`auth` 命令经扩展命令点挂载 |
+| `crates/wecom-cli/` | 二进制（bin）：`main.rs` 组装 Client 并 `run`；`auth` 鉴权体系（bot 凭据/扫码/签名引导/凭据加密）；`WecomBackend`（持有 token 即注入 Bearer token、`RequireAuth` 前置门禁 + 853004 静默刷新）；config/env/logging；`auth` 命令经扩展命令点挂载 |
 | `crates/wecom-transport/` | 传输层：`TransportBackend` trait、reqwest HTTP 后端、长任务轮询、请求/响应信封 trait（`RequestEnvelope`/`ResponseEnvelope`）、端点目录泛型机制（`EndpointCatalog<K>`/`CatalogKey`） |
 | `bin/wecom.js` | npm 入口脚本，负责定位并执行当前平台的二进制 |
 | `packages/*` | 各平台的 npm 二进制包 |

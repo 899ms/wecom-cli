@@ -5,7 +5,16 @@ async fn run() {
 
     let server = MockServer::start().await;
 
-    // Only service detail mock needed for schema get
+    // service_with_options now fetches catalog first to resolve aliases
+    Mock::given(method("POST"))
+        .and(path("/service/discovery"))
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(catalog_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Service detail mock for schema get
     Mock::given(method("POST"))
         .and(path("/service/discovery"))
         .and(body_json(json!({"service": "hr"})))

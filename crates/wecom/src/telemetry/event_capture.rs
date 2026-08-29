@@ -200,6 +200,7 @@ mod tests {
     use std::sync::Mutex;
 
     use assert_json_diff::assert_json_eq;
+    use tracing::field::Visit;
     use tracing_subscriber::prelude::*;
 
     use super::*;
@@ -369,5 +370,85 @@ mod tests {
         let restored: ClientEvent = serde_json::from_str(&json_str).expect("deserialize");
         assert_eq!(original.kind, restored.kind);
         assert_json_eq!(original.payload, restored.payload);
+    }
+
+    /// 构造一个具有指定名称的 tracing field，供 EventVisitor 单测使用。
+    fn field(name: &'static str) -> tracing::field::Field {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::Registry::default());
+        let span = tracing::info_span!(
+            "visitor_fields",
+            kind = "x",
+            payload = "y",
+            other = "z",
+            other2 = "w"
+        );
+        let metadata = span.metadata().expect("span metadata present");
+        metadata
+            .fields()
+            .field(name)
+            .unwrap_or_else(|| panic!("field {name} not found"))
+    }
+
+    /// P1：[EventVisitor::record_str] 记录 kind 与 payload 字段
+    /// 条件：通过 record_str 写入 kind="method_alias" 与 payload 为 JSON 字符串
+    /// 断言：into_event 后 kind 与 payload 正确解析
+    #[test]
+    fn event_visitor_records_kind_and_payload_via_str() {
+        let mut visitor = EventVisitor::default();
+        visitor.record_str(&field("kind"), "method_alias");
+        visitor.record_str(&field("payload"), r#"{"a":1}"#);
+        let ev = visitor.into_event();
+        assert_eq!(ev.kind, "method_alias");
+        assert_json_eq!(ev.payload, serde_json::json!({"a": 1}));
+    }
+
+    /// P1：[EventVisitor::record_debug] 记录 kind 与 payload 字段
+    /// 条件：通过 record_debug 写入 kind（&str）与 payload（DisplayValue，Debug 委托 Display）
+    /// 断言：into_event 后 kind 与 payload 正确解析
+    #[test]
+    fn event_visitor_records_kind_and_payload_via_debug() {
+        let mut visitor = EventVisitor::default();
+        visitor.record_debug(&field("kind"), &"method_alias");
+        let value = serde_json::json!({"a":1});
+        let payload = tracing::field::display(&value);
+        visitor.record_debug(&field("payload"), &payload);
+        let ev = visitor.into_event();
+        assert_eq!(ev.kind, "method_alias");
+        assert_json_eq!(ev.payload, serde_json::json!({"a": 1}));
+    }
+
+    /// P2：[EventVisitor] 未知字段被忽略
+    /// 条件：通过 record_str / record_debug 写入非 kind/payload 字段
+    /// 断言：into_event 后 kind 为空串、payload 为 Null
+    #[test]
+    fn event_visitor_ignores_unknown_fields() {
+        let mut visitor = EventVisitor::default();
+        visitor.record_str(&field("other"), "value");
+        visitor.record_debug(&field("other2"), &"value2");
+        let ev = visitor.into_event();
+        assert_eq!(ev.kind, "");
+        assert_eq!(ev.payload, serde_json::Value::Null);
+    }
+
+    /// P2：[EventVisitor::record_str] 非 JSON payload 回退为 None
+    /// 条件：record_str 写入 payload 为非法 JSON 字符串 "not-json"
+    /// 断言：into_event 后 payload 为 Null（解析失败回退）
+    #[test]
+    fn event_visitor_non_json_payload_falls_back_to_null() {
+        let mut visitor = EventVisitor::default();
+        visitor.record_str(&field("payload"), "not-json");
+        let ev = visitor.into_event();
+        assert_eq!(ev.payload, serde_json::Value::Null);
+    }
+
+    /// P2：[EventVisitor::into_event] 未记录任何字段时使用默认值
+    /// 条件：构造 default EventVisitor 后直接 into_event
+    /// 断言：kind 为空串、payload 为 Null
+    #[test]
+    fn event_visitor_defaults_when_empty() {
+        let visitor = EventVisitor::default();
+        let ev = visitor.into_event();
+        assert_eq!(ev.kind, "");
+        assert_eq!(ev.payload, serde_json::Value::Null);
     }
 }

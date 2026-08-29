@@ -23,7 +23,8 @@ use super::crypto;
 
 /// 启动时尝试迁移旧版凭据（`bot.enc` → `credentials.enc`）。
 ///
-/// `auth_endpoint` 为鉴权引导端点（由调用方解析后传入，测试可直接传 mock URL）。
+/// `endpoint` 为鉴权引导端点（由调用方经 [`resolve_auth_endpoint`] 装配后传入，
+/// 测试可经 `bootstrap::auth_endpoint` 传指向 mock server 的端点）。
 ///
 /// 返回是否发生了迁移；迁移语义失败一律返回 `Ok(false)`（静默降级，见模块 doc）。
 ///
@@ -35,7 +36,7 @@ use super::crypto;
 #[allow(clippy::disallowed_methods)]
 pub async fn try_migrate_legacy_credentials(
     transport: &Transport,
-    auth_endpoint: &str,
+    auth_endpoint: &wecom_transport::Endpoint,
 ) -> Result<bool> {
     // 1. 已有新凭据 → 不迁移（不碰 legacy 文件）。
     if super::credentials::credentials_path().exists() {
@@ -113,6 +114,7 @@ mod tests {
     use wecom_transport::HttpTransportBackend;
 
     use super::*;
+    use crate::auth::bootstrap::auth_endpoint;
     use crate::auth::{load_credentials, load_token};
     use crate::env::TEST_ENV_LOCK;
 
@@ -185,7 +187,7 @@ mod tests {
             let transport = test_transport(&server.uri());
             let migrated = try_migrate_legacy_credentials(
                 &transport,
-                &format!("{}/get_cli_config", server.uri()),
+                &auth_endpoint(&format!("{}/get_cli_config", server.uri())),
             )
             .await
             .unwrap();
@@ -225,10 +227,12 @@ mod tests {
             std::fs::write(dir.join("bot.enc"), b"legacy").unwrap();
 
             let transport = test_transport("http://localhost");
-            let migrated =
-                try_migrate_legacy_credentials(&transport, "http://localhost/get_cli_config")
-                    .await
-                    .unwrap();
+            let migrated = try_migrate_legacy_credentials(
+                &transport,
+                &auth_endpoint("http://localhost/get_cli_config"),
+            )
+            .await
+            .unwrap();
 
             assert!(!migrated, "expected no migration");
             assert!(dir.join("bot.enc").exists(), "legacy file untouched");
@@ -243,10 +247,12 @@ mod tests {
     async fn no_credentials_noop() {
         with_temp_dir(|dir| async move {
             let transport = test_transport("http://localhost");
-            let migrated =
-                try_migrate_legacy_credentials(&transport, "http://localhost/get_cli_config")
-                    .await
-                    .unwrap();
+            let migrated = try_migrate_legacy_credentials(
+                &transport,
+                &auth_endpoint("http://localhost/get_cli_config"),
+            )
+            .await
+            .unwrap();
 
             assert!(!migrated);
             assert!(!dir.join("credentials.enc").exists());
@@ -268,10 +274,12 @@ mod tests {
             write_legacy_bot(&dir, &bot, &key_a);
 
             let transport = test_transport("http://localhost");
-            let migrated =
-                try_migrate_legacy_credentials(&transport, "http://localhost/get_cli_config")
-                    .await
-                    .unwrap();
+            let migrated = try_migrate_legacy_credentials(
+                &transport,
+                &auth_endpoint("http://localhost/get_cli_config"),
+            )
+            .await
+            .unwrap();
 
             assert!(!migrated, "expected silent downgrade");
             assert!(dir.join("bot.enc").exists(), "legacy file kept");
@@ -304,7 +312,7 @@ mod tests {
             let transport = test_transport(&server.uri());
             let migrated = try_migrate_legacy_credentials(
                 &transport,
-                &format!("{}/get_cli_config", server.uri()),
+                &auth_endpoint(&format!("{}/get_cli_config", server.uri())),
             )
             .await
             .unwrap();
@@ -326,10 +334,12 @@ mod tests {
             std::fs::write(dir.join("token.enc"), b"legacy-token").unwrap();
 
             let transport = test_transport("http://localhost");
-            let migrated =
-                try_migrate_legacy_credentials(&transport, "http://localhost/get_cli_config")
-                    .await
-                    .unwrap();
+            let migrated = try_migrate_legacy_credentials(
+                &transport,
+                &auth_endpoint("http://localhost/get_cli_config"),
+            )
+            .await
+            .unwrap();
 
             assert!(!migrated);
             assert!(dir.join("token.enc").exists(), "token-only kept");

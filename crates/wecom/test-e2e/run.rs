@@ -163,6 +163,16 @@ mod run {
         use super::*;
         include!("cases/run/028-error-code-shows-help/test.rs");
     }
+
+    mod remote_doc {
+        use super::*;
+        include!("cases/run/029-remote-doc/test.rs");
+    }
+
+    mod service_alias {
+        use super::*;
+        include!("cases/run/032-service-alias/test.rs");
+    }
 }
 
 // ── headers ─────────────────────────────────────────────────

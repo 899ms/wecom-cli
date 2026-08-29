@@ -1,7 +1,7 @@
 //! HTTP 后端与传输层核心类型。
 //!
 //! 模块结构：
-//! - `request`   — HttpRequest / HttpRequestPayload / HttpRequestContext（纯 HTTP 透传）
+//! - `request`   — HttpRequest / HttpRequestPayload / HttpRequestBody / HttpRequestContext（纯 HTTP 透传）
 //! - `response`  — HttpResponse / ByteStream
 //! - [`HttpClient`]（trait）— 唯一发送抽象；`reqwest::Client` 直接 impl
 //! - `body_guard` — Drop-guarded body length counter for ByteStream
@@ -17,7 +17,8 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
-pub use request::{HttpRequest, HttpRequestPayload, IntoRequestPayload};
+pub(crate) use request::HttpRequestPayloadKind;
+pub use request::{HttpRequest, HttpRequestBody, HttpRequestPayload, IntoHttpRequestPayload};
 pub use response::{ByteStream, ContentRange, HttpResponse};
 
 use crate::{IntoCowEndpoint, Result};
@@ -62,7 +63,7 @@ impl HttpClient for reqwest::Client {
 
 /// `dyn HttpClient` 的 inherent 请求构造方法（非 trait 方法）。
 ///
-/// `post` 要保持 ergonomic（`impl IntoCowEndpoint` / `impl IntoRequestPayload`）
+/// `post` 要保持 ergonomic（`impl IntoCowEndpoint` / `impl IntoHttpRequestPayload`）
 /// 就得是泛型方法，而泛型方法会让 `HttpClient` trait 失去 object-safety；放在
 /// `impl dyn HttpClient` 上则 `self` 本身就是 `&dyn HttpClient`，无 unsize 障碍，
 /// 且 inherent 方法不参与 object-safety 判定。业务主形态 `Arc<dyn HttpClient>`
@@ -72,7 +73,7 @@ impl<'x> dyn HttpClient + 'x {
     pub fn post<'a, E, P>(&'a self, endpoint: E, payload: P) -> HttpRequest<'a>
     where
         E: IntoCowEndpoint<'a>,
-        P: IntoRequestPayload<'a>,
+        P: IntoHttpRequestPayload,
     {
         HttpRequest::new(
             self,

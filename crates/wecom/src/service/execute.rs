@@ -1,8 +1,6 @@
-use std::borrow::Cow;
-
 use indexmap::IndexMap;
 use tracing::field::Empty;
-use wecom_transport::TransportResponse;
+use wecom_transport::{HttpRequestPayload, TransportResponse};
 
 use super::{MethodHandle, RunOptions, output, schema_util};
 use crate::{CliRunOutput, Error, Result, directive, fs, schema};
@@ -93,11 +91,23 @@ pub(super) async fn execute_and_output(
     let on_extra_data = options.run.get_on_extra_data();
 
     let payload = if multipart {
-        wecom_transport::HttpRequestPayload::Form(
-            directive::build_multipart_form(fs, &options.payload, &directives).await?,
-        )
+        // multipart 经工厂包装（延迟物化）：每次发送/重放时重新打开文件构建独立表单。
+        let fs = fs.clone();
+        let payload = options.payload.clone();
+        let file_fields = directive::multipart_file_fields(&directives);
+        HttpRequestPayload::form(move || {
+            let fs = fs.clone();
+            let payload = payload.clone();
+            let file_fields = file_fields.clone();
+            async move {
+                directive::build_multipart_form(&fs, &payload, &file_fields)
+                    .await
+                    .map_err(crate::util::to_transport_error)
+            }
+        })
     } else {
-        wecom_transport::HttpRequestPayload::Json(Cow::Borrowed(&options.payload))
+        // JSON 直值：构造时一次 Arc，重放零拷贝。
+        HttpRequestPayload::json(options.payload.clone())
     };
 
     let request = client

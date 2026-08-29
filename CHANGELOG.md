@@ -1,5 +1,22 @@
 # @wecom/cli
 
+## 1.2.0
+
+### Minor Changes
+
+- 1f0e0b8: 支持远程文档渲染
+  - schema 中 service / resource / method 任一层级声明 `remote_doc: true` 时，对应节点的 `--doc` / `--help` / `--schema` 不再本地渲染，改为请求远程 endpoint 生成文档并直接输出。
+  - 生效规则为就近覆盖（method → 父级 resource 链 → service → 默认 `false`），每层可用 `remote_doc: false` 显式关闭上层开启的远程渲染。
+
+- 1f0e0b8: 支持服务别名解析
+  - `ServiceInfo.alias` 支持为服务声明别名，调用时按精确名优先、别名其次解析。
+  - `method_alias` 遥测事件统一在方法解析处单点发射，记录用户原始输入路径（保留服务别名）与规范化路径的映射。
+
+### Patch Changes
+
+- 1f0e0b8: multipart 上传请求支持 token 失效重放
+  - 请求载荷统一为可重放的延迟工厂：multipart 表单在每次发送时重新构建（重新打开文件），token 失效（853004）静默刷新后的自动重放不再限于 JSON 请求，文件上传类调用同样生效。
+
 ## 1.1.0
 
 ### Major Changes
