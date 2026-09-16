@@ -140,7 +140,7 @@ mod tests {
         pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 
-    /// P0：[resolve_schema::] 无 $ref 引用的简单 schema 解析
+    /// P0：[resolve_schema] 无 $ref 引用的简单 schema 解析
     /// 条件：schema 不包含 $ref，只有 type 和 description
     /// 断言：解析结果保留原始 type 和 description，schema_ref 为 None
     #[test]
@@ -158,7 +158,7 @@ mod tests {
         assert!(resolved.schema_ref.is_none());
     }
 
-    /// P0：[resolve_schema::] 单层 $ref 引用展开
+    /// P0：[resolve_schema] 单层 $ref 引用展开
     /// 条件：Extended schema 通过 $ref 引用 Base schema，且各自有独立 properties
     /// 断言：$ref 被展开为实际字段合并，本地字段优先保留
     #[test]
@@ -287,7 +287,7 @@ mod tests {
         assert!(resolved.is_some());
     }
 
-    /// P1：[resolve_schema::] 嵌套在 properties 内部的 $ref 递归展开
+    /// P1：[resolve_schema] 嵌套在 properties 内部的 $ref 递归展开
     /// 条件：Outer schema 的 property field 通过 $ref 引用 Inner schema
     /// 断言：property 内的 $ref 被深层展开，包含 Inner 的 type 和 description
     #[test]
@@ -407,7 +407,7 @@ mod tests {
         assert!(items.properties.contains_key("id"));
     }
 
-    /// P1：[resolve_schema::] 查询不存在的 schema 名称时返回 None
+    /// P1：[resolve_schema] 查询不存在的 schema 名称时返回 None
     /// 条件：schemas 集合为空，查询一个不存在的名称
     /// 断言：resolve_schema 返回 None
     #[test]

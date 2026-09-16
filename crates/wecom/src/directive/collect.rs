@@ -1,6 +1,9 @@
+use std::path::Path;
+
 use indexmap::IndexMap;
 
 use super::types::*;
+use crate::fs;
 use crate::json_path::PathSegment;
 use crate::schema::*;
 use crate::telemetry::contract::unknown_directive;
@@ -8,14 +11,16 @@ use crate::telemetry::contract::unknown_directive;
 #[derive(Debug)]
 struct WalkCtx<'a> {
     schemas: &'a IndexMap<String, JsonSchema>,
+    cwd: &'a Path,
     directives: Vec<Directive<'a>>,
     unknown_directives: Vec<String>,
 }
 
 impl<'a> WalkCtx<'a> {
-    fn new(schemas: &'a IndexMap<String, JsonSchema>) -> Self {
+    fn new(schemas: &'a IndexMap<String, JsonSchema>, cwd: &'a Path) -> Self {
         Self {
             schemas,
+            cwd,
             directives: vec![],
             unknown_directives: vec![],
         }
@@ -43,8 +48,9 @@ pub fn collect_directives<'a>(
     schemas: &'a IndexMap<String, JsonSchema>,
     schema: &'a JsonSchema,
     data: &serde_json::Value,
+    cwd: &'a Path,
 ) -> Vec<Directive<'a>> {
-    let mut ctx = WalkCtx::new(schemas);
+    let mut ctx = WalkCtx::new(schemas, cwd);
     walk_node(&mut ctx, &[], schema, data);
 
     // Emit a single aggregated event with all unique unknown x-wecom-* directives.
@@ -158,7 +164,7 @@ fn walk_string<'a>(
     if let Some(opts) = &schema.directives.upload_media {
         ctx.directives.push(Directive::UploadMedia {
             path: path.to_vec(),
-            file_path: data.to_string(),
+            file_path: fs::absolutize(ctx.cwd, Path::new(data)),
             with_file_path: opts.with_file_path(),
         });
     }
@@ -167,7 +173,7 @@ fn walk_string<'a>(
     if schema.directives.octet_stream.is_some() {
         ctx.directives.push(Directive::UploadMultipart {
             path: path.to_vec(),
-            file_path: data.to_string(),
+            file_path: fs::absolutize(ctx.cwd, Path::new(data)),
         });
     }
 }
@@ -257,7 +263,7 @@ mod tests {
         let schemas = make_schemas();
         let schema = JsonSchema::default();
         let data = serde_json::json!({});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -283,7 +289,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"name": "hello"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -315,10 +321,10 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"file": "/path/to/file.txt"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         assert!(
-            matches!(&directives[0], Directive::UploadMedia { file_path, .. } if file_path == "/path/to/file.txt")
+            matches!(&directives[0], Directive::UploadMedia { file_path, .. } if file_path.as_path() == std::path::Path::new("/path/to/file.txt"))
         );
     }
 
@@ -350,7 +356,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"media": "/path/to/video.mp4"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         assert!(matches!(&directives[0], Directive::UploadMultipart { .. }));
     }
@@ -387,7 +393,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"data": "csv content here"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         assert!(
             matches!(&directives[0], Directive::Save { options, .. } if options.file_name.as_deref() == Some("output.csv"))
@@ -427,7 +433,7 @@ mod tests {
         // file_save 的收集不应依赖 data 的类型
         let data =
             serde_json::json!({"data": {"content": "csv content here", "file_name": "result.csv"}});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         assert!(
             matches!(&directives[0], Directive::Save { options, .. } if options.file_name.as_deref() == Some("output.csv"))
@@ -455,7 +461,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!(["/a.txt", "/b.txt"]);
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 2);
     }
 
@@ -495,7 +501,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"media": "/file.bin"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
     }
 
@@ -528,7 +534,7 @@ mod tests {
         };
         // "file" is a number, not a string — should be skipped
         let data = serde_json::json!({"file": 42});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -558,10 +564,10 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"file": ["/a.jpg"]});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         assert!(
-            matches!(&directives[0], Directive::UploadMedia { file_path, .. } if file_path == "/a.jpg")
+            matches!(&directives[0], Directive::UploadMedia { file_path, .. } if file_path.as_path() == std::path::Path::new("/a.jpg"))
         );
     }
 
@@ -581,7 +587,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!("test");
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -597,7 +603,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!("a");
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -635,10 +641,10 @@ mod tests {
         };
         // LLM 误传：单个字符串而非数组
         let data = serde_json::json!({"files": "/path/to/file.jpg"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         assert!(
-            matches!(&directives[0], Directive::UploadMedia { file_path, .. } if file_path == "/path/to/file.jpg")
+            matches!(&directives[0], Directive::UploadMedia { file_path, .. } if file_path.as_path() == std::path::Path::new("/path/to/file.jpg"))
         );
     }
 
@@ -673,7 +679,7 @@ mod tests {
         };
         // 正常数组 → 不应被纠偏逻辑影响
         let data = serde_json::json!({"files": ["/a.jpg", "/b.pdf"]});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 2);
     }
 
@@ -708,7 +714,7 @@ mod tests {
         };
         // 对象不应被转换为 array
         let data = serde_json::json!({"files": {"file_path": "/a.jpg"}});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -740,7 +746,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"file": ["/a.jpg"]});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         let Directive::UploadMedia {
             path, file_path, ..
@@ -748,7 +754,7 @@ mod tests {
         else {
             panic!("expected UploadMedia directive");
         };
-        assert_eq!(file_path, "/a.jpg");
+        assert_eq!(file_path.as_path(), std::path::Path::new("/a.jpg"));
         assert_eq!(path.len(), 2);
         assert!(matches!(&path[0], PathSegment::Key(k) if k == "file"));
         assert!(matches!(&path[1], PathSegment::Index(0)));
@@ -784,7 +790,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"files": "/a.jpg"});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         let Directive::UploadMedia {
             path, file_path, ..
@@ -792,7 +798,7 @@ mod tests {
         else {
             panic!("expected UploadMedia directive");
         };
-        assert_eq!(file_path, "/a.jpg");
+        assert_eq!(file_path.as_path(), std::path::Path::new("/a.jpg"));
         assert_eq!(path.len(), 1);
         assert!(matches!(&path[0], PathSegment::Key(k) if k == "files"));
     }
@@ -828,7 +834,7 @@ mod tests {
         };
         // number 类型与 string 不匹配 → 不纠偏
         let data = serde_json::json!({"files": 42});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert!(directives.is_empty());
     }
 
@@ -868,7 +874,7 @@ mod tests {
             ..Default::default()
         };
         let data = serde_json::json!({"items": [["/a.jpg"]]});
-        let directives = collect_directives(&schemas, &schema, &data);
+        let directives = collect_directives(&schemas, &schema, &data, Path::new("/"));
         assert_eq!(directives.len(), 1);
         let Directive::UploadMedia {
             path, file_path, ..
@@ -876,7 +882,7 @@ mod tests {
         else {
             panic!("expected UploadMedia directive");
         };
-        assert_eq!(file_path, "/a.jpg");
+        assert_eq!(file_path.as_path(), std::path::Path::new("/a.jpg"));
         assert_eq!(path.len(), 3);
         assert!(matches!(&path[0], PathSegment::Key(k) if k == "items"));
         assert!(matches!(&path[1], PathSegment::Index(0)));

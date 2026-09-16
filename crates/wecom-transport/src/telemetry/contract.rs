@@ -23,8 +23,9 @@
 //!
 //! # Companion types
 //!
-//! [`CaptureSpanId`] lives in [`super::capture`] — it is not a string
-//! constant but part of the capture mechanism's public API.
+//! [`CaptureSpanId`](super::records::CaptureSpanId) lives in
+//! [`super::records`] — it is not a string constant but part of the
+//! capture mechanism's public API.
 
 // ── Span / field name contracts ──────────────────────────────────
 

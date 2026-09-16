@@ -54,7 +54,7 @@ pub(crate) fn clamp_size(size: u64) -> u64 {
 pub fn range_header_value(start: u64, size: u64) -> Result<reqwest::header::HeaderValue> {
     let end = start + size - 1;
     reqwest::header::HeaderValue::from_str(&format!("bytes={start}-{end}"))
-        .map_err(|e| Error::Other(format!("Invalid Range header value: {e}").into()))
+        .map_err(|e| Error::other(format!("Invalid Range header value: {e}").into()))
 }
 
 /// Wrap the first-segment [`HttpResponse`] body with an auto-resuming stream.
@@ -170,7 +170,7 @@ where
                 // frames each response against its own Content-Length and cannot
                 // catch a cumulative overshoot, so we must reject it here rather
                 // than write a corrupt file.
-                return Err(Error::Other(
+                return Err(Error::other(
                     format!("range download overshot declared total: wrote {next} > {t}").into(),
                 ))
                 .inspect_err(|e| tracing::error!(error = %e, "range download overshot total"));
@@ -196,14 +196,14 @@ where
         }
         if last_seg_len == 0 && next == 0 {
             // First segment was empty — real error.
-            return Err(Error::Other(
+            return Err(Error::other(
                 "first range segment returned empty body".into(),
             ));
         }
 
         // 3. Segment count guard.
         if segment_count >= MAX_RANGE_SEGMENTS {
-            return Err(Error::Other(
+            return Err(Error::other(
                 format!("range download exceeded {MAX_RANGE_SEGMENTS} segments without completion")
                     .into(),
             ));
@@ -241,7 +241,7 @@ where
         // the output file, honoring the integrity constraint.
         let is_partial = response.status().as_u16() == 206 || response.content_range().is_some();
         if !is_partial {
-            return Err(Error::Other(
+            return Err(Error::other(
                 format!(
                     "range segment at offset {next} was not partial content \
                      (status {}); aborting to avoid a corrupt download",
@@ -255,7 +255,7 @@ where
         // Update total if the server provided it now.
         if let Some(cr) = response.content_range() {
             if cr.start != next {
-                return Err(Error::Other(
+                return Err(Error::other(
                     format!(
                         "range segment start mismatch: expected {next}, got {}",
                         cr.start

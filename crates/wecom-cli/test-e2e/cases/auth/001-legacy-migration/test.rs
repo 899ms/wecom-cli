@@ -92,7 +92,7 @@ fn migration_succeeds_keeps_legacy() {
     });
 }
 
-/// P0：迁移失败路径（回归：build 中 load_token 不得误清 legacy）
+/// P0：迁移失败路径——引导返回业务错误时静默降级
 /// 条件：引导端点返回业务错误（errcode != 0）→ 迁移静默降级
 /// 断言：退出码 0（未授权启动表现）、legacy bot.enc **保留**、credentials.enc 不生成
 #[cfg(feature = "custom-endpoint")]
@@ -122,7 +122,7 @@ fn migration_failure_keeps_legacy() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("Status: unauthorized"), "got: {stdout}");
 
-        // 核心回归断言：legacy 必须保留（后续 load_token 不得误清）。
+        // 核心断言：legacy 必须保留。
         assert!(
             dir.join("bot.enc").exists(),
             "legacy bot.enc must be kept on migration failure"

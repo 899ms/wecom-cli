@@ -200,7 +200,7 @@ pub(crate) fn matches_to_value(
                     .flat_map(|v| split_by_delimiters(v, &delimiters))
                     .map(|piece| {
                         parse_scalar(&piece, Some(item_type)).map_err(|e| {
-                            Error::Validation(format!("--{} 值无效: {e}", to_kebab_case(name)))
+                            Error::validation(format!("--{} 值无效: {e}", to_kebab_case(name)))
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -212,7 +212,7 @@ pub(crate) fn matches_to_value(
         // All other types (incl. arrays of objects) — single value via `get_one`.
         if let Some(raw) = matches.get_one::<String>(name) {
             let value = parse_scalar(raw, schema_type)
-                .map_err(|e| Error::Validation(format!("--{} 值无效: {e}", to_kebab_case(name))))?;
+                .map_err(|e| Error::validation(format!("--{} 值无效: {e}", to_kebab_case(name))))?;
             result.insert(name.to_string(), value);
         }
     }

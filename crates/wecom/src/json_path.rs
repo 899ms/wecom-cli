@@ -92,7 +92,7 @@ fn flatten_value_inner(
 }
 
 /// 按路径设置 JSON 值。
-/// 示例: path=[Key("a"), Index(0), Key("b")] → payload["a"][0]["b"] = value
+/// 示例: path=[Key("a"), Index(0), Key("b")] → `payload["a"][0]["b"] = value`
 pub fn set_value_deep(
     object: &mut serde_json::Value,
     path: &[PathSegment],

@@ -24,35 +24,53 @@ async fn run() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
 
     let buf = SharedBuf::new();
     let client = wecom::Client::builder()
-        .home_dir(tmp.path())
-        .tmp_dir(tmp.path())
+        .config_dir(tmp.path())
         .transport(build_test_http_transport("test-token", &server.uri()))
-        .writable_dirs(vec![tmp.path().to_path_buf()])
+        .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+        .workspace_fs(std::sync::Arc::new(
+            wecom_fs::SandboxedFs::new()
+                .with_write_policy(wecom_fs::Policy::new().with_allowed_dirs(&[tmp.path()])),
+        ))
         .build()
         .unwrap();
 
     let result = client
         .run(hr_dept_list_argv(&[
             "--output-dir",
-            tmp.path().to_str().unwrap(),
+            out_dir.to_str().unwrap(),
         ]))
         .output(wecom::CliRunOutput::new(buf.clone()))
         .await;
-    assert_cli_ok(&result, &buf, "binary download");
+    assert_cli_ok(&result, &buf, "binary download to output-dir");
 
     let v = assert_download_result(&buf, "application/octet-stream");
     let file_path_str = v["file_path"].as_str().unwrap();
-    assert!(
-        file_path_str.contains("report.xlsx"),
-        "file_path should contain Content-Disposition filename: {file_path_str}"
+    let file_path = std::path::PathBuf::from(file_path_str);
+    assert_eq!(
+        file_path.file_name().unwrap(),
+        "report.xlsx",
+        "file name should come from Content-Disposition: {file_path_str}"
     );
+    // Canonicalize both sides: the fs layer returns resolved real paths
+    // (on macOS the tempdir /var base is symlinked to /private/var).
+    #[allow(clippy::disallowed_methods)]
+    {
+        let expected_dir = out_dir.canonicalize().unwrap();
+        let actual_dir = file_path.parent().map(|p| p.canonicalize().unwrap());
+        assert_eq!(
+            actual_dir.as_deref(),
+            Some(expected_dir.as_path()),
+            "file should land under --output-dir: {file_path_str}"
+        );
+    }
     assert_eq!(v["size"], binary_content.len() as u64);
 
     // FS: verify file content
     #[allow(clippy::disallowed_methods)]
-    let saved = std::fs::read(file_path_str).unwrap();
+    let saved = std::fs::read(&file_path).unwrap();
     assert_eq!(saved, binary_content);
 }

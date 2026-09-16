@@ -93,15 +93,17 @@ where
 
         consecutive_network_err_count = 0;
 
-        let task_info = data.poll_info().ok_or_else(|| {
-            Error::Parse {
+        let task_info = data
+            .poll_info()
+            .ok_or_else(|| Error::Parse {
                 message: "Missing 'long_task_poll' field".into(),
                 endpoint: "PollClawLongTask".into(),
                 body: Box::new(serde_json::to_value(&data).unwrap_or_default()),
                 source: None,
-            }
-        })
-        .inspect_err(|_| tracing::error!(error = %format!("Missing 'long_task_poll' field in poll response"), "poll response missing long_task_poll field"))?;
+            })
+            .inspect_err(
+                |e| tracing::error!(error = %e, "poll response missing long_task_poll field"),
+            )?;
 
         if task_info.done == Some(true) {
             tracing::info!("long task poll completed");
@@ -124,7 +126,7 @@ where
                 elapsed_secs = start.elapsed().as_secs(),
                 "long task poll timed out",
             );
-            return Err(Error::Other(
+            return Err(Error::other(
                 format!("轮询任务超时: {}s", t.as_secs()).into(),
             ));
         }
@@ -157,7 +159,7 @@ mod tests {
     //! - 非 Network 错误（Api/Http）→ 立即传播不重试
     //! - Network 错误（任意类型）→ 指数退避重试，超过上限则返回 Err
     //!   （轮询为只读 task/query，无副作用，因此不做错误类型细分）
-    //! - task_timeout 超时 → 返回 Error::Other(timeout message)
+    //! - task_timeout 超时 → 返回 Error::other(timeout message)
     //!
     //! ### 上下游交互
     //! - 上游：[http::long_task] 调用 [poll_long_task] 并注入 fetch 闭包
@@ -182,7 +184,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::Error;
+    use crate::{E_OTHER, Error};
 
     // ── LongTaskPollInfo 序列化/反序列化 ──
 
@@ -442,16 +444,12 @@ mod tests {
         .await;
 
         let err = result.unwrap_err();
-        match &err {
-            Error::Other(msg) => {
-                let msg_str = msg.to_string();
-                assert!(
-                    msg_str.contains("超时"),
-                    "expected timeout message, got: {msg_str}"
-                );
-            }
-            _ => panic!("Expected Error::Other(timeout), got: {err:?}"),
-        }
+        assert_eq!(err.code(), E_OTHER, "expected Other(timeout), got: {err:?}");
+        let msg_str = err.message();
+        assert!(
+            msg_str.contains("超时"),
+            "expected timeout message, got: {msg_str}"
+        );
     }
 
     /// 辅助函数：通过连接一个已关闭的端口产生真实的 reqwest::Error（is_connect() == true）

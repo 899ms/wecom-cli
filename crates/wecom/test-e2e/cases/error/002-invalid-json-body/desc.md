@@ -25,4 +25,4 @@ client.run(vec!["wecom", "schema", "list"]).output(...)
 
 ## 关键上下文
 
-- `error.rs`：`Error::Decode` 在 JSON 解析失败时产生
+- `crates/wecom-transport/src/common/error.rs`：`Error::Parse`（`type="ParseError"`，code `E_PARSE`）在 JSON 解析失败时产生，经 `wecom::Error::Wrapped` 上抛

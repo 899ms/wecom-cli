@@ -133,3 +133,83 @@ pub fn setup_sync_discovery_server() -> (String, ServerGuard) {
         (url, server)
     })
 }
+
+/// 沙箱对抗用例共用的 mock 组合：discovery（catalog 同时列出 hr 与 files）
+/// + hr 详情 + files 详情 + `/send`。
+///
+/// 读侧攻击经 `files send --json {"media": <path>}` 触发，写侧攻击经
+/// `hr department list --output <path>` 触发（`/department/list` 由各用例按需
+/// [`setup_method_mock`]）。`/file/upload` 不包含在内——各用例按各自预期命中
+/// 次数以 `.expect(n)` 自建，便于收尾时 `assert_async` 精确断言泄露次数。
+pub struct SandboxMocks {
+    pub catalog: Mock,
+    pub hr: Mock,
+    pub files: Mock,
+    pub send: Mock,
+}
+
+/// Mount [`SandboxMocks`]：catalog 含 hr+files，files 服务的 send 方法 media 字段
+/// 标记 `x-wecom-file-upload`（模式同 002-workspace-domain-split 的内联写法）。
+pub async fn setup_sandbox_mocks(server: &mut Server) -> SandboxMocks {
+    let catalog = server
+        .mock("POST", "/service/discovery")
+        .match_body(Matcher::Json(payload_wrap(&json!({}))))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(api_response(&json!({
+            "items": [
+                { "name": "hr", "description": "Human Resources" },
+                { "name": "files", "description": "File transfer" }
+            ]
+        })))
+        .create_async()
+        .await;
+
+    let hr = server
+        .mock("POST", "/service/discovery")
+        .match_body(Matcher::Json(payload_wrap(&json!({"service": "hr"}))))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(hr_service_body(&server.url()))
+        .create_async()
+        .await;
+
+    let files = server
+        .mock("POST", "/service/discovery")
+        .match_body(Matcher::Json(payload_wrap(&json!({"service": "files"}))))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(api_response(&json!({
+            "description": "File transfer service",
+            "base_url": server.url(),
+            "schemas": {
+                "SendReq": {
+                    "type": "object",
+                    "properties": {
+                        "media": { "type": "string", "x-wecom-file-upload": true }
+                    }
+                },
+                "SendRes": { "type": "object" }
+            },
+            "methods": {
+                "send": {
+                    "path": "/send",
+                    "http_method": "POST",
+                    "request": { "$ref": "SendReq" },
+                    "response": { "$ref": "SendRes" }
+                }
+            },
+            "resources": {}
+        })))
+        .create_async()
+        .await;
+
+    let send = setup_method_mock(server, "/send", &api_response(&json!({}))).await;
+
+    SandboxMocks {
+        catalog,
+        hr,
+        files,
+        send,
+    }
+}

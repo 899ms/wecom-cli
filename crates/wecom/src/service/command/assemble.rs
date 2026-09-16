@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Number, Value};
 
 use super::arg_types::{HelperCmdArgs, MethodCmdArgs};
+use super::json_repair::repair_json;
 use super::schema_clap::matches_to_value;
 use crate::schema::{AdditionalProperties, JsonSchema};
 use crate::telemetry::contract as ctr;
@@ -53,11 +54,12 @@ pub(crate) fn assemble_payload<A: RequestArgs>(
     schema: Option<&JsonSchema>,
     matches: &ArgMatches,
 ) -> Result<Value> {
-    // 1. --json 骨架（lenient，带 jsonrepair 容错）
+    // Extra extraction round-trips args through serde, which skips `set`.
+    let set_ops = args.set_ops().to_vec();
+    // 1. --json 骨架（lenient，候选式修复，schema 仅参与打分）
     let mut payload = match args.json() {
-        Some(j) => {
-            repair_json(j).map_err(|e| Error::Validation(format!("--json 请求体解析失败: {e}")))?
-        }
+        Some(j) => repair_json(j, schema)
+            .map_err(|e| Error::validation(format!("--json 请求体解析失败: {e}")))?,
         None => serde_json::json!({}),
     };
     if let (Some(s), Some(obj)) = (schema, payload.as_object_mut()) {
@@ -67,7 +69,7 @@ pub(crate) fn assemble_payload<A: RequestArgs>(
         obj.extend(matches_to_value(s, matches)?);
     }
     // 4. --set 深层覆盖（最高优先级）
-    apply_set_ops(&mut payload, args.set_ops(), schema)?;
+    apply_set_ops(&mut payload, &set_ops, schema)?;
     Ok(payload)
 }
 
@@ -146,49 +148,6 @@ fn normalize_extra_key(key: &str) -> String {
     stripped.replace('-', "_")
 }
 
-// ── JSON 解析 ─────────────────────────────────────────────
-
-/// Parse JSON with a jsonrepair fallback, returning the **raw** repair reason
-/// (a plain `String`) on failure — not an [`Error`].
-///
-/// Emits `json_repair` telemetry on the repair path. Callers attach their own
-/// user-facing context (`--json` body vs `--set` value) around the returned
-/// `String`. Keeping the error un-wrapped here is what lets the sole
-/// `Error::Validation` wrap happen once at the top, avoiding double-wrapping
-/// like `Validation("... {Validation}")`.
-fn repair_json(json: &str) -> std::result::Result<Value, String> {
-    // Fast path: valid JSON.
-    if let Ok(v) = serde_json::from_str(json) {
-        return Ok(v);
-    }
-    tracing::info!("standard JSON parse failed, attempting repair");
-    match jsonrepair_rs::jsonrepair_value(json) {
-        Ok(v) => {
-            tracing::info!("JSON repaired successfully");
-            let repaired = serde_json::to_string(&v).unwrap_or_default();
-            telemetry::emit(
-                ctr::json_repair::KIND,
-                &serde_json::json!({
-                    ctr::json_repair::FIELD_OUTCOME: ctr::json_repair::OUTCOME_OK_REPAIRED,
-                    ctr::json_repair::FIELD_INPUT: json,
-                    ctr::json_repair::FIELD_OUTPUT: repaired,
-                }),
-            );
-            Ok(v)
-        }
-        Err(repair_err) => {
-            telemetry::emit(
-                ctr::json_repair::KIND,
-                &serde_json::json!({
-                    ctr::json_repair::FIELD_OUTCOME: ctr::json_repair::OUTCOME_ERR_REPAIR,
-                    ctr::json_repair::FIELD_INPUT: json,
-                }),
-            );
-            Err(repair_err.to_string())
-        }
-    }
-}
-
 // ── --set 编排 ────────────────────────────────────────────
 
 /// `--set` 编排：逐项 split `=` → parse_path → resolve_set_value → upsert_value_deep。
@@ -204,19 +163,23 @@ fn apply_set_ops(
         for raw in set_ops {
             let (path_str, rhs) = raw
                 .split_once('=')
-                .ok_or_else(|| Error::Validation(format!("--set {raw} 解析失败: 缺少 `=`")))?;
+                .ok_or_else(|| Error::validation(format!("--set {raw} 解析失败: 缺少 `=`")))?;
+
             let path = json_path::parse_path(path_str)
-                .map_err(|e| Error::Validation(format!("--set {path_str} 路径解析失败: {e}")))?;
-            let leaf_type = schema.and_then(|s| resolve_leaf_type(s, &path));
-            if leaf_type.is_some() {
+                .map_err(|e| Error::validation(format!("--set {path_str} 路径解析失败: {e}")))?;
+
+            let leaf_schema = schema.and_then(|s| resolve_leaf_schema(s, &path));
+            if leaf_schema.and_then(|s| s.schema_type.as_deref()).is_some() {
                 typed_by_schema += 1;
             }
+
             // resolve_set_value / upsert_value_deep 均返回纯 String 原因，这里统一包一次
             // Error::Validation，避免出现 Validation("... {Validation}") 的重复包裹。
-            let value = resolve_set_value(rhs, leaf_type.as_deref())
-                .map_err(|e| Error::Validation(format!("--set {path_str} 值无效: {e}")))?;
+            let value = resolve_set_value(rhs, leaf_schema)
+                .map_err(|e| Error::validation(format!("--set {path_str} 值无效: {e}")))?;
+
             json_path::upsert_value_deep(payload, &path, value)
-                .map_err(|e| Error::Validation(format!("--set {path_str} 赋值失败: {e}")))?;
+                .map_err(|e| Error::validation(format!("--set {path_str} 赋值失败: {e}")))?;
         }
         Ok(())
     })();
@@ -240,11 +203,14 @@ fn apply_set_ops(
     result
 }
 
-/// 沿 path 在已展开的 schema 上逐段下潜，返回叶子 `type`。
+/// 沿 path 在已展开的 schema 上逐段下潜，返回完整叶子 Schema。
 ///
 /// `request_schema()` 返回的 schema 已递归展开所有 `$ref`（含 properties/items 深层），
 /// 因此无需额外的 schemas 表即可直接下潜。任一级无法继续 → `None`（触发回退 B）。
-fn resolve_leaf_type(top: &JsonSchema, path: &[json_path::PathSegment]) -> Option<String> {
+fn resolve_leaf_schema<'a>(
+    top: &'a JsonSchema,
+    path: &[json_path::PathSegment],
+) -> Option<&'a JsonSchema> {
     let mut current = top;
 
     for seg in path {
@@ -267,15 +233,21 @@ fn resolve_leaf_type(top: &JsonSchema, path: &[json_path::PathSegment]) -> Optio
         }
     }
 
-    current.schema_type.clone()
+    Some(current)
 }
 
-/// 依据 leaf_type（A）或推断（B）把 RHS 转成 Value。
+/// 依据叶子 Schema（A）或推断（B）把 RHS 转成 Value。
+///
+/// 无 `type` 或 `type` 非标准时走策略 B；`object` / `array` 叶子把完整 Schema 交给
+/// [`repair_json`]，让其在修复候选打分时参考声明的 properties。
 ///
 /// 失败时返回**纯 [`String`] 原因**（不含 [`Error`] 包装），由调用方
 /// [`apply_set_ops`] 统一附加 `--set <path>` 上下文并包一次 `Error::Validation`。
-fn resolve_set_value(rhs: &str, leaf_type: Option<&str>) -> std::result::Result<Value, String> {
-    match leaf_type {
+fn resolve_set_value(
+    rhs: &str,
+    leaf_schema: Option<&JsonSchema>,
+) -> std::result::Result<Value, String> {
+    match leaf_schema.and_then(|s| s.schema_type.as_deref()) {
         // A: schema 感知
         Some("string") => Ok(Value::String(
             serde_json::from_str(rhs).unwrap_or_else(|_| rhs.to_string()),
@@ -288,18 +260,17 @@ fn resolve_set_value(rhs: &str, leaf_type: Option<&str>) -> std::result::Result<
             "false" => Ok(Value::Bool(false)),
             _ => Err(format!("`{rhs}` 不是有效的布尔值，应为 true 或 false")),
         },
-        Some("array" | "object") => {
-            repair_json(rhs).map_err(|e| format!("`{rhs}` 不是合法的 JSON: {e}"))
+        // object / array：RHS 是完整 JSON 片段，走 lenient 修复（schema 仅参与打分）
+        Some("object" | "array") => {
+            repair_json(rhs, leaf_schema).map_err(|e| format!("`{rhs}` 不是合法的 JSON: {e}"))
         }
-        Some(_unknown) => {
-            // Unknown schema type → fall back to strategy B inference
-            resolve_set_value(rhs, None)
-        }
-        // B: 类型推断
-        None => {
+        // B: 类型推断（无 type 或 type 非标准）。schema 仍交给 repair_json ——
+        // 它只做候选排序信号、不做合法性门禁，声明的 properties 依然可用于打分。
+        _ => {
             let first = rhs.chars().next();
             if first == Some('{') || first == Some('[') {
-                return repair_json(rhs).map_err(|e| format!("`{rhs}` 不是合法的 JSON: {e}"));
+                return repair_json(rhs, leaf_schema)
+                    .map_err(|e| format!("`{rhs}` 不是合法的 JSON: {e}"));
             }
             match rhs {
                 "true" => Ok(Value::Bool(true)),
@@ -326,20 +297,24 @@ mod tests {
     //! ### 关键接口
     //! - [assemble_payload] — 统一装配请求体（--json → extract extras → matches → --set）
     //! - [apply_set_ops] — --set 编排：逐项 split `=` → parse_path → resolve_set_value → upsert
-    //! - [resolve_leaf_type] — 沿 path 在 schema 上逐段下潜，返回叶子 type（策略 A）
-    //! - [resolve_set_value] — 依据 leaf_type（A）或推断（B）把 RHS 转成 Value
+    //! - [resolve_leaf_schema] — 沿 path 在 schema 上逐段下潜，返回叶子 Schema（策略 A）
+    //! - [resolve_set_value] — 依据叶子 Schema（A）或推断（B）把 RHS 转成 Value
     //! - [RequestArgs] trait — 统一 helper/method 参数结构差异
     //!
     //! ### 关键分支与异常路径
-    //! - resolve_set_value：A 有 schema → 精确定型；B 无 schema → 推断（{[\ → JSON，true/false/null → 直接，
-    //!   数字 → Number，其余 → String）
-    //! - resolve_leaf_type：沿已展开 schema 逐段下潜；key 不在 properties 时回退到
+    //! - resolve_set_value：A 有 type → 精确定型（object / array 交 repair_json 并带上叶子 schema）；
+    //!   B 无 type 或 type 非标准 → 推断（{[\ → repair_json，true/false/null → 直接，
+    //!   数字 → Number，其余 → String）；schema 全程只作为 repair_json 的打分信号
+    //! - resolve_leaf_schema：沿已展开 schema 逐段下潜；key 不在 properties 时回退到
     //!   additional_properties Schema 查找类型；任一级无法继续 → None（回退 B）
     //! - apply_set_ops：缺 `=` → Err；路径非法 → Err；值非法 → Err；赋值冲突 → Err
+    //! - 引号修复与装配的交互：[super::json_repair] 统一负责解析与候选打分，schema 不参与
+    //!   合法性门禁；修复后不做任何 schema 校验（required / 类型交后台）；extras 仍须
+    //!   保持为独立键，flag / --set 优先级不受修复影响
     //!
     //! ### 上下游交互
     //! - 上游：[super::super::handler::handle_service_cmd] 调用 assemble_payload
-    //! - 下游：依赖 [json_path]、[JsonSchema]、[telemetry]
+    //! - 下游：依赖 [json_path]、[JsonSchema]、[telemetry]、[super::json_repair]
 
     use std::sync::{Arc, Mutex};
 
@@ -348,64 +323,148 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+    use crate::service::command::schema_clap::build_args_from_schema;
     use crate::telemetry::{CaptureScope, ClientEvent, EventExt, TelemetryLayer};
+
+    // 以下三个 schema 构造器与 json_repair::tests 的同名夹具刻意各自维护一份：
+    // 测试模块不跨模块暴露（crate 内亦然），避免测试代码成为模块间的隐藏接口。
+
+    /// 测试 helper：构造一个 object 类型 schema，properties 含给定字段名（均为 string 类型）。
+    fn schema_with(keys: &[&str]) -> JsonSchema {
+        let mut properties = IndexMap::new();
+        for &k in keys {
+            properties.insert(
+                k.to_string(),
+                Arc::new(JsonSchema {
+                    schema_type: Some("string".to_string()),
+                    ..Default::default()
+                }),
+            );
+        }
+        JsonSchema {
+            schema_type: Some("object".to_string()),
+            properties,
+            ..Default::default()
+        }
+    }
+
+    /// 测试 helper：构造一个 object 类型 schema，properties 为给定的 (字段名, type) 对。
+    fn schema_with_typed(fields: &[(&str, &str)]) -> JsonSchema {
+        let mut properties = IndexMap::new();
+        for &(k, ty) in fields {
+            properties.insert(
+                k.to_string(),
+                Arc::new(JsonSchema {
+                    schema_type: Some(ty.to_string()),
+                    ..Default::default()
+                }),
+            );
+        }
+        JsonSchema {
+            schema_type: Some("object".to_string()),
+            properties,
+            ..Default::default()
+        }
+    }
+
+    /// 测试 helper：构造 message send 的 schema（chat_id + text_content.text 均必填，
+    /// 两层 additionalProperties 均为 false），复现真实消息发送接口的约束形态。
+    fn message_send_schema() -> JsonSchema {
+        let text_content = JsonSchema {
+            schema_type: Some("object".into()),
+            properties: IndexMap::from([(
+                "text".into(),
+                Arc::new(JsonSchema {
+                    schema_type: Some("string".into()),
+                    ..Default::default()
+                }),
+            )]),
+            required: vec!["text".into()],
+            additional_properties: Some(Box::new(AdditionalProperties::Enabled(false))),
+            ..Default::default()
+        };
+        JsonSchema {
+            schema_type: Some("object".into()),
+            properties: IndexMap::from([
+                (
+                    "chat_id".into(),
+                    Arc::new(JsonSchema {
+                        schema_type: Some("string".into()),
+                        ..Default::default()
+                    }),
+                ),
+                ("text_content".into(), Arc::new(text_content)),
+            ]),
+            required: vec!["chat_id".into(), "text_content".into()],
+            additional_properties: Some(Box::new(AdditionalProperties::Enabled(false))),
+            ..Default::default()
+        }
+    }
+
+    /// 测试 helper：构造仅声明 type 的叶子 Schema。
+    fn leaf_of(schema_type: &str) -> JsonSchema {
+        JsonSchema {
+            schema_type: Some(schema_type.to_string()),
+            ..Default::default()
+        }
+    }
 
     // ── resolve_set_value ──
 
     /// P0：[resolve_set_value] 策略 A：叶子 string，RHS 形如数字
-    /// 条件：leaf_type 为 "string"，输入 "98"
+    /// 条件：叶子 schema type 为 "string"，输入 "98"
     /// 断言：返回 Value::String("98")
     #[test]
     fn resolve_set_value_string_keeps_numeric_as_string() {
-        let v = resolve_set_value("98", Some("string")).unwrap();
+        let v = resolve_set_value("98", Some(&leaf_of("string"))).unwrap();
         assert_eq!(v, Value::String("98".into()));
     }
 
     /// P0：[resolve_set_value] 策略 A：叶子 integer
-    /// 条件：leaf_type 为 "integer"，输入 "100"
+    /// 条件：叶子 schema type 为 "integer"，输入 "100"
     /// 断言：返回 Number(100)
     #[test]
     fn resolve_set_value_integer_parsed() {
-        let v = resolve_set_value("100", Some("integer")).unwrap();
+        let v = resolve_set_value("100", Some(&leaf_of("integer"))).unwrap();
         assert_eq!(v, serde_json::json!(100));
     }
 
     /// P1：[resolve_set_value] 策略 A：integer 但输入非法
-    /// 条件：leaf_type 为 "integer"，输入 "abc"
+    /// 条件：叶子 schema type 为 "integer"，输入 "abc"
     /// 断言：返回 Err
     #[test]
     fn resolve_set_value_integer_invalid_err() {
-        assert!(resolve_set_value("abc", Some("integer")).is_err());
+        assert!(resolve_set_value("abc", Some(&leaf_of("integer"))).is_err());
     }
 
     /// P1：[resolve_set_value] 策略 A：叶子 boolean
-    /// 条件：leaf_type 为 "boolean"，输入 "true"
+    /// 条件：叶子 schema type 为 "boolean"，输入 "true"
     /// 断言：返回 Bool(true)
     #[test]
     fn resolve_set_value_boolean() {
-        let v = resolve_set_value("true", Some("boolean")).unwrap();
+        let v = resolve_set_value("true", Some(&leaf_of("boolean"))).unwrap();
         assert_eq!(v, Value::Bool(true));
     }
 
     /// P1：[resolve_set_value] 策略 A：叶子 boolean 非法值
-    /// 条件：leaf_type 为 "boolean"，输入 "yes"
+    /// 条件：叶子 schema type 为 "boolean"，输入 "yes"
     /// 断言：返回 Err
     #[test]
     fn resolve_set_value_boolean_invalid_err() {
-        assert!(resolve_set_value("yes", Some("boolean")).is_err());
+        assert!(resolve_set_value("yes", Some(&leaf_of("boolean"))).is_err());
     }
 
-    /// P0：[resolve_set_value] 策略 A：叶子 object，RHS 为 JSON 片段
-    /// 条件：leaf_type 为 "object"，输入 r#"{"a":1}"#
+    /// P0：[resolve_set_value] 叶子 object 经 repair_json 解析 JSON 片段
+    /// 条件：叶子 schema type 为 "object"，输入 r#"{"a":1}"#
     /// 断言：返回 {"a":1}
     #[test]
     fn resolve_set_value_object_json() {
-        let v = resolve_set_value(r#"{"a":1}"#, Some("object")).unwrap();
+        let v = resolve_set_value(r#"{"a":1}"#, Some(&leaf_of("object"))).unwrap();
         assert_eq!(v, serde_json::json!({"a": 1}));
     }
 
     /// P0：[resolve_set_value] 策略 B：无 schema，纯数字
-    /// 条件：leaf_type 为 None，输入 "42"
+    /// 条件：叶子 schema type 为 None，输入 "42"
     /// 断言：返回 Number(42)
     #[test]
     fn resolve_set_value_infer_number() {
@@ -414,7 +473,7 @@ mod tests {
     }
 
     /// P1：[resolve_set_value] 策略 B：无 schema，JSON 片段首字符 {
-    /// 条件：leaf_type 为 None，输入 r#"{"a":1}"#
+    /// 条件：叶子 schema type 为 None，输入 r#"{"a":1}"#
     /// 断言：返回 {"a":1}
     #[test]
     fn resolve_set_value_infer_json_object() {
@@ -423,7 +482,7 @@ mod tests {
     }
 
     /// P1：[resolve_set_value] 策略 B：无 schema，含冒号时间串
-    /// 条件：leaf_type 为 None，输入 "2026-07-03 23:59:59"
+    /// 条件：叶子 schema type 为 None，输入 "2026-07-03 23:59:59"
     /// 断言：返回 String("2026-07-03 23:59:59")（不误解析）
     #[test]
     fn resolve_set_value_infer_time_string() {
@@ -432,7 +491,7 @@ mod tests {
     }
 
     /// P1：[resolve_set_value] 策略 B：JSON 数组片段
-    /// 条件：leaf_type 为 None，输入 "[1,2,3]"
+    /// 条件：叶子 schema type 为 None，输入 "[1,2,3]"
     /// 断言：返回 [1,2,3]
     #[test]
     fn resolve_set_value_infer_json_array() {
@@ -441,16 +500,16 @@ mod tests {
     }
 
     /// P0：[resolve_set_value] 策略 A：叶子 string，RHS 被 LLM 加引号 "\"hello\""
-    /// 条件：leaf_type 为 "string"，输入 "\"hello\""
+    /// 条件：叶子 schema type 为 "string"，输入 "\"hello\""
     /// 断言：返回 Value::String("hello")（引号被剥除，不进入请求体）
     #[test]
     fn resolve_set_value_string_strips_llm_quotes() {
-        let v = resolve_set_value(r#""hello""#, Some("string")).unwrap();
+        let v = resolve_set_value(r#""hello""#, Some(&leaf_of("string"))).unwrap();
         assert_eq!(v, Value::String("hello".into()));
     }
 
     /// P1：[resolve_set_value] 策略 B：无 schema，RHS 被 LLM 加引号 "\"hello\""
-    /// 条件：leaf_type 为 None，输入 "\"hello\""
+    /// 条件：叶子 schema type 为 None，输入 "\"hello\""
     /// 断言：返回 Value::String("hello")（引号被剥除）
     #[test]
     fn resolve_set_value_infer_strips_llm_quotes() {
@@ -459,7 +518,7 @@ mod tests {
     }
 
     /// P1：[resolve_set_value] 策略 B：无 schema，"\`"98\`"" 保持为字符串
-    /// 条件：leaf_type 为 None，输入 "\"98\""
+    /// 条件：叶子 schema type 为 None，输入 "\"98\""
     /// 断言：返回 Value::String("98")（JSON 字符串字面量，内容为 "98"）
     #[test]
     fn resolve_set_value_infer_quoted_number_stays_string() {
@@ -468,20 +527,20 @@ mod tests {
     }
 
     /// P1：[resolve_set_value] 非法 JSON 字符串不误伤
-    /// 条件：leaf_type 为 "string"，输入 "a\" and \"b"
+    /// 条件：叶子 schema type 为 "string"，输入 "a\" and \"b"
     /// 断言：返回 Value::String("a\" and \"b")（parse 失败，原样保留）
     #[test]
     fn resolve_set_value_string_partial_quotes_unchanged() {
         let input = r#"a" and "b"#;
-        let v = resolve_set_value(input, Some("string")).unwrap();
+        let v = resolve_set_value(input, Some(&leaf_of("string"))).unwrap();
         assert_eq!(v, Value::String(input.into()));
     }
 
-    // ── resolve_leaf_type ──
+    // ── resolve_leaf_schema ──
 
-    /// P0：[resolve_leaf_type] 沿已展开 schema 下潜命中叶子 type
+    /// P0：[resolve_leaf_schema] 沿已展开 schema 下潜命中叶子 Schema
     /// 条件：构造已展开的嵌套 schema（模拟 request_schema() 的返回结果）
-    /// 断言：resolve_leaf_type 返回正确 type
+    /// 断言：返回 Schema 中的 type 正确
     #[test]
     fn resolve_leaf_type_follows_ref() {
         let mut schemas = IndexMap::new();
@@ -525,13 +584,13 @@ mod tests {
         let resolved =
             crate::schema::resolve_schema(&schemas, "Top").expect("resolve_schema should succeed");
         let path = json_path::parse_path("inner.text").unwrap();
-        let t = resolve_leaf_type(&resolved, &path);
-        assert_eq!(t.as_deref(), Some("string"));
+        let leaf = resolve_leaf_schema(&resolved, &path).unwrap();
+        assert_eq!(leaf.schema_type.as_deref(), Some("string"));
     }
 
-    /// P1：[resolve_leaf_type] 某级 key 的 schema_type 为 None 时返回 None
+    /// P1：[resolve_leaf_schema] 即使没有 type 也保留完整 Schema
     /// 条件：已展开 schema 中 x 属性的 type 为 None
-    /// 断言：返回 None（触发回退 B）
+    /// 断言：叶子存在，type 为 None（类型推断仍走回退 B）
     #[test]
     fn resolve_leaf_type_missing_type_returns_none() {
         let top = JsonSchema {
@@ -541,7 +600,7 @@ mod tests {
                 m.insert(
                     "x".to_string(),
                     std::sync::Arc::new(JsonSchema {
-                        // 无 schema_type → resolve_leaf_type 返回 None
+                        // Preserve the schema even without an explicit type.
                         ..Default::default()
                     }),
                 );
@@ -550,10 +609,15 @@ mod tests {
             ..Default::default()
         };
         let path = json_path::parse_path("x").unwrap();
-        assert!(resolve_leaf_type(&top, &path).is_none());
+        assert!(
+            resolve_leaf_schema(&top, &path)
+                .unwrap()
+                .schema_type
+                .is_none()
+        );
     }
 
-    /// P1：[resolve_leaf_type] key 不在 properties 中但匹配 additional_properties Schema 时解析成功
+    /// P1：[resolve_leaf_schema] key 不在 properties 中但匹配 additional_properties Schema 时解析成功
     /// 条件：schema 有 additional_properties=Schema("number")，查询任意 key
     /// 断言：返回 Some("number")
     #[test]
@@ -570,10 +634,16 @@ mod tests {
             ..Default::default()
         };
         let path = json_path::parse_path("any_key").unwrap();
-        assert_eq!(resolve_leaf_type(&top, &path).as_deref(), Some("number"));
+        assert_eq!(
+            resolve_leaf_schema(&top, &path)
+                .unwrap()
+                .schema_type
+                .as_deref(),
+            Some("number")
+        );
     }
 
-    /// P1：[resolve_leaf_type] additional_properties 为 Enabled(true) 时返回 None（无类型信息）
+    /// P1：[resolve_leaf_schema] additional_properties 为 Enabled(true) 时返回 None（无类型信息）
     /// 条件：schema 有 additional_properties=Enabled(true)，key 不在 properties 中
     /// 断言：返回 None
     #[test]
@@ -595,10 +665,10 @@ mod tests {
             ..Default::default()
         };
         let path = json_path::parse_path("a.unknown_key").unwrap();
-        assert!(resolve_leaf_type(&top, &path).is_none());
+        assert!(resolve_leaf_schema(&top, &path).is_none());
     }
 
-    /// P1：[resolve_leaf_type] 路径中某段 key 不存在于 schema 中的 properties 时返回 None
+    /// P1：[resolve_leaf_schema] 路径中某段 key 不存在于 schema 中的 properties 时返回 None
     /// 条件：schema 无 sub 属性，查询 a.sub.type
     /// 断言：返回 None
     #[test]
@@ -619,7 +689,7 @@ mod tests {
             ..Default::default()
         };
         let path = json_path::parse_path("a.sub.type").unwrap();
-        assert!(resolve_leaf_type(&top, &path).is_none());
+        assert!(resolve_leaf_schema(&top, &path).is_none());
     }
 
     // ── apply_set_ops 编排 ──
@@ -654,7 +724,7 @@ mod tests {
         assert_json_diff::assert_json_eq!(payload, json!({"a": {"b": 9}}));
     }
 
-    /// P1：[apply_set_ops] RHS 含 `=` 不再被切分
+    /// P1：[apply_set_ops] RHS 含 `=` 时按首个 `=` 切分
     /// 条件：--set note=k=v
     /// 断言：note=="k=v"（按第一个 = 切分）
     #[test]
@@ -703,44 +773,6 @@ mod tests {
     }
 
     // ── apply_extras ──
-
-    /// 构造一个 object 类型 schema，properties 含给定字段名（均为 string 类型）。
-    fn schema_with(keys: &[&str]) -> JsonSchema {
-        let mut properties = indexmap::IndexMap::new();
-        for &k in keys {
-            properties.insert(
-                k.to_string(),
-                std::sync::Arc::new(JsonSchema {
-                    schema_type: Some("string".to_string()),
-                    ..Default::default()
-                }),
-            );
-        }
-        JsonSchema {
-            schema_type: Some("object".to_string()),
-            properties,
-            ..Default::default()
-        }
-    }
-
-    /// 构造一个 object 类型 schema，properties 为给定的 (字段名, type) 对。
-    fn schema_with_typed(fields: &[(&str, &str)]) -> JsonSchema {
-        let mut properties = indexmap::IndexMap::new();
-        for &(k, ty) in fields {
-            properties.insert(
-                k.to_string(),
-                std::sync::Arc::new(JsonSchema {
-                    schema_type: Some(ty.to_string()),
-                    ..Default::default()
-                }),
-            );
-        }
-        JsonSchema {
-            schema_type: Some("object".to_string()),
-            properties,
-            ..Default::default()
-        }
-    }
 
     /// P0：[apply_extras] dry_run 布尔标志提取
     /// 条件：schema 为空，payload 为 {"dry_run":true}
@@ -1132,136 +1164,423 @@ mod tests {
         assert_json_diff::assert_json_eq!(payload, json!({}));
     }
 
-    // ── repair_json ──
-
-    /// P0：[repair_json] 合法 JSON 直接解析成功
-    /// 条件：输入标准 JSON {"a":1}
-    /// 断言：返回 Value {"a":1}
+    /// P0：[assemble_payload] 修复 message send 正文中的未转义双引号
+    /// 条件：text_content.text 是 schema string，正文包含两组未转义 ASCII 双引号
+    /// 断言：CLI 装配链路成功，正文引号原样保留，结构字段不被吞入正文
     #[test]
-    fn repair_json_valid() {
-        let v = repair_json(r#"{"a":1}"#).unwrap();
-        assert_json_diff::assert_json_eq!(v, json!({"a": 1}));
-    }
+    fn assemble_payload_repairs_message_text_inner_quotes() {
+        let raw = r#"{"chat_id":"wr001","text_content":{"text":"数据已分析完成，请跟进"25年12月后上线"的"系统单量进度""}}"#;
+        assert!(serde_json::from_str::<Value>(raw).is_err());
 
-    /// P1：[repair_json] 缺失引号的键名经 jsonrepair 修复后成功
-    /// 条件：输入非标准 JSON {a:1}（键名无引号）
-    /// 断言：修复后返回 Value {"a":1}
-    #[test]
-    fn repair_json_repaired() {
-        let v = repair_json(r#"{a:1}"#).unwrap();
-        assert_json_diff::assert_json_eq!(v, json!({"a": 1}));
-    }
+        let schema = message_send_schema();
+        let mut command = clap::Command::new("test");
+        for argument in build_args_from_schema(&schema).unwrap() {
+            command = command.arg(argument);
+        }
+        let matches = command.try_get_matches_from(["test"]).unwrap();
+        let mut args = MethodCmdArgs {
+            json: Some(raw.to_string()),
+            ..Default::default()
+        };
+        let value = assemble_payload(&mut args, Some(&schema), &matches).unwrap();
 
-    /// P1：[repair_json] 无法修复的输入返回 Err
-    /// 条件：输入不可修复的残缺 JSON 如 "{:]"（花括号方括号混用）
-    /// 断言：返回 Err
-    #[test]
-    fn repair_json_unrepairable() {
-        assert!(repair_json("{:]").is_err());
-    }
-
-    // ── repair_json 遥测 ──
-
-    /// P1：[repair_json] 合法 JSON 不发射遥测事件（非 repair 路径不上报）
-    /// 条件：输入合法 JSON
-    /// 断言：CaptureScope 没有收到任何事件
-    #[test]
-    fn repair_json_telemetry_no_event_on_valid() {
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
-        );
-
-        let collected: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let c = collected.clone();
-
-        let scope = CaptureScope::new();
-        scope.on_event(move |ev: ClientEvent| {
-            c.lock().unwrap().push(ev);
-        });
-
-        let _enter = scope.span().enter();
-        let _ = repair_json(r#"{"a":1}"#);
-        drop(_enter);
-
-        let snaps: Vec<ClientEvent> = std::mem::take(&mut *collected.lock().unwrap());
-        assert!(snaps.is_empty(), "合法 JSON 不应发射遥测事件");
-    }
-
-    /// P1：[repair_json] 修复后 JSON 发射 ok_repaired 遥测事件
-    /// 条件：输入可修复的非标准 JSON
-    /// 断言：CaptureScope 收到 kind="json_repair"、outcome="ok_repaired" 的事件，
-    ///       且 payload 附带修复前后 JSON（input=原文，output=修复后序列化）
-    #[test]
-    fn repair_json_telemetry_ok_repaired() {
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
-        );
-
-        let collected: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let c = collected.clone();
-
-        let scope = CaptureScope::new();
-        scope.on_event(move |ev: ClientEvent| {
-            c.lock().unwrap().push(ev);
-        });
-
-        let _enter = scope.span().enter();
-        let _ = repair_json(r#"{a:1}"#);
-        drop(_enter);
-
-        let snaps: Vec<ClientEvent> = std::mem::take(&mut *collected.lock().unwrap());
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].kind, ctr::json_repair::KIND);
-        assert_json_diff::assert_json_eq!(
-            snaps[0].payload[ctr::json_repair::FIELD_OUTCOME],
-            json!(ctr::json_repair::OUTCOME_OK_REPAIRED)
-        );
-        assert_json_diff::assert_json_eq!(
-            snaps[0].payload[ctr::json_repair::FIELD_INPUT],
-            json!(r#"{a:1}"#)
-        );
-        assert_json_diff::assert_json_eq!(
-            snaps[0].payload[ctr::json_repair::FIELD_OUTPUT],
-            json!(r#"{"a":1}"#)
+        assert_eq!(value["chat_id"], "wr001");
+        assert_eq!(
+            value["text_content"]["text"],
+            "数据已分析完成，请跟进\"25年12月后上线\"的\"系统单量进度\""
         );
     }
 
-    /// P1：[repair_json] 修复失败时发射 err_repair 遥测事件
-    /// 条件：输入不可修复的残缺 JSON
-    /// 断言：CaptureScope 收到 kind="json_repair"、outcome="err_repair" 的事件，
-    ///       且 payload 附带修复前原文（input）
+    /// P0：[assemble_payload] 引号修复不影响 flag 覆盖与 --set 优先级
+    /// 条件：--json 为 {"text":"a "quote"","next":"json"}，--next 为 "flag"，--set next=set
+    /// 断言：text 引号被修复，next 最终值为 --set 覆盖后的 "set"
     #[test]
-    fn repair_json_telemetry_err_repair() {
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
+    fn schema_quote_repair_preserves_flags_and_set_priority() {
+        let schema = schema_with(&["text", "next"]);
+        let mut command = clap::Command::new("test");
+        for argument in build_args_from_schema(&schema).unwrap() {
+            command = command.arg(argument);
+        }
+        let matches = command
+            .try_get_matches_from(["test", "--next", "flag"])
+            .unwrap();
+        let mut args = MethodCmdArgs {
+            json: Some(r#"{"text":"a "quote"","next":"json"}"#.into()),
+            set: vec!["next=set".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+            json!({
+                "text": "a \"quote\"", "next": "set"
+            })
         );
+    }
 
-        let collected: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let c = collected.clone();
+    /// P1：[assemble_payload] 引号修复后 dry_run extras 仍可正常提取
+    /// 条件：--json 为 {"dry_run":true,"text":"a "quote""}（dry_run 位于待修字段之前）
+    /// 断言：payload 仅剩 text（引号已转义），args.dry_run 为 Some(true)
+    #[test]
+    fn schema_quote_repair_preserves_dry_run_extra_extraction() {
+        let schema = schema_with(&["text"]);
+        let mut command = clap::Command::new("test");
+        for argument in build_args_from_schema(&schema).unwrap() {
+            command = command.arg(argument);
+        }
+        let matches = command.try_get_matches_from(["test"]).unwrap();
+        let mut args = MethodCmdArgs {
+            json: Some(r#"{"dry_run":true,"text":"a "quote""}"#.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+            json!({"text": "a \"quote\""})
+        );
+        assert_eq!(args.dry_run, Some(true));
+    }
 
-        let scope = CaptureScope::new();
-        scope.on_event(move |ev: ClientEvent| {
-            c.lock().unwrap().push(ev);
-        });
+    /// 测试 helper：按 schema 生成 clap 参数并解析 argv，供装配链路用例复用。
+    fn repair_test_matches(schema: &JsonSchema, argv: &[&str]) -> ArgMatches {
+        let mut command = clap::Command::new("test");
+        for argument in build_args_from_schema(schema).unwrap() {
+            command = command.arg(argument);
+        }
+        command.try_get_matches_from(argv).unwrap()
+    }
 
-        let _enter = scope.span().enter();
-        let _ = repair_json("{:]");
-        drop(_enter);
+    /// P0：[assemble_payload] CLI extras 位于待修复字段前后都能保持为独立键
+    /// 条件：additionalProperties=false 的 schema，dry_run / dry-run / --dry_run /
+    ///       --dry-run / page_count 分别置于 text 之前与之后
+    /// 断言：text 内引号被转义，extras 仍为独立键并被提取为 CLI flag
+    #[test]
+    fn schema_quote_repair_cli_extras_before_and_after_text() {
+        let mut schema = schema_with(&["text"]);
+        schema.additional_properties = Some(Box::new(AdditionalProperties::Enabled(false)));
+        let matches = repair_test_matches(&schema, &["test"]);
+        for key in ["dry_run", "dry-run", "--dry_run", "--dry-run", "page_count"] {
+            let control = if key == "page_count" { "3" } else { "true" };
+            let extra = format!(r#""{key}":{control}"#);
+            let text = r#""text":"a "quote"""#;
+            for raw in [format!("{{{text},{extra}}}"), format!("{{{extra},{text}}}")] {
+                let candidate = repair_json(&raw, Some(&schema)).unwrap();
+                assert_eq!(candidate["text"], "a \"quote\"");
+                assert!(
+                    candidate.get(key).is_some(),
+                    "extra must remain a separate key"
+                );
+                let mut args = MethodCmdArgs {
+                    json: Some(raw),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+                    json!({"text": "a \"quote\""})
+                );
+                if key == "page_count" {
+                    assert_eq!(args.page_count, Some(3));
+                } else {
+                    assert_eq!(args.dry_run, Some(true));
+                }
+            }
+        }
+    }
 
-        let snaps: Vec<ClientEvent> = std::mem::take(&mut *collected.lock().unwrap());
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].kind, ctr::json_repair::KIND);
+    /// P1：[assemble_payload] 已转义与待修复输入在 flag / --set 组合下结果一致
+    /// 条件：required=id+text 的 schema，--json 的 text 分别取已转义与待修复两种形态，
+    ///       id 由 --set 或 flag 提供
+    /// 断言：两种输入最终 payload 相同且 --set 优先级最高；extras 仍可提取
+    #[test]
+    fn schema_quote_repair_mixed_inputs_keep_set_priority() {
+        let mut schema = schema_with(&["id", "text"]);
+        schema.required = vec!["id".into(), "text".into()];
+        schema.additional_properties = Some(Box::new(AdditionalProperties::Enabled(false)));
+        for repaired in [false, true] {
+            for supply_flag in [false, true] {
+                let flags = if supply_flag {
+                    vec!["test", "--id", "flag"]
+                } else {
+                    vec!["test"]
+                };
+                let matches = repair_test_matches(&schema, &flags);
+                let raw = if repaired {
+                    r#"{"text":"a "quote"","dry_run":true}"#
+                } else {
+                    r#"{"text":"a \"quote\"","dry_run":true}"#
+                };
+                let mut args = MethodCmdArgs {
+                    json: Some(raw.into()),
+                    set: vec!["id=set".into()],
+                    ..Default::default()
+                };
+                assert_eq!(
+                    assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+                    json!({"id": "set", "text": "a \"quote\""})
+                );
+                assert_eq!(args.dry_run, Some(true));
+            }
+        }
+        let matches = repair_test_matches(&schema, &["test", "--id", "flag"]);
+        let mut args = MethodCmdArgs {
+            json: Some(r#"{"text":"a "quote"","dry_run":false}"#.into()),
+            dry_run: Some(true),
+            ..Default::default()
+        };
+        let value = assemble_payload(&mut args, Some(&schema), &matches).unwrap();
+        assert_eq!(value["id"], "flag");
+        assert_eq!(value["dry_run"], false); // Existing conflict handling keeps the JSON key.
+        assert_eq!(args.dry_run, Some(true));
+    }
+
+    /// P2：[assemble_payload] --json 夹带 help / doc / schema / dry_run 时装配行为一致
+    /// 条件：required=id+text 的 schema，--json 分别夹带四个 CLI extras 且 text 含未转义引号
+    /// 断言：四种 extras 均修复成功并被提取为 CLI flag，缺 required 不报错
+    ///       （无 schema 门禁，也就不存在文档类豁免名单）
+    #[test]
+    fn schema_quote_repair_never_gates_on_cli_extras() {
+        let mut schema = schema_with(&["id", "text"]);
+        schema.required = vec!["id".into(), "text".into()];
+        let matches = repair_test_matches(&schema, &["test"]);
+        for extra in ["dry_run", "help", "doc", "schema"] {
+            let raw = format!(r#"{{"text":"a "quote"","{extra}":true}}"#);
+            let mut args = MethodCmdArgs {
+                json: Some(raw.clone()),
+                ..Default::default()
+            };
+            assert_eq!(
+                assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+                json!({"text": "a \"quote\""}),
+                "extra: {extra}"
+            );
+            // HelperCmdArgs 只识别 help / doc / schema；dry_run 不是其字段，保留在 payload。
+            let helper_expected = if extra == "dry_run" {
+                json!({"text": "a \"quote\"", "dry_run": true})
+            } else {
+                json!({"text": "a \"quote\""})
+            };
+            let mut helper = HelperCmdArgs {
+                json: Some(raw),
+                ..Default::default()
+            };
+            assert_eq!(
+                assemble_payload(&mut helper, Some(&schema), &matches).unwrap(),
+                helper_expected,
+                "extra: {extra}"
+            );
+        }
+    }
+
+    /// P1：[assemble_payload] 合法与 legacy 语法的 --json 夹带 extras 时不引入 schema 门禁
+    /// 条件：schema 必填 id+text，--json 分别为 {"dry_run":true} 与 {dry_run:true}（legacy）
+    /// 断言：payload 均为 {}（缺 required 由后台校验），args.dry_run 均提取为 Some(true)
+    #[test]
+    fn assemble_payload_extracts_extras_from_valid_and_legacy_json() {
+        let mut schema = schema_with(&["id", "text"]);
+        schema.required = vec!["id".into(), "text".into()];
+        let matches = repair_test_matches(&schema, &["test"]);
+        for raw in [r#"{"dry_run":true}"#, "{dry_run:true}"] {
+            let mut args = MethodCmdArgs {
+                json: Some(raw.into()),
+                ..Default::default()
+            };
+            assert_json_diff::assert_json_eq!(
+                assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+                json!({})
+            );
+            assert_eq!(args.dry_run, Some(true));
+        }
+    }
+
+    /// P1：[apply_set_ops] --set 的 object / array 叶子沿用叶子 schema 做候选式修复
+    /// 条件：nested 为 object 叶子、rows 为 array 叶子，RHS 含未转义引号
+    /// 断言：按叶子 schema 修复成功；叶子的 required 缺失不报错（交后台）；
+    ///       无 schema 时按转义最少启发式修复；叶子为 string 时不触发修复
+    #[test]
+    fn schema_quote_repair_set_uses_nested_and_array_schemas() {
+        let schema: JsonSchema = serde_json::from_value(json!({
+            "type": "object", "properties": {
+                "nested": {"type": "object", "properties": {
+                    "id": {"type": "string"}, "text": {"type": "string"}
+                }, "required": ["id", "text"], "additionalProperties": false},
+                "rows": {"type": "array", "items": {"type": "object", "properties": {
+                    "text": {"type": "string"}
+                }, "required": ["text"]}}
+            }
+        }))
+        .unwrap();
+        let matches = repair_test_matches(&schema, &["test"]);
+        let mut args = MethodCmdArgs {
+            json: Some(r#"{"dry_run":true}"#.into()),
+            set: vec![
+                r#"nested={"text":"a "quote""}"#.into(),
+                "nested.id=set".into(),
+                r#"rows=[{"text":"b "quote""}]"#.into(),
+                r#"rows[1]={"text":"c "quote""}"#.into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+            json!({
+                "nested": {"id": "set", "text": "a \"quote\""},
+                "rows": [{"text": "b \"quote\""}, {"text": "c \"quote\""}]
+            })
+        );
+        assert_eq!(args.dry_run, Some(true));
+        // Leaf-level required is not gated either: repair succeeds and the
+        // backend validates the final payload.
+        args.set = vec![r#"nested={"text":"a "quote""}"#.into()];
+        args.json = None;
+        assert_eq!(
+            assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+            json!({"nested": {"text": "a \"quote\""}})
+        );
+        // Without a schema the fewest-escapes heuristic still repairs.
+        let mut payload = json!({});
+        apply_set_ops(
+            &mut payload,
+            &[r#"nested={"text":"a "quote""}"#.into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(payload["nested"]["text"], "a \"quote\"");
+        // A string leaf never enters JSON repair: the RHS stays verbatim.
+        let mut payload = json!({});
+        apply_set_ops(
+            &mut payload,
+            &[r#"nested.text=a "quote""#.into()],
+            Some(&schema),
+        )
+        .unwrap();
+        assert_eq!(payload["nested"]["text"], r#"a "quote""#);
+    }
+
+    /// P2：[assemble_payload] --set 的 object 值经修复后不触发根 schema 校验
+    /// 条件：根 schema required=[id,text]，仅提供 --set body={"text":"a "q""}
+    /// 断言：装配成功，body.text 引号被转义（缺 required 由后台校验）
+    #[test]
+    fn schema_quote_repair_set_does_not_gate_on_root_schema() {
+        let schema: JsonSchema = serde_json::from_value(json!({
+            "type": "object", "properties": {
+                "id": {"type": "string"}, "text": {"type": "string"},
+                "body": {"type": "object", "properties": {"text": {"type": "string"}}}
+            }, "required": ["id", "text"]
+        }))
+        .unwrap();
+        let matches = repair_test_matches(&schema, &["test"]);
+        let mut args = MethodCmdArgs {
+            set: vec![r#"body={"text":"a "q""}"#.into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+            json!({"body": {"text": "a \"q\""}})
+        );
+    }
+
+    /// P1：[assemble_payload] --json 提取 extras 后 --set 仍然生效
+    /// 条件：--json '{"dry_run":true}' --set a=1（extras 提取会让 args 走 serde 往返，
+    ///       set 是 #[serde(skip)] 字段，必须先快照）
+    /// 断言：payload 为 {"a":1}，args.dry_run 为 Some(true)
+    #[test]
+    fn assemble_payload_keeps_set_ops_after_extras_round_trip() {
+        let schema = schema_with(&["a"]);
+        let matches = repair_test_matches(&schema, &["test"]);
+        let mut args = MethodCmdArgs {
+            json: Some(r#"{"dry_run":true}"#.into()),
+            set: vec!["a=1".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            assemble_payload(&mut args, Some(&schema), &matches).unwrap(),
+            json!({"a": "1"})
+        );
+        assert_eq!(args.dry_run, Some(true));
+    }
+
+    /// P1：[repair_json] 嵌套对象内夹带未知 extras 键时仍应修复
+    /// 条件：nested 子对象 additionalProperties=false，其 text 含未转义引号且夹带 dry_run
+    /// 断言：text 引号被转义，dry_run 保持独立字段（未知键只参与打分，不否决）
+    #[test]
+    fn schema_quote_repair_tolerates_unknown_keys_in_nested_objects() {
+        let schema: JsonSchema = serde_json::from_value(json!({
+            "type": "object", "properties": {
+                "nested": {"type": "object", "properties": {"text": {"type": "string"}},
+                           "additionalProperties": false}
+            }
+        }))
+        .unwrap();
+        let repaired = repair_json(
+            r#"{"nested":{"text":"a "quote"","dry_run":true}}"#,
+            Some(&schema),
+        )
+        .unwrap();
         assert_json_diff::assert_json_eq!(
-            snaps[0].payload[ctr::json_repair::FIELD_OUTCOME],
-            json!(ctr::json_repair::OUTCOME_ERR_REPAIR)
+            repaired,
+            json!({"nested": {"text": "a \"quote\"", "dry_run": true}})
         );
+    }
+
+    /// P0：[assemble_payload] 必填字段由 CLI flag 补齐时仍能修复正文引号
+    /// 条件：schema 必填 chat_id + text_content，--json 只给 text_content，chat_id 来自 --chat-id
+    /// 断言：装配成功，chat_id 与修复后的正文同时存在
+    #[test]
+    fn assemble_payload_repairs_quotes_when_required_field_comes_from_flag() {
+        let raw = r#"{"text_content":{"text":"数据"25年"的"进度""}}"#;
+        assert!(jsonrepair_rs::jsonrepair_value(raw).is_err());
+
+        let schema = message_send_schema();
+        let matches = repair_test_matches(&schema, &["test", "--chat-id", "wr001"]);
+        let mut args = MethodCmdArgs {
+            json: Some(raw.into()),
+            ..Default::default()
+        };
+        let value = assemble_payload(&mut args, Some(&schema), &matches).unwrap();
         assert_json_diff::assert_json_eq!(
-            snaps[0].payload[ctr::json_repair::FIELD_INPUT],
-            json!("{:]")
+            value,
+            json!({"chat_id": "wr001", "text_content": {"text": "数据\"25年\"的\"进度\""}})
         );
+    }
+
+    /// P1：[repair_json] 待修复字段之后夹带 CLI extras 键时仍应修复
+    /// 条件：schema 仅声明 text，--json 在 text 之后夹带 extras 键 dry_run
+    /// 断言：text 内引号被转义，dry_run 保持独立字段而非被吞入 text
+    #[test]
+    fn schema_quote_repair_tolerates_cli_flag_key_after_repaired_field() {
+        let raw = r#"{"text":"a "quote"","dry_run":true}"#;
+        let repaired = repair_json(raw, Some(&schema_with(&["text"])))
+            .expect("cli extras must not block repair");
+        assert_json_diff::assert_json_eq!(
+            repaired,
+            json!({"text": "a \"quote\"", "dry_run": true})
+        );
+    }
+
+    /// P1：[assemble_payload] dry_run 位于待修复字段之后时仍可被提取为 CLI flag
+    /// 条件：--json 为 {"text":"a "quote"","dry_run":true}（dry_run 在 text 之后）
+    /// 断言：payload 仅剩 text（引号已转义），args.dry_run 为 Some(true)
+    #[test]
+    fn assemble_payload_extracts_flag_declared_after_repaired_field() {
+        let schema = schema_with(&["text"]);
+        let matches = repair_test_matches(&schema, &["test"]);
+        let mut args = MethodCmdArgs {
+            json: Some(r#"{"text":"a "quote"","dry_run":true}"#.into()),
+            ..Default::default()
+        };
+        let value = assemble_payload(&mut args, Some(&schema), &matches).unwrap();
+        assert_json_diff::assert_json_eq!(value, json!({"text": "a \"quote\""}));
+        assert_eq!(args.dry_run, Some(true));
     }
 
     // ── apply_set_ops 遥测 ──
+
+    /// 测试 helper：注册共享 emit callsite 并重建 interest 缓存（机理见
+    /// crate::telemetry::event_capture 测试模块的同名 helper）。
+    /// 使用时机：`set_default` 之后、`CaptureScope::new()` 之前；
+    /// 热身事件不进入断言。
+    fn warm_up_emit_callsite() {
+        crate::telemetry::emit("test_warmup", &serde_json::json!({}));
+        tracing::callsite::rebuild_interest_cache();
+    }
 
     /// P1：[apply_set_ops] 成功时发射 set_path 事件并携带 count 和 typed_by_schema
     /// 条件：--set a=1 --set b=2，无 schema
@@ -1271,6 +1590,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let c = collected.clone();
@@ -1307,6 +1627,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let c = collected.clone();
@@ -1338,6 +1659,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let c = collected.clone();
@@ -1367,21 +1689,30 @@ mod tests {
 
     // ── resolve_set_value P2 边界 ──
 
-    /// P2：[resolve_set_value] 策略 A：叶子 array，RHS 为 lenient JSON
-    /// 条件：leaf_type 为 "array"，输入 "[1,2,3]"
+    /// P2：[resolve_set_value] 叶子 array 经 repair_json 解析 lenient JSON
+    /// 条件：叶子 schema type 为 "array"，输入 "[1,2,3]"
     /// 断言：返回 [1,2,3]
     #[test]
     fn resolve_set_value_array_type() {
-        let v = resolve_set_value("[1,2,3]", Some("array")).unwrap();
+        let v = resolve_set_value("[1,2,3]", Some(&leaf_of("array"))).unwrap();
         assert_json_diff::assert_json_eq!(v, json!([1, 2, 3]));
     }
 
+    /// P2：[resolve_set_value] 未知 type 的非严格 JSON 片段仍交给 repair_json
+    /// 条件：叶子 schema type 为 "custom"，输入 "{a:1}"（schema 仅参与打分，不做门禁）
+    /// 断言：修复为 {"a":1}，不因 type 非标准而报错
+    #[test]
+    fn resolve_set_value_unknown_type_repairs_json_fragment() {
+        let v = resolve_set_value("{a:1}", Some(&leaf_of("custom"))).unwrap();
+        assert_json_diff::assert_json_eq!(v, json!({"a": 1}));
+    }
+
     /// P2：[resolve_set_value] 策略 A：未知 schema 类型回退到策略 B 推断
-    /// 条件：leaf_type 为 "custom"，输入 "42"
+    /// 条件：叶子 schema type 为 "custom"，输入 "42"
     /// 断言：回退 B，解析为 Number(42)
     #[test]
     fn resolve_set_value_unknown_schema_falls_back() {
-        let v = resolve_set_value("42", Some("custom")).unwrap();
+        let v = resolve_set_value("42", Some(&leaf_of("custom"))).unwrap();
         assert_eq!(v, json!(42));
     }
 

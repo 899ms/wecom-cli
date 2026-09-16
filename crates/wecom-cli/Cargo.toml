@@ -44,6 +44,8 @@ tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "local-time"] }
 wecom = { workspace = true }
+wecom-error = { workspace = true }
+wecom-fs = { workspace = true }
 wecom-transport = { workspace = true }
 
 # 进程父链（trace::chain）平台依赖：macOS 用 libc 的 proc_pidinfo，

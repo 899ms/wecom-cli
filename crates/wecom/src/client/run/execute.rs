@@ -26,9 +26,8 @@ impl<'a> CliRun<'a> {
     /// Opens a `cli.run` span. All downstream spans (`service.execute`,
     /// `transport.invoke`, `http.request`) nest under it
     /// automatically. The resolved subcommand path is recorded as the
-    /// span's [`crate::telemetry::contract::subcmd::FIELD_PATH`] field and
-    /// delivered at span close through
-    /// [`SubcmdExt::on_subcmd`](crate::telemetry::SubcmdExt::on_subcmd).
+    /// span's `subcmd` field and emitted as a `dispatching to subcommand`
+    /// event.
     #[tracing::instrument(
         level = "info",
         name = "cli.run",
@@ -111,24 +110,26 @@ impl<'a> CliRun<'a> {
                     service::handle_service_cmd(&self, name, &first_arg, matches, &cmd).await
                 }
             }
-            None => Err(Error::Other("Missing subcommand".into())),
+            None => Err(Error::other("Missing subcommand".into())),
         };
 
         // 后台接口返回 10021 错误码时，视为参数/用法错误：渲染「error 行 + 当前
         // 命令 help」（对齐 clap 用法错误输出格式）后，以 `CliOutput` 返回——退出码
         // 2、render 直接输出已渲染文本，与正常 help/用法错误走同一套处理路径。
-        if let Err(Error::Transport(
-            api @ TransportError::Api {
-                code: Some(ERRCODE_SHOW_HELP),
-                ..
-            },
-        )) = &result
+        // 检测走能力判等（`code()` 对 Api 变体透传后台码）；命中后经 downcast
+        // 恢复具体 transport 错误交给 help provider 结构化解构。
+        if let Err(e) = &result
+            && e.code() == ERRCODE_SHOW_HELP
         {
+            let api = match e {
+                Error::Wrapped(w) => w.as_any().downcast_ref::<TransportError>(),
+                _ => None,
+            };
             let leaf_path = extract_subcmd_path(&matches);
             let path: Vec<&str> = leaf_path.split(' ').filter(|s| !s.is_empty()).collect();
             return Err(Error::CliOutput {
                 code: 2,
-                message: self.render_leaf_help(&cmd, &path, Some(api)),
+                message: self.render_leaf_help(&cmd, &path, api),
                 source: None,
             });
         }
@@ -212,7 +213,7 @@ impl<'a> CliRun<'a> {
     /// (aligned with clap's usage-error output format); otherwise the raw help
     /// is used.
     ///
-    /// Shared between the CLI `--help` path ([`service::handler`]) and the
+    /// Shared between the CLI `--help` path (`handle_service_cmd`) and the
     /// 10021 error path ([`execute`](Self::execute)).
     pub(crate) fn render_leaf_help(
         &self,

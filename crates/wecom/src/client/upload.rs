@@ -1,7 +1,9 @@
 use std::future::IntoFuture;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use super::Client;
+use crate::fs::check_file_size_limit;
 use crate::{Error, Result, builtins, constants, fs};
 
 // ── ClientUploadMediaRequest ────────────────────────────────────────
@@ -15,7 +17,9 @@ use crate::{Error, Result, builtins, constants, fs};
 /// straightforward).
 ///
 /// # Examples
-/// ```ignore
+/// ```rust,no_run
+/// # use wecom::Client;
+/// # async fn example(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
 /// // No extra headers — just await
 /// let resp = client.upload_media("/path/to/file.png").await?;
 ///
@@ -25,11 +29,14 @@ use crate::{Error, Result, builtins, constants, fs};
 ///     .header("x-trace-id", "abc123")
 ///     .timeout(std::time::Duration::from_secs(30))
 ///     .await?;
+/// # let _ = resp;
+/// # Ok(())
+/// # }
 /// ```
 pub struct ClientUploadMediaRequest<'a> {
     client: &'a Client,
-    fs: fs::Fs,
-    file_path: String,
+    fs: std::sync::Arc<dyn fs::Fs>,
+    file_path: PathBuf,
     header_error: Option<Error>,
     options: wecom_transport::RequestOptions,
 }
@@ -38,7 +45,7 @@ wecom_transport::impl_request_builder!(
     ClientUploadMediaRequest<'a>,
     +options,
     error_type = Error,
-    error_wrapper = Error::Other,
+    error_wrapper = Error::other,
 );
 
 impl<'a> ClientUploadMediaRequest<'a> {
@@ -51,10 +58,15 @@ impl<'a> ClientUploadMediaRequest<'a> {
             return Err(e);
         }
         // 单文件上传入口也做大小校验，防止跳过批量预校验的路径
-        fs::check_file_size_limit(&self.fs, &self.file_path, constants::MAX_UPLOAD_SIZE).await?;
+        check_file_size_limit(
+            self.fs.as_ref(),
+            &self.file_path,
+            constants::MAX_UPLOAD_SIZE,
+        )
+        .await?;
         // Use the same sandboxed Fs as `Client::run` so all entry points
         // share identical path-validation semantics.
-        builtins::upload_media(self.client, &self.fs, &self.file_path, &self.options).await
+        builtins::upload_media(self.client, &self.fs, self.file_path, &self.options).await
     }
 }
 
@@ -76,22 +88,26 @@ impl Client {
     /// directly or customised with `.headers()` / `.header()` /
     /// `.timeout()` before sending.
     ///
-    /// `file_path` may be absolute or relative to the client's
-    /// [`cwd`](Self::cwd) and is validated against the client's configured
-    /// sandbox roots — exactly the same rules as [`Client::run`].
+    /// `file_path` may be absolute or relative to the injected filesystem's
+    /// working directory and is validated by the injected filesystem
+    /// implementation — exactly the same rules as [`Client::run`].
     ///
     /// Routing: `POST /file/upload` (multipart).
     ///
     /// # Example
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use wecom::Client;
+    /// # async fn example(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     /// let resp = client.upload_media("/path/to/file.png").await?;
     /// println!("media_id = {}", resp.media_id);
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn upload_media(&self, file_path: impl Into<String>) -> ClientUploadMediaRequest<'_> {
+    pub fn upload_media(&self, file_path: impl Into<PathBuf>) -> ClientUploadMediaRequest<'_> {
         ClientUploadMediaRequest {
             client: self,
-            fs: self.default_fs(),
-            file_path: file_path.into(),
+            fs: std::sync::Arc::clone(self.workspace_fs()),
+            file_path: fs::absolutize(self.cwd(), &file_path.into()),
             header_error: None,
             options: wecom_transport::RequestOptions::default(),
         }
@@ -111,8 +127,7 @@ mod tests {
     //! ### 关键分支与异常路径
     //! - header_error 已存在 → execute 直接透传该错误，不会发起请求
     //! - file_path 不存在 / 无法读取 → 透传 builtins::upload_* 的 Err
-    //! - 路径相对解析基于 client.cwd()，并应用 client 的 readable / writable
-    //!   sandbox roots（与 [Client::run] 行为一致）
+    //! - 路径解析与校验由注入的 filesystem 实现承担（与 [Client::run] 行为一致）
     //!
     //! ### 上下游交互
     //! - 上游：库使用方通过 `Client::upload_media` 调用
@@ -125,7 +140,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+        Client::builder().config_dir(&dir).build().unwrap()
     }
 
     // ── upload_media builder ──

@@ -28,15 +28,13 @@ impl SharedBuf {
 /// Build a test [`wecom::Client`] pointed at the given mock server URL.
 pub fn build_test_client(server_url: &str) -> wecom::Client {
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
     let transport = wecom::transport::HttpTransportBackend::builder()
         .base_url(server_url)
         .header_sensitive("Authorization", "Bearer test-token", true)
         .build()
         .expect("add header");
     wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
         .transport(transport)
         .build()
         .expect("build test client")

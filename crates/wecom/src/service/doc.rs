@@ -63,7 +63,7 @@ pub(super) fn gen_schema_doc(
 ) -> MethodSchemaInfo {
     let is_download = schema_util::resolve_schema_ref(&schema.schemas, &method.response)
         .as_ref()
-        .map(directive::check_has_octet_stream)
+        .map(|s| directive::check_has_octet_stream(&schema.schemas, s))
         == Some(true);
 
     let (response, schemas) = if is_download {
@@ -148,7 +148,7 @@ pub(super) fn gen_method_ts(schema: &ServiceSchema, method: &MethodSchema) -> Op
     // Check if the response is an octet-stream (file download)
     let is_download = schema_util::resolve_schema_ref(&schema.schemas, &method.response)
         .as_ref()
-        .map(directive::check_has_octet_stream)
+        .map(|s| directive::check_has_octet_stream(&schema.schemas, s))
         == Some(true);
 
     // Collect response schema reference (or use download result type)

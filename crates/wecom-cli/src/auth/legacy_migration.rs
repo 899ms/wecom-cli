@@ -1,10 +1,10 @@
 //! 旧版凭据自动迁移（legacy `bot.enc`/`token.enc` → `credentials.enc`）。
 //!
-//! 历史版本将 bot 凭据与 token 分存于独立加密文件 `bot.enc` / `token.enc`；
-//! 现版本收敛为单一 `credentials.enc`。本模块在启动时检测旧文件：无新凭据
+//! 旧格式将 bot 凭据与 token 分存于独立加密文件 `bot.enc` / `token.enc`；
+//! 当前格式为单一 `credentials.enc`。本模块在启动时检测旧文件：无当前凭据
 //! 文件但存在 `bot.enc` 时，读取旧 botid/secret 自动走 auth 引导换取
-//! Bearer token，落盘为新格式（`credentials.enc`）。旧文件**不主动清理**：
-//! 残留无功能影响，读取全走新文件，同密钥加密无安全差异。
+//! Bearer token，落盘为当前格式（`credentials.enc`）。旧文件**不主动清理**：
+//! 残留无功能影响，读取全走当前格式文件，同密钥加密无安全差异。
 //!
 //! 失败策略：除最终落盘 IO 错误向上传播外，一切迁移语义失败（文件缺失 /
 //! 解密失败 / 网络 / 业务错误 / 无 token）均静默降级（仅日志，不提示用户），
@@ -23,8 +23,9 @@ use super::crypto;
 
 /// 启动时尝试迁移旧版凭据（`bot.enc` → `credentials.enc`）。
 ///
-/// `endpoint` 为鉴权引导端点（由调用方经 [`resolve_auth_endpoint`] 装配后传入，
-/// 测试可经 `bootstrap::auth_endpoint` 传指向 mock server 的端点）。
+/// `endpoint` 为鉴权引导端点（由调用方经
+/// [`resolve_auth_endpoint`](super::bootstrap::resolve_auth_endpoint) 装配后
+/// 传入，测试可经 `bootstrap::auth_endpoint` 传指向 mock server 的端点）。
 ///
 /// 返回是否发生了迁移；迁移语义失败一律返回 `Ok(false)`（静默降级，见模块 doc）。
 ///

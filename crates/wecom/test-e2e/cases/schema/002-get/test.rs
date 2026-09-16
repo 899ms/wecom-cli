@@ -5,7 +5,7 @@ async fn run() {
 
     let server = MockServer::start().await;
 
-    // service_with_options now fetches catalog first to resolve aliases
+    // service_with_options 先拉取 catalog 以解析 alias
     Mock::given(method("POST"))
         .and(path("/service/discovery"))
         .and(body_json(json!({})))

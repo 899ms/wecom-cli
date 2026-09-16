@@ -5,8 +5,7 @@
 //!
 //! All wecom business events share a single tracing target. Consumers
 //! register a single callback via [`EventExt::on_event`] and dispatch by
-//! `kind` inside that callback. This replaces the per-event `on_alias` /
-//! `on_unknown_directive` extension traits.
+//! `kind` inside that callback.
 //!
 //! The [`emit`] function is the single emission point — all wecom internal
 //! trigger sites call `emit(kind, payload)` instead of emitting tracing
@@ -113,15 +112,18 @@ pub trait EventExt {
     ///
     /// # How it works
     ///
-    /// Installs an [`EventMarker`] into the scope span's extensions
+    /// Installs an `EventMarker` into the scope span's extensions
     /// (idempotent), then writes the typed hook into the marker's
-    /// `on_event` slot. [`EventLayer`] dispatches unified telemetry
-    /// events to that slot at runtime.
+    /// `on_event` slot. [`TelemetryLayer`](crate::telemetry::TelemetryLayer)
+    /// dispatches unified telemetry events to that slot at runtime.
     ///
-    /// Requires [`TelemetryLayer`] to be mounted on the subscriber:
+    /// Requires [`TelemetryLayer`](crate::telemetry::TelemetryLayer) to be
+    /// mounted on the subscriber:
     ///
-    /// ```rust,ignore
-    /// subscriber.with(wecom::telemetry::TelemetryLayer::new())
+    /// ```rust,no_run
+    /// # use tracing_subscriber::prelude::*;
+    /// # let subscriber = tracing_subscriber::Registry::default();
+    /// subscriber.with(wecom::telemetry::TelemetryLayer::new());
     /// ```
     fn on_event<F>(&self, f: F)
     where
@@ -162,7 +164,9 @@ impl EventExt for CaptureScope {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
+/// use wecom::telemetry::emit;
+///
 /// emit("method_alias", &serde_json::json!({
 ///     "input": "contact search",
 ///     "resolved": "contact users search",
@@ -189,7 +193,7 @@ mod tests {
     //! ### 关键分支与异常路径
     //! - 事件在 scope 内 → 回调触发，kind/payload 正确
     //! - 事件在 scope 外 → 回调不触发
-    //! - 多次注册 → last-wins，旧回调被覆盖
+    //! - 多次注册 → last-wins，先注册的回调被覆盖
     //! - 并行 scope → 事件隔离，互不干扰
     //! - 序列化/反序列化 → 字段完整保留
     //!
@@ -206,6 +210,22 @@ mod tests {
     use super::*;
     use crate::telemetry::combined_layer::TelemetryLayer;
 
+    /// 测试 helper：以当前 subscriber 注册 [emit] 的 callsite 并重建全局 interest 缓存。
+    ///
+    /// `tracing` 的 callsite 惰性注册：首个触碰它的线程若处于「仅一个 dispatcher
+    /// 注册」窗口且自身没有 default subscriber（如并行运行的非遥测测试），interest
+    /// 会被缓存为 never，之后事件宏直接跳过发射——遥测测试可能因此偶发丢失全部事件
+    /// （并行约 1/3 概率）。在本测试线程先发射一次使 callsite 以 sometimes/always
+    /// 入册，随后的 `rebuild_interest_cache` 再治愈间隙中可能落入的 never。热身事件
+    /// 在任何 [CaptureScope] 回调注册之前发出，不进入任何断言。
+    ///
+    /// 使用时机：每个挂载 `TelemetryLayer` 的测试在 `set_default` 之后、
+    /// `CaptureScope::new()` 之前调用一次。
+    fn warm_up_emit_callsite() {
+        emit("test_warmup", &serde_json::json!({}));
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     /// P0：[EventExt::on_event] 在 scope 内发射事件时回调触发并携带正确的 kind 和 payload
     /// 条件：创建 CaptureScope，注册 on_event 回调，在 scope span 内 emit 事件
     /// 断言：回调收到 1 个 ClientEvent，kind="method_alias"，payload 字段匹配
@@ -214,6 +234,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
@@ -251,6 +272,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
@@ -279,6 +301,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let first: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let f1 = first.clone();
@@ -309,6 +332,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
 
         let a_collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let b_collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();

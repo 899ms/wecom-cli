@@ -20,10 +20,10 @@ pub(super) async fn fetch_with_cache<T: Serialize + DeserializeOwned>(
     force_reload: bool,
     options: &wecom_transport::RequestOptions,
 ) -> Result<T> {
-    let cache_dir = client.cache_dir();
-
-    // 服务发现模块允许读写 cache_dir 下的的文件
-    let fs = fs::Fs::new_with_permissions(client.cwd(), Some(&[&cache_dir]), Some(&[&cache_dir]));
+    // Discovery cache lives in the CLI-private domain: paths are constructed
+    // entirely from Client::cache_dir and sanitized service names, and the
+    // operations go through the private-domain Fs instance.
+    let fs = client.private_fs();
 
     let cache_file =
         client
@@ -34,7 +34,9 @@ pub(super) async fn fetch_with_cache<T: Serialize + DeserializeOwned>(
 
     let span = tracing::Span::current();
 
-    if !force_reload && let Some((cache_data, mtime)) = get_cache_content(&fs, &cache_file).await {
+    if !force_reload
+        && let Some((cache_data, mtime)) = get_cache_content(fs.as_ref(), &cache_file).await
+    {
         span.record("cache.hit", true);
         tracing::info!(
             service_name = service_name.unwrap_or("<catalog>"),
@@ -54,7 +56,9 @@ pub(super) async fn fetch_with_cache<T: Serialize + DeserializeOwned>(
 
     // 写入缓存（直接用 Value 序列化）
     if let Ok(data) = serde_json::to_string(&value)
-        && let Err(e) = fs.atomic_write(&cache_file, data.as_bytes(), 0o644).await
+        && let Err(e) = fs
+            .atomic_write(&cache_file, data.as_bytes(), Some(0o644))
+            .await
     {
         tracing::info!(path = %cache_file.display(), error = %e, "Failed to write discovery cache");
     }
@@ -102,19 +106,22 @@ async fn call_discovery(
         .map_err(Error::from)
 }
 
-/// SAFETY: Cache file path is internally constructed from `Client::cache_dir()`
-/// with sanitized service names — never user-controlled.
+/// Read and parse a cache file when it exists and is fresh.
+///
+/// The cache path is constructed from `Client::cache_dir()` and a sanitized
+/// service name, and the caller passes the CLI-private Fs instance; this
+/// helper must never be reused with a request-controlled path or the
+/// workspace-domain instance.
 async fn get_cache_content<T: DeserializeOwned>(
-    fs: &fs::Fs,
+    fs: &dyn fs::Fs,
     cache_file: &Path,
 ) -> Option<(T, SystemTime)> {
-    // 使用 Fs 抽象层进行沙箱内操作
     let metadata = match fs.metadata(cache_file).await {
         Ok(meta) => meta,
         Err(_) => return None, // 文件不存在或无法访问
     };
 
-    let modified = metadata.modified().ok()?;
+    let modified = metadata.modified?;
 
     if modified.elapsed().unwrap_or_default() >= CACHE_TTL {
         return None;
@@ -153,7 +160,7 @@ mod tests {
     //!
     //! ### 上下游交互
     //! - 上游：[ServiceRegistry::new] 调用 [fetch_with_cache] 尝试加载缓存
-    //! - 下游：依赖 `std::fs` 进行文件读写，使用 `filetime` 修改文件时间戳
+    //! - 下游：经 [fs::Fs] 读写缓存文件，测试中使用 `filetime` 修改文件时间戳
 
     use std::fs;
 
@@ -162,9 +169,9 @@ mod tests {
     use super::*;
     use crate::registry::ServiceCatalog;
 
-    /// 构造一个沙箱 [`crate::fs::Fs`]，读写权限都限定在 `root` 目录内。
-    fn build_sandbox(root: &std::path::Path) -> crate::fs::Fs {
-        crate::fs::Fs::new_with_permissions(root, Some(&[root]), Some(&[root]))
+    /// 构造一个无限制的 [`wecom_fs::SandboxedFs`]。
+    fn build_sandbox() -> wecom_fs::SandboxedFs {
+        wecom_fs::SandboxedFs::new()
     }
 
     // ── get_cache_content 测试 ──
@@ -179,7 +186,7 @@ mod tests {
         let catalog = r#"{ "items": [{ "name": "svc" }] }"#;
         fs::write(&file, catalog).unwrap();
 
-        let sandbox = build_sandbox(tmp.path());
+        let sandbox = build_sandbox();
 
         let result: Option<(ServiceCatalog, _)> = get_cache_content(&sandbox, &file).await;
         assert!(result.is_some());
@@ -196,7 +203,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("nonexistent.json");
 
-        let sandbox = build_sandbox(tmp.path());
+        let sandbox = build_sandbox();
 
         let result: Option<(ServiceCatalog, _)> = get_cache_content(&sandbox, &file).await;
         assert!(result.is_none());
@@ -211,7 +218,7 @@ mod tests {
         let file = tmp.path().join("bad.json");
         fs::write(&file, "not valid json!!!").unwrap();
 
-        let sandbox = build_sandbox(tmp.path());
+        let sandbox = build_sandbox();
 
         let result: Option<(ServiceCatalog, _)> = get_cache_content(&sandbox, &file).await;
         assert!(result.is_none());
@@ -233,7 +240,7 @@ mod tests {
         filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(two_minutes_ago))
             .unwrap();
 
-        let sandbox = build_sandbox(tmp.path());
+        let sandbox = build_sandbox();
 
         let result: Option<(ServiceCatalog, _)> = get_cache_content(&sandbox, &file).await;
         assert!(result.is_none());
@@ -292,8 +299,7 @@ mod tests {
             captured: captured.clone(),
         };
         let client = Client::builder()
-            .home_dir(tmp.path())
-            .cwd(tmp.path())
+            .config_dir(tmp.path())
             .transport(
                 wecom_transport::TransportBuilder::new(backend)
                     .build()
@@ -330,6 +336,38 @@ mod tests {
         );
     }
 
+    /// P0：[fetch_with_cache] 缓存读写只经 private_fs，与 workspace_fs 无关
+    /// 条件：workspace_fs 注入全拒绝的 ErrFs；private_fs 为真实沙箱；捕获型后端
+    /// 断言：fetch_with_cache 成功返回；缓存文件真实写入 config_dir/cache
+    #[tokio::test]
+    async fn fetch_with_cache_uses_private_fs_only() {
+        let tmp = TempDir::new().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let backend = CaptureBackend {
+            captured: captured.clone(),
+        };
+        let client = Client::builder()
+            .config_dir(tmp.path())
+            .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+            .workspace_fs(std::sync::Arc::new(crate::fs::testing::ErrFs))
+            .transport(
+                wecom_transport::TransportBuilder::new(backend)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let options = wecom_transport::RequestOptions::default();
+        let catalog = fetch_with_cache::<ServiceCatalog>(&client, None, false, &options)
+            .await
+            .unwrap();
+        assert!(catalog.items.is_empty());
+        assert!(
+            tmp.path().join("cache/catalog.json").exists(),
+            "discovery cache must be written through private_fs"
+        );
+    }
+
     /// P0：[fetch_with_cache] 缓存未命中时把 options 透传进 discovery 请求
     /// 条件：捕获型后端 + 空缓存目录；options 含 DiscoveryExt(8)，调用
     ///       fetch_with_cache::<ServiceCatalog>(&client, None, false, &options)
@@ -342,8 +380,7 @@ mod tests {
             captured: captured.clone(),
         };
         let client = Client::builder()
-            .home_dir(tmp.path())
-            .cwd(tmp.path())
+            .config_dir(tmp.path())
             .transport(
                 wecom_transport::TransportBuilder::new(backend)
                     .build()

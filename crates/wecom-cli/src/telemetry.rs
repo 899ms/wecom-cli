@@ -1,5 +1,8 @@
 //! JSON repair 提示监听：基于统一 telemetry 事件，在 json repair 成功时
-//! 向 stderr 输出修复前后 JSON，帮助用户核对被自动修复的请求体。
+//! 向 stderr 输出提示，告知用户请求体曾被自动修复。
+//!
+//! 注意：`json_repair` 事件仅携带策略与候选数，不含修复前后原文，
+//! 故提示不含具体 JSON 内容。
 
 use wecom::telemetry::{ClientEvent, EventExt};
 use wecom_transport::telemetry::CaptureScope;
@@ -10,10 +13,6 @@ const KIND_JSON_REPAIR: &str = "json_repair";
 const FIELD_OUTCOME: &str = "outcome";
 /// outcome = ok_repaired：修复成功。
 const OUTCOME_OK_REPAIRED: &str = "ok_repaired";
-/// 修复前（原始输入）JSON 字段。
-const FIELD_INPUT: &str = "input";
-/// 修复后 JSON 字段。
-const FIELD_OUTPUT: &str = "output";
 
 /// 注册 json repair 成功提示监听。
 ///
@@ -35,59 +34,26 @@ pub fn install_json_repair_listener(scope: &CaptureScope) {
             return;
         }
 
-        let before = ev
-            .payload
-            .get(FIELD_INPUT)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let after_raw = ev
-            .payload
-            .get(FIELD_OUTPUT)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-
-        eprintln!("{}", format_json_repair_hint(before, after_raw));
+        eprintln!("{JSON_REPAIR_HINT}");
     });
 }
 
-/// 组装 stderr 提示文本：修复前原文 + 修复后 pretty JSON。
-fn format_json_repair_hint(before: &str, after_raw: &str) -> String {
-    format!(
-        "[wecom] json repair: 输入 JSON 已自动修复\n--- 修复前 ---\n{before}\n--- 修复后 ---\n{}",
-        pretty_json(after_raw)
-    )
-}
-
-/// 将紧凑 JSON 字符串转为 pretty 形式；解析失败时原样返回。
-fn pretty_json(s: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(s)
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        .unwrap_or_else(|| s.to_string())
-}
+/// stderr 提示文本：告知输入 JSON 曾被自动修复。
+const JSON_REPAIR_HINT: &str = "[wecom] json repair: 输入 JSON 已自动修复";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// P0：[format_json_repair_hint] 提示文本包含修复前后 JSON，修复后为 pretty 形式
+    /// P0：提示文本含 json repair 标识
     #[test]
-    fn hint_contains_before_and_pretty_after() {
-        let hint = format_json_repair_hint(r#"{bad: "value"}"#, r#"{"bad":"value"}"#);
-        assert!(hint.contains("json repair"), "应含修复提示，got: {hint}");
-        assert!(
-            hint.contains(r#"{bad: "value"}"#),
-            "应含修复前原文，got: {hint}"
-        );
-        assert!(
-            hint.contains("  \"bad\": \"value\""),
-            "修复后应为 pretty JSON，got: {hint}"
-        );
+    fn hint_mentions_json_repair() {
+        assert!(JSON_REPAIR_HINT.contains("json repair"));
     }
 
-    /// P1：[pretty_json] 非法 JSON 原样返回
+    /// P1：outcome 过滤只认 ok_repaired（常量与上游契约一致）
     #[test]
-    fn pretty_json_invalid_returns_original() {
-        assert_eq!(pretty_json("not json"), "not json");
+    fn outcome_constant_matches_contract() {
+        assert_eq!(OUTCOME_OK_REPAIRED, "ok_repaired");
     }
 }

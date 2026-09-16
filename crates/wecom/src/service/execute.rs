@@ -36,9 +36,13 @@ pub(super) async fn execute_and_output(
     // 收集请求 directives
     let request_schema = method.request_schema();
     let (directives, multipart) = if let Some(schema) = &request_schema {
-        let directives =
-            directive::collect_directives(&method.service_schema.schemas, schema, &options.payload);
-        let multipart = directive::check_has_octet_stream(schema);
+        let directives = directive::collect_directives(
+            &method.service_schema.schemas,
+            schema,
+            &options.payload,
+            options.run.get_cwd(),
+        );
+        let multipart = directive::check_has_octet_stream(&method.service_schema.schemas, schema);
         tracing::debug!(
             directives_count = directives.len(),
             multipart,
@@ -49,22 +53,24 @@ pub(super) async fn execute_and_output(
         (vec![], false)
     };
 
-    let fs = options.run.fs();
+    let fs = options.run.get_fs();
 
-    // 预留 / 校验 output 路径（含沙箱根纠错）
-    let mut output_file = match options.output_path.as_deref() {
+    // 预留 / 校验 output 路径
+    let mut output_file = match options.output_path.clone() {
         Some(path) => {
-            let corrected = fs.resolve_writable_or_suggest(path).await?;
-            Some(output::create_output_file(fs, &corrected).await?)
+            let corrected = fs.resolve(&path, fs::FsAccess::Write).await?;
+            Some(output::create_output_file(fs.as_ref(), &corrected).await?)
         }
         None => None,
     };
 
-    // 校验 output_dir 合法性（不做路径解析）
-    if let Some(path) = &options.output_dir {
-        fs.resolve_dir_writable_or_suggest(path)
+    // Retain the authorized directory for every subsequent output consumer.
+    if let Some(path) = options.output_dir.clone() {
+        let resolved = fs
+            .resolve(&path, fs::FsAccess::WriteDir)
             .await
             .inspect_err(|e| tracing::error!(error = %e, "sandbox check dir writable failed"))?;
+        options.output_dir = Some(resolved);
     }
 
     // 处理 media upload
@@ -84,7 +90,7 @@ pub(super) async fn execute_and_output(
     }
 
     // 检查 form-data 上传文件总大小不超过 100 MB
-    check_multipart_body_size(fs, &directives, 100 * 1024 * 1024).await?;
+    check_multipart_body_size(fs.as_ref(), &directives, 100 * 1024 * 1024).await?;
 
     // ── 第一页请求 ──────────────────────────────────────────
 
@@ -92,15 +98,15 @@ pub(super) async fn execute_and_output(
 
     let payload = if multipart {
         // multipart 经工厂包装（延迟物化）：每次发送/重放时重新打开文件构建独立表单。
-        let fs = fs.clone();
+        let fs = std::sync::Arc::clone(fs);
         let payload = options.payload.clone();
         let file_fields = directive::multipart_file_fields(&directives);
         HttpRequestPayload::form(move || {
-            let fs = fs.clone();
+            let fs = std::sync::Arc::clone(&fs);
             let payload = payload.clone();
             let file_fields = file_fields.clone();
             async move {
-                directive::build_multipart_form(&fs, &payload, &file_fields)
+                directive::build_multipart_form(fs.as_ref(), &payload, &file_fields)
                     .await
                     .map_err(crate::util::to_transport_error)
             }
@@ -167,14 +173,7 @@ pub(super) async fn execute_and_output(
             },
             "single page mode, outputting result",
         );
-        let result = output::handle_json_output(
-            fs,
-            data,
-            output_file,
-            options.output_dir.as_deref(),
-            &method.method_path_segments,
-        )
-        .await?;
+        let result = output::handle_json_output(data, output_file).await?;
 
         output.print(&serde_json::to_string_pretty(&result).unwrap_or_default());
         return Ok(());
@@ -184,16 +183,8 @@ pub(super) async fn execute_and_output(
     tracing::Span::current().record("paged", true);
     tracing::info!(max_pages = options.page_count, "entering paged mode",);
 
-    // 确定写入目标：--output > --output-dir 下创建文件 > stdout
-    if output_file.is_none()
-        && let Some(dir) = &options.output_dir
-    {
-        let name = format!("{}.ndjson", method.method_path_segments.join("_"));
-        output_file = Some(output::create_output_file_unique(fs, dir.join(name)).await?);
-    }
-
-    // 输出
-    write_page(output, &data, &mut output_file)?;
+    // 确定写入目标：--output > stdout
+    write_page(output, &data, &mut output_file).await?;
 
     // 翻页循环（从第 2 页开始）
     let mut total_pages: u32 = 1;
@@ -236,7 +227,7 @@ pub(super) async fn execute_and_output(
             &response_schema,
         )
         .await?;
-        write_page(output, &data, &mut output_file)?;
+        write_page(output, &data, &mut output_file).await?;
         total_pages += 1;
     }
 
@@ -244,8 +235,9 @@ pub(super) async fn execute_and_output(
 
     // 分页完成，如果写入了文件则打印路径信息
     if let Some(output_file) = &mut output_file {
-        output
-            .print(&serde_json::to_string_pretty(&output_file.result_ndjson()).unwrap_or_default());
+        output.print(
+            &serde_json::to_string_pretty(&output_file.result_ndjson().await).unwrap_or_default(),
+        );
     }
 
     Ok(())
@@ -255,14 +247,14 @@ pub(super) async fn execute_and_output(
 ///
 /// 逐个获取文件元信息并累加大小，任一文件超过 `limit` 即返回错误。
 async fn check_multipart_body_size(
-    fs: &fs::Fs,
+    fs: &dyn fs::Fs,
     directives: &[directive::Directive<'_>],
     limit: u64,
 ) -> Result<()> {
     let file_paths: Vec<_> = directives
         .iter()
         .filter_map(|d| match d {
-            directive::Directive::UploadMultipart { file_path, .. } => Some(file_path.as_str()),
+            directive::Directive::UploadMultipart { file_path, .. } => Some(file_path.clone()),
             _ => None,
         })
         .collect();
@@ -274,13 +266,14 @@ async fn check_multipart_body_size(
     let mut total_size: u64 = 0;
 
     for file_path in &file_paths {
-        let file_size = fs.metadata(file_path).await?.len();
+        let file_size = fs.metadata(file_path).await?.len;
         total_size = total_size.saturating_add(file_size);
 
         if total_size > limit {
-            return Err(Error::Validation(format!(
-                "请求文件总大小超过限制（{:.1} MB）",
-                limit as f64 / 1_048_576.0
+            return Err(Error::validation(format!(
+                "请求文件总大小超过限制（{:.1} MB）: {}",
+                limit as f64 / 1_048_576.0,
+                file_path.display()
             )));
         }
     }
@@ -289,13 +282,14 @@ async fn check_multipart_body_size(
 }
 
 /// 输出一页 NDJSON 数据：有文件则追加写入，否则通过 output.print() 输出。
-fn write_page(
+async fn write_page(
     output: &CliRunOutput,
     data: &serde_json::Value,
     output_file: &mut Option<output::OutputFileInfo>,
 ) -> Result<()> {
     if let Some(f) = output_file {
-        f.write_line(&serde_json::to_string(data).unwrap_or_default())?;
+        f.write_line(&serde_json::to_string(data).unwrap_or_default())
+            .await?;
     } else {
         output.print(&data.to_string());
     }
@@ -312,7 +306,7 @@ async fn process_response_directives(
     let Some(schema) = response_schema else {
         return Ok(());
     };
-    for directive in &directive::collect_directives(schemas, schema, data) {
+    for directive in &directive::collect_directives(schemas, schema, data, options.run.get_cwd()) {
         directive::process_file_save(options, data, directive).await?;
     }
     Ok(())
@@ -352,10 +346,11 @@ mod tests {
     //! - extract_next_cursor：has_more 为 false、next_cursor 为空、缺少字段等分支
     //!
     //! ### 上下游交互
-    //! - 上游：[service_handle::handle_service_cmd] 调用本模块执行请求
+    //! - 上游：[handler::handle_service_cmd] 调用本模块执行请求
     //! - 下游：依赖 [wecom_transport::Transport]、[output] 模块、[directive] 模块
 
     use serde_json::json;
+    use wecom_fs::Fs;
 
     use super::*;
     use crate::directive::Directive;
@@ -423,8 +418,7 @@ mod tests {
     /// 断言：返回 Ok(())
     #[tokio::test]
     async fn check_multipart_body_size_empty_directives_ok() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fs = crate::fs::Fs::new(tmp.path());
+        let fs = wecom_fs::SandboxedFs::new();
         let result = check_multipart_body_size(&fs, &[], 1024).await;
         assert!(result.is_ok());
     }
@@ -435,24 +429,24 @@ mod tests {
     #[tokio::test]
     async fn check_multipart_body_size_under_limit_ok() {
         let tmp = tempfile::tempdir().unwrap();
-        let fs = crate::fs::Fs::new(tmp.path());
+        let fs = wecom_fs::SandboxedFs::new();
         let file_a = tmp.path().join("a.txt");
         let file_b = tmp.path().join("b.txt");
-        fs.atomic_write(&file_a, b"1234567890", 0o644)
+        fs.atomic_write(&file_a, b"1234567890", Some(0o644))
             .await
             .unwrap();
-        fs.atomic_write(&file_b, b"abcdefghij", 0o644)
+        fs.atomic_write(&file_b, b"abcdefghij", Some(0o644))
             .await
             .unwrap();
 
         let directives = vec![
             Directive::UploadMultipart {
                 path: vec![PathSegment::Key("file_a".into())],
-                file_path: file_a.to_string_lossy().to_string(),
+                file_path: file_a.clone(),
             },
             Directive::UploadMultipart {
                 path: vec![PathSegment::Key("file_b".into())],
-                file_path: file_b.to_string_lossy().to_string(),
+                file_path: file_b.clone(),
             },
         ];
 
@@ -466,24 +460,24 @@ mod tests {
     #[tokio::test]
     async fn check_multipart_body_size_exceeds_limit_err() {
         let tmp = tempfile::tempdir().unwrap();
-        let fs = crate::fs::Fs::new(tmp.path());
+        let fs = wecom_fs::SandboxedFs::new();
         let file_a = tmp.path().join("a.txt");
         let file_b = tmp.path().join("b.txt");
-        fs.atomic_write(&file_a, b"1234567890", 0o644)
+        fs.atomic_write(&file_a, b"1234567890", Some(0o644))
             .await
             .unwrap();
-        fs.atomic_write(&file_b, b"abcdefghij", 0o644)
+        fs.atomic_write(&file_b, b"abcdefghij", Some(0o644))
             .await
             .unwrap();
 
         let directives = vec![
             Directive::UploadMultipart {
                 path: vec![PathSegment::Key("file_a".into())],
-                file_path: file_a.to_string_lossy().to_string(),
+                file_path: file_a.clone(),
             },
             Directive::UploadMultipart {
                 path: vec![PathSegment::Key("file_b".into())],
-                file_path: file_b.to_string_lossy().to_string(),
+                file_path: file_b.clone(),
             },
         ];
 
@@ -502,30 +496,151 @@ mod tests {
     #[tokio::test]
     async fn check_multipart_body_size_ignores_upload_media() {
         let tmp = tempfile::tempdir().unwrap();
-        let fs = crate::fs::Fs::new(tmp.path());
+        let fs = wecom_fs::SandboxedFs::new();
         let file_a = tmp.path().join("a.txt");
         let file_b = tmp.path().join("b.txt");
-        fs.atomic_write(&file_a, b"1234567890", 0o644)
+        fs.atomic_write(&file_a, b"1234567890", Some(0o644))
             .await
             .unwrap();
-        fs.atomic_write(&file_b, b"1234567890", 0o644)
+        fs.atomic_write(&file_b, b"1234567890", Some(0o644))
             .await
             .unwrap();
 
         let directives = vec![
             Directive::UploadMedia {
                 path: vec![PathSegment::Key("media".into())],
-                file_path: file_a.to_string_lossy().to_string(),
+                file_path: file_a.clone(),
                 with_file_path: false,
             },
             Directive::UploadMultipart {
                 path: vec![PathSegment::Key("form".into())],
-                file_path: file_b.to_string_lossy().to_string(),
+                file_path: file_b.clone(),
             },
         ];
 
         // UploadMultipart 文件 10 字节 < limit 15
         let result = check_multipart_body_size(&fs, &directives, 15).await;
         assert!(result.is_ok());
+    }
+
+    // ── execute_and_output：--output-dir 下载类门禁 ──
+
+    /// 测试夹具：业务请求固定返回 `{"has_more": false}` 的后端。
+    #[derive(Debug)]
+    struct NoMorePagesBackend;
+
+    impl wecom_transport::TransportBackend for NoMorePagesBackend {
+        fn execute<'a>(
+            &'a self,
+            _endpoint: std::borrow::Cow<'a, wecom_transport::Endpoint>,
+            _payload: wecom_transport::HttpRequestPayload,
+            _options: wecom_transport::RequestOptions,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            wecom_transport::TransportResponse,
+                            wecom_transport::Error,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok(wecom_transport::TransportResponse::Json(
+                    wecom_transport::ExecuteOutput {
+                        result: json!({"has_more": false}),
+                        extra: IndexMap::new(),
+                    },
+                ))
+            })
+        }
+    }
+
+    /// P0：[execute_and_output] 非下载类方法携带 --output-dir：JSON 响应不产文件，
+    ///     但显式声明仍走 WriteDir 沙箱校验
+    /// 条件：方法响应为纯 JSON（无下载产物），output_dir 指向 roots 内/外两种取值
+    /// 断言：roots 内 → 调用成功且目录下不产生文件；roots 外 → 沙箱报错、请求不发出
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // 测试夹具直接落盘播种缓存，与被测 Fs 实现无关
+    async fn output_dir_validated_for_non_download_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // 播种 catalog + detail 缓存，使 discovery 不走网络。
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("catalog.json"),
+            serde_json::to_string(&json!({ "items": [{ "name": "svc" }] })).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            cache_dir.join("service_svc.json"),
+            serde_json::to_string(&json!({
+                "description": "test service",
+                "base_url": "https://test.example.com/",
+                "schemas": {
+                    "ListRes": { "type": "object" }
+                },
+                "methods": {},
+                "resources": {
+                    "department": {
+                        "methods": {
+                            "list": {
+                                "http_method": "GET",
+                                "path": "/list",
+                                "response": { "$ref": "ListRes" }
+                            }
+                        },
+                        "resources": {}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let client = crate::Client::builder()
+            .config_dir(&root)
+            .workspace_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::confined_to(&[
+                root.as_path(),
+            ])))
+            .transport(
+                wecom_transport::TransportBuilder::new(NoMorePagesBackend)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let method = client.method(&["svc", "department", "list"]).await.unwrap();
+        let run = client.run(vec!["test".into()]);
+        let out_dir = root.join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        let mut options = RunOptions::new(&run);
+        options.output_dir = Some(out_dir.clone());
+
+        // roots 内：调用成功；纯 JSON 响应不产生文件，--output-dir 自然无效果。
+        execute_and_output(&method, options)
+            .await
+            .expect("in-roots --output-dir must pass sandbox validation");
+        let produced = std::fs::read_dir(&out_dir).unwrap().count();
+        assert_eq!(produced, 0, "no file may be produced under --output-dir");
+
+        // roots 外：显式声明的 --output-dir 走 WriteDir 沙箱校验，报错且请求不发出。
+        let method = client.method(&["svc", "department", "list"]).await.unwrap();
+        let run = client.run(vec!["test".into()]);
+        let mut options = RunOptions::new(&run);
+        options.output_dir = Some(root.join("..").to_path_buf());
+
+        let err = execute_and_output(&method, options)
+            .await
+            .expect_err("out-of-roots --output-dir must be rejected by the sandbox");
+        assert!(
+            err.render().contains("目标路径超出可访问范围"),
+            "err = {}",
+            err.render()
+        );
     }
 }

@@ -1,6 +1,6 @@
 # CLI `--json` 中 `page_count` 被 apply_extras 提取并触发分页
 
-- **场景**：验证通过 `--json` 传入 `page_count` 时，`extract_json_extras` 正确提取并设置分页参数
+- **场景**：验证通过 `--json` 传入 `page_count` 时，`apply_extras` 正确提取并设置分页参数
 - **Transport**：HTTP（wiremock）
 - **来源**：apply_extras 分页路径
 
@@ -28,5 +28,5 @@ client.run(vec!["wecom", "hr", "department", "list", "--json", "{"page_count": 2
 
 ## 关键上下文
 
-- `service/command/arg_types.rs`：`extract_json_extras` → `apply_extras` 从 `--json` payload 提取非 schema 字段
+- `service/command/assemble.rs`：`apply_extras` 从 `--json` payload 提取非 schema 字段
 - `service/handler.rs`：提取后的 `page_count` 传入 `RunOptions` 触发分页

@@ -27,11 +27,9 @@
 //! - `CaptureScope` owns a per-call capture span and registers an
 //!   `on_request` callback that fires synchronously as each outbound
 //!   span closes.
-//! - Vendor does **not** buffer any data internally — callbacks receive
+//! - The capture layer does **not** buffer any data internally — callbacks receive
 //!   ownership of [`HttpRequestRecord`] and the consumer decides whether
 //!   to retain, aggregate, or discard.
-//!
-//! See `docs/design/http-request-capture.md` for the full design.
 
 use std::sync::{Arc, Mutex};
 
@@ -321,8 +319,8 @@ impl tracing::field::Visit for HttpFieldRecorder<'_> {
 
 /// Per-call RAII handle for subscribing to outbound request spans.
 ///
-/// All data is delivered through push-style callbacks — vendor does
-/// **not** buffer any records internally. Callers who need a list
+/// All data is delivered through push-style callbacks — the capture layer
+/// does **not** buffer any records internally. Callers who need a list
 /// can collect into their own container in the callback.
 ///
 /// # Example (most common — `new` with on_request)
@@ -355,7 +353,7 @@ impl tracing::field::Visit for HttpFieldRecorder<'_> {
 /// # };
 /// ```
 ///
-/// # Collecting spans into a list (replacement for removed `take_spans`)
+/// # Collecting spans into a list
 ///
 /// ```rust,no_run
 /// use std::sync::{Arc, Mutex};
@@ -487,7 +485,7 @@ mod tests {
     //! - HttpFieldsBuilder::finish() → 未设置字段使用默认值
     //! - CaptureScope::new() → 创建 span 并注入 CaptureMarker
     //! - CaptureScope::attach() → 在已有 span 上注入 marker
-    //! - 多次注册回调 → last-wins，旧 Arc 引用计数归 1
+    //! - 多次注册回调 → last-wins，先注册的 Arc 引用计数归 1
     //! - 默认状态 → 所有回调为 None
     //! - scope 销毁 → hook Arc 引用计数随 marker 一起销毁
     //!
@@ -624,10 +622,4 @@ mod tests {
         // assertion is that nothing leaked.
         let _ = weak.upgrade();
     }
-
-    // ── removed tests ────────────────────────────────────────────
-    //
-    // All `on_event_*` tests were deleted — `on_event` is no longer part
-    // of `wecom-transport`'s public API. Generic event dispatch is now
-    // handled by `wecom::telemetry::EventLayer`.
 }

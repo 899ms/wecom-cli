@@ -27,4 +27,4 @@ client.run(hr_dept_list_argv(&["--page-count", "3", "--page-delay", "1"]))
 
 ## 关键上下文
 
-- `service/execute.rs`：分页循环中 `request.headers(hdrs)` 将 headers 透传到每页请求
+- `service/execute.rs`：分页循环每页统一走 `client.transport().invoke(..).with_options(run.get_options())`，`CliRun::header()` 设置的 headers 随 options 透传到每页请求

@@ -13,6 +13,19 @@ fn collect_spans(scope: &CaptureScope) -> Arc<Mutex<Vec<HttpRequestRecord>>> {
     collected
 }
 
+/// 热身：以当前 subscriber 注册生产 RequestSpan callsite 并重建 interest 缓存。
+///
+/// `RequestSpan` 是 crate 内部类型、e2e 不可见，故改为向 mock server 的未注册
+/// 路径发一次请求（404 可忽略，span 在发送前已创建、mock 计数不受影响）。
+/// 机理同为消除 callsite 惰性注册
+/// 在并行测试间的 never 污染竞态。使用时机：CaptureScope 创建之前。
+async fn warm_up_request_span(base: &str) {
+    let _ = Transport::from(HttpTransportBackend::default())
+        .invoke(ep(base, "/cgi-bin/callsite-warmup"), json!({}))
+        .await;
+    tracing::callsite::rebuild_interest_cache();
+}
+
 #[tokio::test]
 async fn http_500() {
     let server = MockServer::start().await;
@@ -110,6 +123,7 @@ async fn http_business_error_populates_request_record_error() {
         .mount(&server)
         .await;
 
+    warm_up_request_span(&server.uri()).await;
     let scope = CaptureScope::new();
     let snaps_arc = collect_spans(&scope);
     let _enter = scope.span().enter();

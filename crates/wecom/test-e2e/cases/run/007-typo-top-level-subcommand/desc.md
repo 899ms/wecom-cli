@@ -23,5 +23,5 @@ client.run(vec!["wecom", "schma"]).output(output).await
 
 ## 关键上下文
 
-- `service/command.rs`：catalog items 注册为 clap 子命令
+- `service/command/build.rs`：catalog items 注册为 clap 子命令
 - `cache` 是 `.hide(true)` 命令，不应出现在建议中

@@ -26,4 +26,4 @@ client.run(vec!["wecom", "schema", "list"]).output(...)
 
 ## 关键上下文
 
-- `error.rs`：`Error::Network` 的 `exit_code()` 返回 1
+- `crates/wecom-transport/src/common/error.rs`：`Error::Network` 经 `From` 装箱为 `wecom::Error::Wrapped`，其 `exit_code()` 返回 1

@@ -19,7 +19,8 @@ use crate::{Error, MaskedHeaders, Result, telemetry};
 /// so logging at the bottom layer would produce false-positive errors
 /// during healthy retry loops.
 ///
-/// The body stream is wrapped with [`telemetry::instrument_body`] so
+/// The body stream is wrapped with `body_guard::instrument_body` (see
+/// [`super::body_guard`]) so
 /// `res.body_len` is recorded exactly once when the stream is dropped
 /// (normal exhaustion, early cancellation, or error).
 pub(crate) async fn reqwest_request(

@@ -3,9 +3,7 @@
 //! Provides wire contracts (span names, field names, event targets),
 //! a generic capture mechanism, and public re-exports.
 //!
-//! See `docs/design/telemetry.md` and `docs/design/http-request-capture.md`
-//! for the full design.
-//!
+
 //! # Module layout
 //!
 //! - [`contract`] — Stable wire contract constants (span names, field names,
@@ -16,8 +14,8 @@
 //!   (pure data types)
 //! - `request_span` — `RequestSpan` (crate-internal, not re-exported)
 //!
-//! The HTTP-specific `instrument_body` helper lives in
-//! [`crate::http_client::body_guard`] alongside the backends that use it.
+//! The HTTP-specific `instrument_body` helper lives in the crate-internal
+//! `http_client::body_guard` module, alongside the backends that use it.
 //!
 //! [`http_request`]: contract::http_request
 

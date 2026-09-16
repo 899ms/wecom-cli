@@ -8,15 +8,20 @@ use crate::{Error, Result};
 /// before sending.
 ///
 /// # Examples
-/// ```ignore
+/// ```rust,no_run
+/// # use wecom::Client;
+/// # async fn example(client: &Client, payload: serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
 /// // No extra headers — just await
-/// let val = client.invoke(&["contact", "users", "get"], payload).await?;
+/// let val = client.invoke(&["contact", "users", "get"], payload.clone()).await?;
 ///
 /// // With extra headers
 /// let val = client
 ///     .invoke(&["contact", "users", "get"], payload)
 ///     .header("x-custom", "value")
 ///     .await?;
+/// # let _ = val;
+/// # Ok(())
+/// # }
 /// ```
 pub struct ClientInvokeRequest<'a> {
     client: &'a Client,
@@ -30,7 +35,7 @@ wecom_transport::impl_request_builder!(
     ClientInvokeRequest<'a>,
     +options,
     error_type = Error,
-    error_wrapper = Error::Other,
+    error_wrapper = Error::other,
 );
 
 impl<'a> ClientInvokeRequest<'a> {
@@ -94,7 +99,9 @@ impl Client {
     /// [`serde_json::Value`] is returned directly.
     ///
     /// # Example
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use wecom::Client;
+    /// # async fn example(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     /// // Simple call
     /// let data = client
     ///     .invoke(
@@ -109,8 +116,11 @@ impl Client {
     ///         &["contact", "users", "get"],
     ///         serde_json::json!({"userid": "alice"}),
     ///     )
-    ///     .header("x-custom", "value")?
+    ///     .header("x-custom", "value")
     ///     .await?;
+    /// # let _ = data;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn invoke(&self, path: &[&str], payload: serde_json::Value) -> ClientInvokeRequest<'_> {
         ClientInvokeRequest {
@@ -142,15 +152,9 @@ mod tests {
 
     // ── helpers ──
 
-    /// Build a sandboxed Client backed by `root` as both home_dir and tmp_dir.
+    /// Build a sandboxed Client backed by `root` as config_dir.
     fn build_client(root: &std::path::Path) -> Client {
-        Client::builder()
-            .home_dir(root)
-            .tmp_dir(root)
-            .readable_dirs(vec![root.to_path_buf()])
-            .writable_dirs(vec![root.to_path_buf()])
-            .build()
-            .unwrap()
+        Client::builder().config_dir(root).build().unwrap()
     }
 
     // ── Client::invoke ──

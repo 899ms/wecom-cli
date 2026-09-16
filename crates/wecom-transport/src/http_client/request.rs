@@ -30,7 +30,7 @@ type HttpRequestPayloadBuildFn =
 
 /// payload 种类标记（构造期已知，零成本）。
 ///
-/// 供 [`compute_ranged`](crate::compute_ranged) 的分段下载准入判定使用——
+/// 供 [`compute_ranged`](crate::http::compute_ranged) 的分段下载准入判定使用——
 /// 无需物化 payload 即可区分 JSON 与 multipart。仅 crate 内部使用（`kind()`
 /// 与 `HttpRequestPayload::new` 同收窄），不参与公开 API。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,7 +129,8 @@ impl IntoHttpRequestPayload for &serde_json::Value {
 
 /// Raw HTTP request builder implementing `IntoFuture`.
 ///
-/// Created via [`HttpTransportBackend::post`]. Chain `.headers()`, `.header()`,
+/// Created via [`HttpTransportBackend::post`](crate::HttpTransportBackend::post).
+/// Chain `.headers()`, `.header()`,
 /// `.timeout()` or just `.await`.
 ///
 /// The payload is a [`HttpRequestPayload`] (deferred materialization):
@@ -487,7 +488,7 @@ mod tests {
 
     /// P0：[HttpRequest::into_future] 仅 .headers(...) 设置的 header 会被发送
     /// 条件：transport 只提供 http_client（不含任何 headers）；.headers 追加 x-extra=extra-val
-    /// 断言：wire 请求包含 x-extra（transport 级 headers 不再由 HttpRequest::execute 自动合并）
+    /// 断言：wire 请求包含 x-extra（transport 级 headers 不由 HttpRequest::execute 自动合并）
     #[tokio::test]
     async fn into_future_sends_only_request_headers() {
         use wiremock::matchers::{method, path};
@@ -530,7 +531,7 @@ mod tests {
 
     /// P1：[HttpRequest::into_future] 不调用 .headers() 时，请求不携带 transport 级 header
     /// 条件：transport.headers 含 x-only；直接通过 HttpRequest::execute 发起请求（跳过 invoke 合并）
-    /// 断言：wire 请求中 **不含** x-only——验证 request 子层不再自动合并 transport.headers
+    /// 断言：wire 请求中 **不含** x-only——验证 request 子层不自动合并 transport.headers
     #[tokio::test]
     async fn into_future_only_transport_headers() {
         use wiremock::matchers::{method, path};
@@ -699,10 +700,11 @@ mod tests {
     #[tokio::test]
     async fn payload_build_passthrough_error() {
         let factory = HttpRequestPayload::new(HttpRequestPayloadKind::Json, || async {
-            Err::<HttpRequestBody, _>(crate::Error::Other("boom".into()))
+            Err::<HttpRequestBody, _>(crate::Error::other("boom".into()))
         });
         let err = factory.build().await.unwrap_err();
-        assert!(matches!(err, crate::Error::Other(_)));
+        assert_eq!(err.code(), crate::E_OTHER);
+        assert_eq!(err.message(), "boom");
     }
 
     // ── HttpRequestPayloadKind（构造期种类标记）──

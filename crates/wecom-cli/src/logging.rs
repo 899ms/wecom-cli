@@ -166,7 +166,7 @@ fn cst_timer() -> OffsetTime<&'static [time::format_description::BorrowedFormatI
 /// consistent with the CST timestamps written inside the log.
 ///
 /// Implements [`std::io::Write`] so it can be used with
-/// [`tracing_appender::non_blocking`].
+/// [`tracing_appender::non_blocking()`].
 struct CstDailyAppender {
     inner: Arc<Mutex<CstDailyInner>>,
 }
@@ -315,8 +315,8 @@ mod tests {
         }
         let output = build_logging();
         // 编译期注入了 WECOM_CLI_DEFAULT_LOG_DIR 时，文件层会尝试打开默认目录
-        //（是否返回 None 取决于目录可写性），此时不保证 None，仅对未注入构建
-        // 保持原断言；调用本身即验证不 panic（unreachable 修复的回归防护）。
+        //（是否返回 None 取决于目录可写性），此时不保证 None；调用本身即验证
+        // 不 panic。
         if option_env!("WECOM_CLI_DEFAULT_LOG_DIR").is_none() {
             assert!(output.layer.is_none());
             assert!(output.guard.is_none());

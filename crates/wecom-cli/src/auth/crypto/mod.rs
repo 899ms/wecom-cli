@@ -12,15 +12,18 @@ pub(crate) use keystore::{
 
 use std::path::Path;
 
+use wecom_fs::Fs;
+
 use crate::Result;
 
 /// Atomically write `data` (bytes) to `path` (temp file in the same directory → atomic rename).
 ///
-/// 委托 wecom 库 [`wecom::Fs::atomic_write`]（temp → fsync → rename，persist 前设置权限）。
-/// `Fs::new` 不带根列表即非沙箱模式：凭据/密钥为 app 内部存储，不经用户沙箱。
+/// 委托 `wecom-fs` 的 [`Fs::atomic_write`]
+/// （temp → fsync → rename，persist 前设置权限）。`SandboxedFs::new` 不带根列表
+/// 即非沙箱模式：凭据/密钥为 app 内部存储，不经用户沙箱。
 pub(crate) async fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    wecom::Fs::new(path.parent().unwrap_or(path))
-        .atomic_write(path, data, mode)
+    wecom_fs::SandboxedFs::new()
+        .atomic_write(path, data, Some(mode))
         .await?;
     Ok(())
 }

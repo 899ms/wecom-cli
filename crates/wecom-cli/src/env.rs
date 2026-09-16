@@ -10,9 +10,6 @@ pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 /// 配置目录，默认为 ~/.config/wecom
 pub const CONFIG_DIR: &str = "WECOM_CLI_CONFIG_DIR";
 
-/// 临时目录，默认为 std::env::temp_dir().join("wecom")
-pub const TMP_DIR: &str = "WECOM_CLI_TMP_DIR";
-
 /// 额外请求头，格式：Record<string, string>
 pub const ADDITIONAL_HEADERS: &str = "WECOM_CLI_ADDITIONAL_HEADERS";
 

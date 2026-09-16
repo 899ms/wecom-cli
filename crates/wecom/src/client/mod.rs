@@ -8,7 +8,7 @@ mod upload;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use builder::ClientBuilder;
+pub use builder::{ClientBuilder, default_private_fs, default_workspace_fs};
 pub use catalog::{EndpointCatalog, EndpointKey, PayloadStringReq};
 pub use custom_command::CustomCommand;
 pub use invoke::ClientInvokeRequest;
@@ -21,18 +21,19 @@ use crate::{Error, Result, fs, registry, service};
 
 /// The main entry point for the wecom library.
 ///
-/// `Client` owns all runtime state: HTTP client, caches, paths, and
-/// configuration. Create one via [`Client::builder()`] or [`Client::from_defaults()`].
+/// `Client` owns all runtime state: HTTP client, caches, paths, filesystem
+/// capability, and configuration. Create one via [`Client::builder()`].
 pub struct Client {
-    // -- file-system default options --
-    cwd: PathBuf,
-    readable_dirs: Option<Vec<PathBuf>>,
-    writable_dirs: Option<Vec<PathBuf>>,
-    path_resolver: Option<fs::PathResolver>,
+    // -- filesystem capabilities --
+    /// CLI 私有状态域（config / token / discovery 缓存）。
+    private_fs: Arc<dyn fs::Fs>,
+    /// 用户工作区与产物目录域。
+    workspace_fs: Arc<dyn fs::Fs>,
 
     // -- paths --
-    home_dir: PathBuf,
-    tmp_dir: PathBuf,
+    cwd: PathBuf,
+    config_dir: PathBuf,
+    default_output_dir: Option<PathBuf>,
 
     // -- cli name --
     /// 二进制名（命令名），用于 `--version` / `--help` / `--doc` 输出。
@@ -67,80 +68,67 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// Convenience constructor — equivalent to `Self::builder().build()`.
-    pub fn from_defaults() -> Result<Self> {
-        Self::builder().build()
+    // -- filesystem --
+
+    /// Filesystem capability for the CLI's own private state (config, token,
+    /// discovery cache).
+    ///
+    /// Never pass request payloads, response bodies or any other
+    /// externally-derived path into this instance — use
+    /// [`workspace_fs`](Self::workspace_fs) for those.
+    pub fn private_fs(&self) -> &Arc<dyn fs::Fs> {
+        &self.private_fs
     }
 
-    // -- file-system --
+    /// Filesystem capability for the user workspace and artifact directory —
+    /// the only instance that may receive externally-derived paths.
+    pub fn workspace_fs(&self) -> &Arc<dyn fs::Fs> {
+        &self.workspace_fs
+    }
 
-    /// Default working directory configured at construction time.
+    /// Working directory that anchors relative externally-derived paths
+    /// (CLI arguments, model payloads, helper parameters).
+    ///
+    /// Pinned once at construction (default: the process working
+    /// directory); every `fs::absolutize` at a construction boundary
+    /// resolves against this fixed base (or a per-run
+    /// [`CliRun::cwd`](crate::CliRun::cwd) override), so the anchor cannot
+    /// drift mid-run.
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
-    /// Readable root directories, if any.
-    pub fn readable_dirs(&self) -> Option<&[PathBuf]> {
-        self.readable_dirs.as_deref()
-    }
-
-    /// Writable root directories, if any.
-    pub fn writable_dirs(&self) -> Option<&[PathBuf]> {
-        self.writable_dirs.as_deref()
-    }
-
-    /// Build a sandboxed [`fs::Fs`] from the client's default `cwd` and
-    /// readable / writable root lists.
-    ///
-    /// This is the canonical way to obtain an [`fs::Fs`] that honors the
-    /// client's configured sandbox.  Both [`Client::run`] and the
-    /// programmatic upload builder ([`ClientUploadMediaRequest`]) use this
-    /// so all entry points share identical path-validation semantics.
-    pub fn default_fs(&self) -> fs::Fs {
-        let readable: Option<Vec<&Path>> = self
-            .readable_dirs
-            .as_ref()
-            .map(|dirs| dirs.iter().map(|p| p.as_path()).collect());
-        let writable: Option<Vec<&Path>> = self
-            .writable_dirs
-            .as_ref()
-            .map(|dirs| dirs.iter().map(|p| p.as_path()).collect());
-        let mut fs =
-            fs::Fs::new_with_permissions(&self.cwd, readable.as_deref(), writable.as_deref());
-        if let Some(resolver) = &self.path_resolver {
-            fs = fs.with_resolver(Arc::clone(resolver));
-        }
-        fs
-    }
-
     /// Root configuration directory (default `~/.config/wecom`).
-    pub fn home_dir(&self) -> &Path {
-        &self.home_dir
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
     }
 
-    /// Directory used for on-disk caches (`<home_dir>/cache`).
+    /// Directory used for on-disk caches (`<config_dir>/cache`).
     ///
-    /// Derived from [`home_dir`](Self::home_dir); cannot be set independently.
+    /// Derived from [`config_dir`](Self::config_dir); cannot be set independently.
     pub fn cache_dir(&self) -> PathBuf {
-        self.home_dir.join("cache")
+        self.config_dir.join("cache")
     }
 
-    /// Temporary directory for scratch files (default `$TMPDIR/wecom`).
-    pub fn tmp_dir(&self) -> &Path {
-        &self.tmp_dir
+    /// Default output directory for downloaded files, if configured via
+    /// [`ClientBuilder::default_output_dir`](crate::ClientBuilder::default_output_dir).
+    ///
+    /// The value is the faithful configuration (a relative value is
+    /// anchored to the working directory at build time). The *effective*
+    /// fallback — the working directory when unconfigured — is resolved
+    /// at read time by [`CliRun::get_default_output_dir`], so a per-run
+    /// [`CliRun::cwd`] override moves the default landing spot as
+    /// expected. A per-call output directory (`--output-dir` /
+    /// [`RunOptions::output_dir`](crate::RunOptions)) overrides it for a
+    /// single invocation.
+    pub fn default_output_dir(&self) -> Option<&Path> {
+        self.default_output_dir.as_deref()
     }
 
     /// The binary name (command name) used in `--version` / `--help` /
     /// `--doc` output.
     pub fn bin_name(&self) -> &str {
         &self.bin_name
-    }
-
-    /// Default directory where HTTP response files are stored (`<tmp_dir>/requests`).
-    ///
-    /// Derived from [`tmp_dir`](Self::tmp_dir); cannot be set independently.
-    pub fn request_storage_dir(&self) -> PathBuf {
-        self.tmp_dir.join("requests")
     }
 
     // -- networking --
@@ -158,15 +146,18 @@ impl Client {
     /// Derive an [`wecom_transport::Endpoint`] using this client's configuration.
     ///
     /// base_url is `None` — the transport fills its
-    /// defaults at execution time. Use [`MethodHandle::endpoint`] for
+    /// defaults at execution time. Use
+    /// [`MethodHandle::endpoint`](crate::service::MethodHandle::endpoint) for
     /// per-service overrides.
     ///
     /// The returned endpoint carries HTTP addressing.
     ///
     /// # Example
-    /// ```ignore
+    /// ```rust
+    /// # fn example(client: &wecom::Client) {
     /// // Service discovery endpoint:
     /// client.endpoint("/service/discovery");
+    /// # }
     /// ```
     pub fn endpoint(&self, path: impl Into<String>) -> wecom_transport::Endpoint {
         wecom_transport::Endpoint::new().with(wecom_transport::HttpEndpoint::new(path))
@@ -201,38 +192,51 @@ impl Client {
     /// [`service::ServiceHandle`] whose methods are all synchronous.
     ///
     /// # Errors
-    /// Returns [`Error::Validation`] if `name` matches no service in the
-    /// discovery catalog (checked by exact name first, then alias).
+    /// Returns a validation error (`ValidationError`) if `name` matches no
+    /// service in the discovery catalog (checked by exact name first, then
+    /// alias).
     ///
     /// # Example
-    /// ```ignore
+    /// ```rust,no_run
+    /// # async fn example(client: &wecom::Client) -> Result<(), Box<dyn std::error::Error>> {
     /// let svc = client.service("contact").await?;
     /// let method = svc.method(&["users", "list"])?;
     /// method.invoke(serde_json::json!({})).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn service(&self, name: &str) -> Result<service::ServiceHandle<'_>> {
         self.service_with_options(name, &RequestOptions::default())
             .await
     }
 
-    /// Get a [`MethodHandle`] directly by path, e.g. `&["contact", "users", "list"]`.
+    /// Get a [`MethodHandle`](crate::service::MethodHandle) directly by path,
+    /// e.g. `&["contact", "users", "list"]`.
     ///
     /// This is a convenience shortcut for:
-    /// ```ignore
-    /// client.service("contact").await?.method(&["users", "list"])?
+    /// ```rust,no_run
+    /// # async fn example(client: &wecom::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let method = client.service("contact").await?.method(&["users", "list"])?;
+    /// # let _ = method;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// The first element is the service name; the remaining elements are the
     /// method path passed to [`service::ServiceHandle::method`].
     ///
     /// # Errors
-    /// Returns [`Error::Validation`] if the path has fewer than two elements,
+    /// Returns a validation error (`ValidationError`) if the path has fewer
+    /// than two elements,
     /// the service is not found, or the method path does not exist.
     ///
     /// # Example
-    /// ```ignore
+    /// ```rust,no_run
+    /// # async fn example(client: &wecom::Client) -> Result<(), Box<dyn std::error::Error>> {
     /// let method = client.method(&["contact", "users", "list"]).await?;
     /// method.invoke(serde_json::json!({})).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn method(&self, path: &[&str]) -> Result<service::MethodHandle<'_>> {
         self.method_with_options(path, &RequestOptions::default())
@@ -274,7 +278,7 @@ impl Client {
         // 先精确匹配 name，再匹配 alias；catalog 未命中视为无效服务名，直接报错
         let info = registry::find_service_by_name(&catalog.items, name)
             .cloned()
-            .ok_or_else(|| Error::Validation(format!("找不到服务 '{name}'")))
+            .ok_or_else(|| Error::validation(format!("找不到服务 '{name}'")))
             .inspect_err(|e| tracing::error!(error = %e, "service not found in catalog"))?;
 
         let schema = self
@@ -297,7 +301,7 @@ impl Client {
     ) -> Result<service::MethodHandle<'_>> {
         if path.len() < 2 {
             tracing::error!(path = ?path, "method path too short");
-            return Err(Error::Validation(format!(
+            return Err(Error::validation(format!(
                 "方法路径至少需要两段 ([\"<service>\", \"<method>\", ...])，但收到: {:?}",
                 path
             )));
@@ -322,11 +326,10 @@ impl Client {
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("Client");
-        s.field("cwd", &self.cwd)
-            .field("readable_dirs", &self.readable_dirs)
-            .field("writable_dirs", &self.writable_dirs)
-            .field("home_dir", &self.home_dir)
-            .field("tmp_dir", &self.tmp_dir)
+        s.field("private_fs", &self.private_fs)
+            .field("workspace_fs", &self.workspace_fs)
+            .field("config_dir", &self.config_dir)
+            .field("default_output_dir", &self.default_output_dir)
             .field("transport", &self.transport);
         s.finish_non_exhaustive()
     }
@@ -362,13 +365,17 @@ mod tests {
 
     // ── helpers ──
 
-    /// Build a sandboxed Client backed by `root` as both home_dir and tmp_dir.
+    /// Build a Client backed by `root` as config_dir, cwd and sandbox root.
     fn build_client(root: &std::path::Path) -> Client {
         Client::builder()
-            .home_dir(root)
-            .tmp_dir(root)
-            .readable_dirs(vec![root.to_path_buf()])
-            .writable_dirs(vec![root.to_path_buf()])
+            .config_dir(root)
+            .cwd(root)
+            .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::confined_to(&[
+                root,
+            ])))
+            .workspace_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::confined_to(&[
+                root,
+            ])))
             .build()
             .unwrap()
     }
@@ -534,6 +541,15 @@ mod tests {
 
     // ── Client::method（method_alias 遥测，SDK 侧 wiring） ──
 
+    /// 测试 helper：注册共享 emit callsite 并重建 interest 缓存（机理见
+    /// crate::telemetry::event_capture 测试模块的同名 helper）。
+    /// 使用时机：`set_default` 之后、`CaptureScope::new()` 之前；
+    /// 热身事件不进入断言。
+    fn warm_up_emit_callsite() {
+        crate::telemetry::emit("test_warmup", &serde_json::json!({}));
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     /// P0：[Client::method] 服务别名命中时发射一条合并 method_alias 事件
     /// 条件：缓存 catalog 中 "hr" 服务声明 alias ["human-resources"]，调 method(&["human-resources", "list"])
     /// 断言：方法解析成功（name()=="list"），且捕获一条 method_alias 事件
@@ -543,6 +559,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -578,6 +595,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -604,11 +622,7 @@ mod tests {
     #[test]
     fn endpoint_carries_path() {
         let tmp = TempDir::new().unwrap();
-        let client = Client::builder()
-            .home_dir(tmp.path())
-            .cwd(tmp.path())
-            .build()
-            .unwrap();
+        let client = Client::builder().config_dir(tmp.path()).build().unwrap();
         let ep = client.endpoint("/cgi/x");
         // base_url is None on the endpoint — transport fills at execute time
         assert_eq!(ep.base_url(), "");
@@ -626,12 +640,11 @@ mod tests {
             .build()
             .unwrap();
         let client = Client::builder()
-            .home_dir(tmp.path())
-            .cwd(tmp.path())
+            .config_dir(tmp.path())
             .transport(transport)
             .build()
             .unwrap();
-        // base_url is handled at transport level — just verify client was built
+        // base_url 由 transport 层持有，此处只校验 Client 能正常构建
         let _ = client;
     }
 

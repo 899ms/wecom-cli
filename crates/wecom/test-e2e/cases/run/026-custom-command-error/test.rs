@@ -8,14 +8,12 @@ async fn run() {
     // 注册一个 handler 固定返回错误的扩展命令
     let custom = wecom::CustomCommand::new(
         clap::Command::new("boom").about("Always fails"),
-        |_run, _matches| Box::pin(async { Err(wecom::Error::Other("boom!".into())) }),
+        |_run, _matches| Box::pin(async { Err(wecom::Error::other("boom!".into())) }),
     );
 
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
     let client = wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
         .transport(build_test_http_transport("test-token", &server.uri()))
         .command(custom)
         .build()
@@ -35,10 +33,8 @@ async fn run() {
     let err = result.unwrap_err();
     // 非 CliOutput 错误统一退出码为 1
     assert_eq!(err.exit_code(), 1, "exit_code should be 1");
-    match err {
-        wecom::Error::Other(msg) => assert_eq!(msg.to_string(), "boom!"),
-        other => panic!("expected Error::Other, got {other:?}"),
-    }
+    assert_eq!(err.code(), wecom::E_OTHER);
+    assert_eq!(err.message(), "boom!");
 
     // 扩展命令命中 → 服务发现被跳过，全程零网络请求
     let requests = server

@@ -3,26 +3,32 @@
 //! # Key types
 //!
 //! - [`Transport`] — unified handle holding `Arc<dyn TransportBackend>`. Accepts any
-//!   [`TransportBackend`](traits::TransportBackend) via `From<T>` or `Transport::new()`.
-//! - [`TransportBackend`](traits::TransportBackend) — open trait for custom transport backends.
+//!   [`TransportBackend`] via `From<T>` or `Transport::new()`.
+//! - [`TransportBackend`] — open trait for custom transport backends.
 //! - [`Endpoint`] — unified addressing carrying HTTP info for one call.
 //! - [`TransportRequest`] — builder-style request handle, `IntoFuture`-driven.
 //!
 //! # Implementing a custom backend
 //!
-//! Building blocks for custom [`TransportBackend`](traits::TransportBackend)
+//! Building blocks for custom [`TransportBackend`]
 //! implementations (protocol types, long-task polling, resumable download,
 //! request envelope) live under [`backend`] — kept out of the crate root so
 //! the top level stays focused on the consumer API.
 //!
 //! # Minimal example
 //!
-//! ```ignore
+//! ```rust,no_run
+//! use wecom_transport::{Endpoint, HttpEndpoint};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let backend = wecom_transport::HttpTransportBackend::default();
 //! let transport = wecom_transport::Transport::from(backend)
 //!     .with_header("Authorization", "Bearer x")?;
-//! let endpoint = Endpoint::new("https://api.example.com", "/cgi-bin/action");
+//! let endpoint = Endpoint::new().with(HttpEndpoint::new("/cgi-bin/action"));
 //! let result = transport.invoke(&endpoint, &serde_json::json!({})).await?;
+//! # let _ = result;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod backend;

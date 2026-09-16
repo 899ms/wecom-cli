@@ -120,15 +120,13 @@ async fn run() {
 
     let buf = SharedBuf::new();
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
     let transport = wecom::transport::HttpTransportBackend::builder()
         .base_url(server.uri())
         .header_sensitive("Authorization", "Bearer test-token", true)
         .build()
         .expect("add header");
     let client = wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
         .transport(transport)
         .build()
         .expect("build test client");

@@ -16,4 +16,4 @@
 
 ## 关键上下文
 
-- `client/run.rs`：无法匹配任何已知 service → 回退 clap 默认错误处理
+- `client/run/execute.rs`：无法匹配任何已知 service → 回退 clap 默认错误处理

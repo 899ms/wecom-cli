@@ -26,4 +26,4 @@ transport.invoke(ep(&server.uri(), "/cgi-bin/test"), payload).await
 
 ## 关键上下文
 
-- `http/mod.rs`：HttpTransport::invoke()
+- `http/mod.rs`：`HttpTransportBackend::invoke()`

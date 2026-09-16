@@ -104,8 +104,8 @@ async fn run() {
 
     let buf = SharedBuf::new();
     let client = wecom::Client::builder()
-        .home_dir(tmp.path())
-        .tmp_dir(tmp.path())
+        .config_dir(tmp.path())
+        .cwd(tmp.path())
         .transport(
             wecom::transport::HttpTransportBackend::builder()
                 .base_url(server.uri())
@@ -113,7 +113,11 @@ async fn run() {
                 .build()
                 .expect("add header"),
         )
-        .writable_dirs(vec![tmp.path().to_path_buf()])
+        .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+        .workspace_fs(std::sync::Arc::new(
+            wecom_fs::SandboxedFs::new()
+                .with_write_policy(wecom_fs::Policy::new().with_allowed_dirs(&[tmp.path()])),
+        ))
         .build()
         .unwrap();
 
@@ -143,6 +147,22 @@ async fn run() {
         data_path.contains("output.csv"),
         "data field should contain output.csv, got: {data_path}"
     );
+
+    // 无 --output-dir：x-wecom-file-save 产物默认落盘 cwd（缺省分支的端到端锁定）。
+    // Canonicalize both sides: the fs layer returns resolved real paths
+    // (on macOS the tempdir /var base is symlinked to /private/var).
+    #[allow(clippy::disallowed_methods)]
+    {
+        let expected_dir = tmp.path().canonicalize().unwrap();
+        let actual_dir = std::path::Path::new(data_path)
+            .parent()
+            .map(|p| p.canonicalize().unwrap());
+        assert_eq!(
+            actual_dir.as_deref(),
+            Some(expected_dir.as_path()),
+            "file-save artifact must land under the default output dir (cwd): {data_path}"
+        );
+    }
 
     // FS: output.csv should exist with decoded content "hello".
     let content = assert_file_exists(std::path::Path::new(data_path));

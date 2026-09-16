@@ -29,4 +29,4 @@ client.run(vec!["wecom", "hr", "department", "list"])
 
 ## 关键上下文
 
-- `client/run.rs`：result/error 之外的字段为空时 on_extra_data 不触发
+- `client/run/mod.rs`：result/error 之外的字段为空时 on_extra_data 不触发

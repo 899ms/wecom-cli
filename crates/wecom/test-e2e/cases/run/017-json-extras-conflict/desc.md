@@ -30,5 +30,5 @@ client.run(vec!["wecom", "hr", "department", "list", "--json", "{"page_count": 3
 
 ## 关键上下文
 
-- `service/command/arg_types.rs`：`apply_extras` 检测到已设置的字段后保留原始 key，不覆盖
+- `service/command/assemble.rs`：`apply_extras` 检测到已设置的字段后保留原始 key，不覆盖
 - `service/handler.rs`：提取后的 `page_count` 传入 `RunOptions`；未提取的 key 留在 payload 中通过 HTTP 发送

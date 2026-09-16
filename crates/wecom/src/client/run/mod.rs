@@ -39,40 +39,42 @@ use crate::{Error, Result, fs};
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```rust,no_run
+/// # use wecom::{CliRunOutput, Client};
+/// # async fn example(
+/// #     client: &Client,
+/// #     argv: Vec<String>,
+/// #     buf: Vec<u8>,
+/// #     my_headers: &reqwest::header::HeaderMap,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// // Simple – no extra options:
-/// client.run(argv).await?;
+/// client.run(argv.clone()).await?;
 ///
 /// // With custom output:
-/// client.run(argv).output(CliRunOutput::new(buf)).await?;
+/// client.run(argv.clone()).output(CliRunOutput::new(buf)).await?;
 ///
 /// // With additional headers:
-/// client.run(argv).headers(&my_headers).await?;
+/// client.run(argv.clone()).headers(&my_headers).await?;
 ///
 /// // With a single header:
-/// client.run(argv).header("x-custom", "value").await?;
+/// client.run(argv.clone()).header("x-custom", "value").await?;
 ///
-/// // Override working directory for this run:
-/// client.run(argv).cwd("/tmp/workspace").await?;
-///
-/// // Restrict sandbox readable/writable directories:
-/// client.run(argv)
-///     .readable_dirs(vec![PathBuf::from("/data/input")])
-///     .writable_dirs(vec![PathBuf::from("/data/output")])
+/// // Use a differently configured workspace filesystem for this run
+/// // (e.g. another working directory):
+/// client.run(argv.clone())
+///     .fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
 ///     .await?;
 ///
-/// // Combine fs overrides with other options:
-/// client.run(argv)
-///     .cwd("/project")
-///     .writable_dirs(vec![PathBuf::from("/project/out")])
-///     .home_dir("/custom/home")
+/// // Combine a workspace fs override with other options:
+/// client.run(argv.clone())
+///     .fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
 ///     .headers(&my_headers)
 ///     .await?;
 ///
 /// // Cap every individual wire call (首发请求、分页每页、长任务轮询每一轮
 /// // /task/query、媒体上传子请求) with a uniform per-request
 /// // timeout. 注意：这是"每笔请求"的超时，而不是整个 run 的总挂钟时间。
-/// client.run(argv)
+/// client.run(argv.clone())
 ///     .timeout(std::time::Duration::from_secs(30))
 ///     .await?;
 ///
@@ -82,15 +84,16 @@ use crate::{Error, Result, fs};
 /// client.run(argv)
 ///     .on_poll(|ev| eprintln!("[heartbeat] task={} result={:?}", ev.taskid, ev.result))
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct CliRun<'a> {
     client: &'a Client,
-    fs: fs::Fs,
+    workspace_fs: Arc<dyn fs::Fs>,
+    cwd: Option<PathBuf>,
     argv: Vec<String>,
     output: CliRunOutput,
     header_error: Option<Error>,
-    home_dir: Option<PathBuf>,
-    tmp_dir: Option<PathBuf>,
     options: wecom_transport::RequestOptions,
     on_extra_data: Option<ExtraDataCallback>,
 }
@@ -123,7 +126,7 @@ wecom_transport::impl_request_builder!(
     CliRun<'a>,
     +options,
     error_type = Error,
-    error_wrapper = Error::Other,
+    error_wrapper = Error::other,
 );
 
 impl<'a> CliRun<'a> {
@@ -136,93 +139,80 @@ impl<'a> CliRun<'a> {
 
     // ── fs ──
 
-    /// Return the [`fs::Fs`] handle for this run.
+    /// Filesystem capability for this run (workspace domain).
     ///
-    /// The `Fs` is built at construction time from the client defaults
-    /// and can be overridden via `.cwd()`, `.readable_dirs()`,
-    /// `.writable_dirs()`, or `.fs_config()`.
-    pub fn fs(&self) -> &fs::Fs {
-        &self.fs
+    /// Defaults to the client-injected [`Client::workspace_fs`]
+    /// implementation; a per-run [`.fs()`](Self::fs) override replaces it
+    /// wholesale. The CLI-private domain is intentionally not reachable from
+    /// here — use [`Client::private_fs`] for that.
+    pub fn get_fs(&self) -> &Arc<dyn fs::Fs> {
+        &self.workspace_fs
     }
 
-    /// Return a mutable reference to the [`fs::Fs`] handle.
-    pub fn fs_mut(&mut self) -> &mut fs::Fs {
-        &mut self.fs
+    /// Replace the workspace-domain [`fs::Fs`] implementation for this run
+    /// only.
+    ///
+    /// Run-scoped filesystem behavior (working directory, sandbox roots,
+    /// path resolver) is a construction-time concern of the implementation:
+    /// override it by injecting a differently configured instance. The
+    /// override cannot affect the CLI-private domain.
+    #[must_use]
+    pub fn fs(mut self, fs: Arc<dyn fs::Fs>) -> Self {
+        self.workspace_fs = fs;
+        self
     }
 
-    /// Override the working directory (used for resolving relative paths)
-    /// for this run only.  Rebuilds the internal `Fs`.
+    // ── config_dir / default_output_dir（client 级固定，run 级不可覆盖）──
+
+    /// Configuration directory of the owning [`Client`].
+    ///
+    /// Deliberately not overridable per run: the CLI-private [`fs::Fs`]
+    /// roots are pinned when the instance is constructed, so a run-level
+    /// directory override would drift away from the capability that serves
+    /// it.  Embedders needing another directory build a differently
+    /// configured [`Client`] (or inject another fs via [`fs()`](Self::fs)
+    /// for the workspace domain).
+    pub fn get_config_dir(&self) -> &Path {
+        self.client.config_dir()
+    }
+
+    /// Effective cache directory (derived from [`get_config_dir`](Self::get_config_dir)).
+    pub fn get_cache_dir(&self) -> PathBuf {
+        self.get_config_dir().join("cache")
+    }
+
+    /// Effective default output directory for downloaded files: the
+    /// client-configured default output directory, or this run's working
+    /// directory anchor when unconfigured (honoring a per-run
+    /// [`.cwd()`](Self::cwd) override).
+    pub fn get_default_output_dir(&self) -> &Path {
+        self.client
+            .default_output_dir()
+            .unwrap_or_else(|| self.get_cwd())
+    }
+
+    /// Working directory anchoring relative externally-derived paths for
+    /// this run.
+    ///
+    /// Defaults to the owning [`Client`]'s pinned cwd; a per-run
+    /// [`.cwd()`](Self::cwd) override moves the anchor only.
+    pub fn get_cwd(&self) -> &Path {
+        self.cwd.as_deref().unwrap_or_else(|| self.client.cwd())
+    }
+
+    /// Override the working-directory anchor for this run.
+    ///
+    /// Only the anchor moves, **not** the security boundary: the workspace
+    /// [`fs::Fs`] keeps its construction-time roots.  Intended for moving
+    /// *within* the configured roots (e.g. per-task subdirectories under a
+    /// shared workspace root).  Relative input anchored to a cwd outside
+    /// the roots is rejected (fail-closed) — when switching to a directory
+    /// outside the roots, pair with [`.fs()`](Self::fs) carrying matching
+    /// roots.
     #[must_use]
     pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.fs.set_cwd(dir);
+        self.cwd = Some(dir.into());
         self
-    }
-
-    /// Override the sandbox readable root directories for this run only.
-    #[must_use]
-    pub fn readable_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
-        *self.fs.readable_dirs_mut() = Some(dirs);
-        self
-    }
-
-    /// Override the sandbox writable root directories for this run only.
-    #[must_use]
-    pub fn writable_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
-        *self.fs.writable_dirs_mut() = Some(dirs);
-        self
-    }
-
-    /// Override the custom path resolver for this run only.
-    #[must_use]
-    pub fn resolver(mut self, resolver: crate::fs::PathResolver) -> Self {
-        *self.fs.resolver_mut() = Some(resolver);
-        self
-    }
-
-    // ── home_dir ──
-
-    /// Override the home directory for this run only.
-    ///
-    /// If not set, falls back to [`Client::home_dir()`].
-    #[must_use]
-    pub fn home_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.home_dir = Some(dir.into());
-        self
-    }
-
-    /// Effective home directory: per-run override or client default.
-    pub fn get_home_dir(&self) -> &Path {
-        self.home_dir
-            .as_deref()
-            .unwrap_or_else(|| self.client.home_dir())
-    }
-
-    /// Effective cache directory (derived from [`get_home_dir`](Self::get_home_dir)).
-    pub fn get_cache_dir(&self) -> PathBuf {
-        self.get_home_dir().join("cache")
-    }
-
-    // ── tmp_dir ──
-
-    /// Override the temporary directory for this run only.
-    ///
-    /// If not set, falls back to [`Client::tmp_dir()`].
-    #[must_use]
-    pub fn tmp_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.tmp_dir = Some(dir.into());
-        self
-    }
-
-    /// Effective temporary directory: per-run override or client default.
-    pub fn get_tmp_dir(&self) -> &Path {
-        self.tmp_dir
-            .as_deref()
-            .unwrap_or_else(|| self.client.tmp_dir())
-    }
-
-    /// Effective request storage directory (derived from [`get_tmp_dir`](Self::get_tmp_dir)).
-    pub fn get_request_storage_dir(&self) -> PathBuf {
-        self.get_tmp_dir().join("requests")
     }
 
     // ── output ──
@@ -251,7 +241,9 @@ impl<'a> CliRun<'a> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use wecom::Client;
+    /// # async fn example(client: &Client, argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     /// client.run(argv)
     ///     .on_extra_data(|data| {
     ///         if let Some(display) = data.get("display_result") {
@@ -259,6 +251,8 @@ impl<'a> CliRun<'a> {
     ///         }
     ///     })
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[must_use]
     pub fn on_extra_data<F>(mut self, f: F) -> Self
@@ -277,7 +271,7 @@ impl<'a> CliRun<'a> {
     /// Render clap help / error output color-aware (see
     /// [`CliRunOutput::render_styled`]), preserving the original styling.
     ///
-    /// Shared between `--help` rendering ([`crate::service::handler`]) and the CLI
+    /// Shared between `--help` rendering (`handle_service_cmd`) and the CLI
     /// parse-error path ([`execute`](Self::execute)).
     pub(crate) fn render_help_message(&self, fallback: &clap::builder::StyledStr) -> String {
         self.output.render_styled(fallback)
@@ -303,25 +297,33 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use wecom::{CliRunOutput, Client};
+    /// # async fn example(
+    /// #     client: &Client,
+    /// #     argv: Vec<String>,
+    /// #     buf: Vec<u8>,
+    /// #     headers: &reqwest::header::HeaderMap,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
     /// // Simple usage (output to stdout):
-    /// client.run(argv).await?;
+    /// client.run(argv.clone()).await?;
     ///
     /// // With custom output:
-    /// client.run(argv).output(CliRunOutput::new(buf)).await?;
+    /// client.run(argv.clone()).output(CliRunOutput::new(buf)).await?;
     ///
     /// // With additional headers:
     /// client.run(argv).headers(&headers).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn run(&self, argv: Vec<String>) -> CliRun<'_> {
         CliRun {
             client: self,
-            fs: self.default_fs(),
+            workspace_fs: Arc::clone(self.workspace_fs()),
+            cwd: None,
             argv,
             output: CliRunOutput::default(),
             header_error: None,
-            home_dir: None,
-            tmp_dir: None,
             options: wecom_transport::RequestOptions::default(),
             on_extra_data: None,
         }

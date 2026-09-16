@@ -41,6 +41,6 @@ WECOM_CLI_CONFIG_DIR=<tmp_dir> wecom --version
 
 ## 关键上下文
 
-- `config.rs`：`load_config_file()` → `serde_json::from_str` 失败 → `Error::Config(format!("Failed to parse config file ..."))`。
-- `error.rs`：`Error::Config` → `render()` 返回 `{"error":{"code":893005,"message":"...","type":"ConfigError"}}`。
-- `error.rs`：`Error::Config` → `exit_code()` 返回 `1`。
+- `crates/wecom-cli/src/config.rs`：`load_config_file()` → `serde_json::from_str` 失败 → `wecom::Error::config("Failed to parse config file ...")`。
+- `crates/wecom/src/error.rs`：`Error::config()` 构造 `Error::Wrapped(MessageError::config(..))`，`render()` 返回 `{"error":{"code":893005,"message":"...","type":"ConfigError"}}`。
+- `crates/wecom-cli/src/error.rs`：`Error::Wecom(..)` 的 `exit_code()` 返回 `1`。

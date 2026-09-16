@@ -14,7 +14,7 @@ pub const DEFAULT_BIN_NAME: &str = match option_env!("CARGO_BIN_NAME") {
 };
 
 /// CLI 环境与构建信息，`X-WeCom-Cli-Info` 请求头的结构化表示，
-/// 同时承担 `--version` 人类可读输出（[Display]）。
+/// 同时承担 `--version` 人类可读输出（[`Display`](std::fmt::Display)）。
 ///
 /// 所有字段均为编译期确定的 `&'static str`，[CliInfo::new] 是 `const fn`，
 /// 可在编译期求值，运行时零成本；对外统一使用 [CLI_INFO] 常量。
@@ -70,7 +70,7 @@ impl CliInfo {
     /// 以指定二进制名渲染 `--version` 输出。
     ///
     /// 格式 `{name} {version} ({distribution} {build_time} {commit})`，
-    /// [`Display`] 以 [`DEFAULT_BIN_NAME`] 为默认名称；外部（wecom-cli）注入自定义
+    /// [`Display`](std::fmt::Display) 以 [`DEFAULT_BIN_NAME`] 为默认名称；
     /// 名称时通过 [`Client::bin_name`](crate::Client::bin_name) 调用本方法。
     pub fn display_with_name(&self, name: &str) -> String {
         format!(

@@ -320,7 +320,7 @@ impl TsPrinter {
     }
 }
 
-/// 测试适配器：提供自由函数调用面（`schema_type_to_ts(schema, &mut deps, depth)`），
+/// 测试适配器：保留自由函数调用面（`schema_type_to_ts(schema, &mut deps, depth)`），
 /// 内部委托给 [`TsPrinter::type_expr`]，并把收集到的依赖回写到 `deps`。
 #[cfg(test)]
 fn schema_type_to_ts(schema: &JsonSchema, deps: &mut Vec<String>, depth: usize) -> String {
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(ts, "type Flag = boolean;");
     }
 
-    /// P1：[schema_to_ts::] null 基本类型转换为 TypeScript
+    /// P1：[schema_to_ts] null 基本类型转换为 TypeScript
     /// 条件：schema 的 type 为 "null"
     /// 断言：生成 "type Nothing = null;"
     #[test]
@@ -581,7 +581,7 @@ mod tests {
 
     // ── array ──
 
-    /// P0：[schema_to_ts::] 带 items 的数组转换为 TypeScript 数组类型
+    /// P0：[schema_to_ts] 带 items 的数组转换为 TypeScript 数组类型
     /// 条件：array schema 的 items 为 string
     /// 断言：生成 "type Names = string[];"
     #[test]
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(ts, "type Names = string[];");
     }
 
-    /// P1：[schema_to_ts::] 无 items 的数组回退为 unknown[]
+    /// P1：[schema_to_ts] 无 items 的数组回退为 unknown[]
     /// 条件：array schema 未指定 items
     /// 断言：生成 "type List = unknown[];"
     #[test]
@@ -816,7 +816,7 @@ mod tests {
 
     // ── additionalProperties ──
 
-    /// P1：[schema_type_to_ts::] additionalProperties=true 时生成 Record<string, unknown>
+    /// P1：[schema_type_to_ts] additionalProperties=true 时生成 Record<string, unknown>
     /// 条件：object 的 additional_properties 为 true
     /// 断言：schema_type_to_ts 返回 Record<string, unknown>
     #[test]
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(result, "Record<string, unknown>");
     }
 
-    /// P1：[schema_type_to_ts::] 带类型的 additionalProperties 生成对应值的 Record
+    /// P1：[schema_type_to_ts] 带类型的 additionalProperties 生成对应值的 Record
     /// 条件：object 的 additional_properties 为 Schema("number")
     /// 断言：返回 Record<string, number>
     #[test]
@@ -924,7 +924,7 @@ mod tests {
         assert_eq!(ts, "/** 用户名 */\ntype Name = string;");
     }
 
-    /// P1：[push_jsdoc::] 仅含 extra 的 schema 生成 JSDoc 标签
+    /// P1：[push_jsdoc] 仅含 extra 的 schema 生成 JSDoc 标签
     /// 条件：schema 有 undefinedProperties minLength=1
     /// 断言：TS 代码前有 "/** @minLength 1 */"
     #[test]
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(ts, "/** @minLength 1 */\ntype Token = string;");
     }
 
-    /// P1：[push_jsdoc::] 同时有 description 和 extra 时的多行 JSDoc
+    /// P1：[push_jsdoc] 同时有 description 和 extra 时的多行 JSDoc
     /// 条件：schema 有 description "备注" 和 maxLength=100
     /// 断言：生成多行 JSDoc，包含描述和 @maxLength 标签
     #[test]
@@ -1000,7 +1000,7 @@ mod tests {
             ..Default::default()
         };
         let (ts, _) = schema_to_ts("TS", &schema);
-        // String 类型的 undefined_property 值不再被 JSON 序列化包裹引号
+        // String 类型的 undefined_property 值不被 JSON 序列化包裹引号
         assert_eq!(ts, "/** @format date-time */\ntype TS = string;");
     }
 
@@ -1060,7 +1060,7 @@ mod tests {
 
     // ── 多行 description JSDoc ──
 
-    /// P1：[push_jsdoc::] 多行 description 生成多行 JSDoc 注释
+    /// P1：[push_jsdoc] 多行 description 生成多行 JSDoc 注释
     /// 条件：description 含三行文本 "第一行\n第二行\n第三行"
     /// 断言：每行前带 " * " 的多行 JSDoc 块
     #[test]
@@ -1181,7 +1181,7 @@ mod tests {
 
     // ── object with multiple required/optional ──
 
-    /// P1：[schema_to_ts::] 全部属性必填的 interface 不带 ? 标记
+    /// P1：[schema_to_ts] 全部属性必填的 interface 不带 ? 标记
     /// 条件：object 有 a:string 和 b:number，required 含两者
     /// 断言：interface 中 a 和 b 均 无 ?
     #[test]
@@ -1315,7 +1315,7 @@ mod tests {
 
     // ── 多个 ref 依赖在不同属性中 ──
 
-    /// P1：[schema_to_ts::] 多个 $ref 依赖在不同属性中同时收集
+    /// P1：[schema_to_ts] 多个 $ref 依赖在不同属性中同时收集
     /// 条件：object 的 author 属性直接 ref "Author"，tags 属性的 items ref "Tag"
     /// 断言：deps 同时包含 "Author" 和 "Tag"
     #[test]
@@ -1379,7 +1379,7 @@ mod tests {
 
     // ── interface with description ──
 
-    /// P1：[schema_to_ts::] 带 description 的 object interface 生成 JSDoc 注释
+    /// P1：[schema_to_ts] 带 description 的 object interface 生成 JSDoc 注释
     /// 条件：object 有 description="一个用户" 和 id 属性
     /// 断言：interface 前有 "/** 一个用户 */" JSDoc
     #[test]
@@ -1401,7 +1401,7 @@ mod tests {
 
     // ── inline object with optional props ──
 
-    /// P1：[schema_type_to_ts::] 內联 object 同时包含必填和可选属性
+    /// P1：[schema_type_to_ts] 內联 object 同时包含必填和可选属性
     /// 条件：object 有必填属性 a 和可选属性 b
     /// 断言：生成的内联类型中 a 无 ? 标记，b 带 ? 标记
     #[test]
@@ -1423,7 +1423,7 @@ mod tests {
 
     // ── 文件路径 note（upload_media / octet_stream / file_save） ──
 
-    /// P0：[push_jsdoc::] 带 upload_media 的 string 生成 "@note 指向本地文件路径"
+    /// P0：[push_jsdoc] 带 upload_media 的 string 生成 "@note 指向本地文件路径"
     /// 条件：schema 是 string，directives.upload_media = Some(true)
     /// 断言：TS 代码前有 "/** @note 指向本地文件路径 */"
     #[test]
@@ -1440,7 +1440,7 @@ mod tests {
         assert_eq!(ts, "/** @note 指向本地文件路径 */\ntype File = string;");
     }
 
-    /// P0：[push_jsdoc::] 带 octet_stream 的 string 生成 "@note 指向本地文件路径"
+    /// P0：[push_jsdoc] 带 octet_stream 的 string 生成 "@note 指向本地文件路径"
     /// 条件：schema 是 string，directives.octet_stream.is_some()
     /// 断言：TS 代码前有 "/** @note 指向本地文件路径 */"
     #[test]
@@ -1457,7 +1457,7 @@ mod tests {
         assert_eq!(ts, "/** @note 指向本地文件路径 */\ntype Bin = string;");
     }
 
-    /// P0：[push_jsdoc::] array items 是带 upload_media 的 string 时，array 层也显示 note
+    /// P0：[push_jsdoc] array items 是带 upload_media 的 string 时，array 层也显示 note
     /// 条件：schema 是 array，items 是 string 且 directives.upload_media = Some(true)
     /// 断言：array 类型别名前有 "/** @note 指向本地文件路径 */"
     #[test]
@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(ts, "/** @note 指向本地文件路径 */\ntype Files = string[];");
     }
 
-    /// P0：[push_jsdoc::] array items 是带 octet_stream 的 string 时，array 层也显示 note
+    /// P0：[push_jsdoc] array items 是带 octet_stream 的 string 时，array 层也显示 note
     /// 条件：schema 是 array，items 是 string 且 directives.octet_stream.is_some()
     /// 断言：array 类型别名前有 "/** @note 指向本地文件路径 */"
     #[test]
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(ts, "/** @note 指向本地文件路径 */\ntype Bins = string[];");
     }
 
-    /// P1：[push_jsdoc::] array items 是非 string 时不显示 file note
+    /// P1：[push_jsdoc] array items 是非 string 时不显示 file note
     /// 条件：schema 是 array，items 是 number 且（假设性）带 upload_media
     /// 断言：TS 代码中不含 "@note 指向本地文件路径"
     #[test]
@@ -1520,7 +1520,7 @@ mod tests {
         assert!(!ts.contains("@note 指向本地文件路径"));
     }
 
-    /// P1：[push_jsdoc::] array 本身无文件 directive 且 items 无文件 directive 时不显示 note
+    /// P1：[push_jsdoc] array 本身无文件 directive 且 items 无文件 directive 时不显示 note
     /// 条件：普通 string[] array
     /// 断言：TS 代码中不含 "@note 指向本地文件路径"
     #[test]
@@ -1534,7 +1534,7 @@ mod tests {
         assert!(!ts.contains("@note"));
     }
 
-    /// P2：[push_jsdoc::] array items 缺失时即使带 array 层 upload_media 也不输出 note
+    /// P2：[push_jsdoc] array items 缺失时即使带 array 层 upload_media 也不输出 note
     /// 条件：schema 是 array，items 为 None，自身未带文件 directive
     /// 断言：TS 代码中不含 "@note 指向本地文件路径"
     #[test]

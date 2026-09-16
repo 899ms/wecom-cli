@@ -53,6 +53,15 @@ async fn run() {
     let buf = SharedBuf::new();
     let client = build_test_client(&server.uri());
 
+    // 无 --output 时纯 JSON 分页不产生任何文件（--output-dir 只管辖下载产物的
+    // 语义锁定）：快照默认落盘目录（未配置 default_output_dir 时为进程 cwd）的
+    // 文件名集合，运行后必须不变。
+    #[allow(clippy::disallowed_methods)] // e2e 断言层直探文件系统
+    let before: std::collections::BTreeSet<_> = std::fs::read_dir(client.cwd())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
     let result = client
         .run(hr_dept_list_argv(&[
             "--page-count",
@@ -72,5 +81,18 @@ async fn run() {
     // Each line is valid JSON
     for line in &lines {
         let _: Value = serde_json::from_str(line).unwrap();
+    }
+
+    // 分页纯走 stdout，默认落盘目录不产生任何文件
+    #[allow(clippy::disallowed_methods)] // e2e 断言层直探文件系统
+    {
+        let after: std::collections::BTreeSet<_> = std::fs::read_dir(client.cwd())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            before, after,
+            "paged JSON without --output must not create any file"
+        );
     }
 }

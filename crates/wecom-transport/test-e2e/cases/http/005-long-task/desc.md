@@ -21,4 +21,4 @@
 
 ## 关键上下文
 
-- `http/polling.rs`：HttpPollingConfig、轮询循环
+- `polling.rs` + `http/polling.rs`：`poll_long_task` 轮询循环，连续网络错误超过 `MAX_CONSECUTIVE_NETWORK_ERRORS` 时返回最后一个网络错误

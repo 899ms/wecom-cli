@@ -26,4 +26,4 @@ transport.invoke(ep(&server.uri(), "/cgi-bin/headers"), payload).await
 
 ## 关键上下文
 
-- `http/request.rs`：HttpRequest 构造时附加自定义 header
+- `http_client/request.rs`：HttpRequest 构造时附加自定义 header

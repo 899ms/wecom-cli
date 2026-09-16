@@ -93,8 +93,8 @@ impl<'c> ServiceHandle<'c> {
     /// Get a handle to a specific method by path.
     ///
     /// Before walking the resource tree, attempts path-alias resolution
-    /// (see [`crate::registry::MethodSchema::path_alias`]), so callers
-    /// don't need to distinguish alias paths from real command paths.
+    /// (the schema's `path_alias` field), so callers don't need to
+    /// distinguish alias paths from real command paths.
     ///
     /// Emits a single `method_alias` telemetry event when the resolution
     /// rewrote the input at either alias layer — the service-name alias
@@ -104,12 +104,16 @@ impl<'c> ServiceHandle<'c> {
     /// event covers even a both-layers rewrite.
     ///
     /// # Example
-    /// ```ignore
+    /// ```rust,no_run
+    /// # fn example(svc: &wecom::ServiceHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// let method = svc.method(&["users", "list"])?;
+    /// # let _ = method;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn method(&self, path: &[&str]) -> Result<MethodHandle<'c>> {
         if path.is_empty() {
-            return Err(Error::Validation("方法路径不能为空".to_string()))
+            return Err(Error::validation("方法路径不能为空".to_string()))
                 .inspect_err(|e| tracing::error!(error = %e, "empty method path"));
         }
 
@@ -142,13 +146,13 @@ impl<'c> ServiceHandle<'c> {
         let mut resource = &self.schema.resource_tree;
         for &segment in &path[..path.len() - 1] {
             resource = resource.resources.get(segment).ok_or_else(|| {
-                Error::Other(format!("找不到目标方法 '{}'", path.join(".")).into())
+                Error::other(format!("找不到目标方法 '{}'", path.join(".")).into())
             }).inspect_err(|_| tracing::error!(error = %format!("找不到目标方法 '{}'", path.join(".")), "method not found"))?;
         }
 
         let method_name = path[path.len() - 1];
         let method = resource.methods.get(method_name).ok_or_else(|| {
-            Error::Other(format!("找不到目标方法 '{}'", path.join(".")).into())
+            Error::other(format!("找不到目标方法 '{}'", path.join(".")).into())
         }).inspect_err(|_| tracing::error!(error = %format!("找不到目标方法 '{}'", path.join(".")), "method not found"))?;
 
         let method_path_segments: Vec<_> = std::iter::once(self.info.name.clone())
@@ -269,7 +273,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+        Client::builder().config_dir(&dir).build().unwrap()
     }
 
     static TEST_CLIENT: std::sync::LazyLock<Client> =
@@ -547,8 +551,18 @@ mod tests {
 
     // ── method_alias 遥测（统一发射点） ──
 
+    /// 测试 helper：注册共享 emit callsite 并重建 interest 缓存（机理见
+    /// crate::telemetry::event_capture 测试模块的同名 helper）。
+    /// 使用时机：`set_default` 之后、`CaptureScope::new()` 之前；
+    /// 热身事件不进入断言。
+    fn warm_up_emit_callsite() {
+        crate::telemetry::emit("test_warmup", &serde_json::json!({}));
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     /// 构造 CaptureScope 并收集事件到返回的共享 vec
     fn capture_events() -> (CaptureScope, Arc<Mutex<Vec<ClientEvent>>>) {
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();

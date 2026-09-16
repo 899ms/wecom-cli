@@ -23,10 +23,8 @@ fn build_client_with_auth_cmd(server_uri: &str, called: Arc<AtomicBool>) -> weco
     );
 
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
     wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
         .transport(build_test_http_transport("test-token", server_uri))
         .command(custom)
         .build()

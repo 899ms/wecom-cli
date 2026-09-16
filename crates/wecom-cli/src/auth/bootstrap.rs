@@ -175,7 +175,7 @@ fn sha256_hex(input: &str) -> String {
 /// [`resolve_auth_endpoint`] 构造（信封与鉴权抑制标记由它保证）。
 ///
 /// 错误统一返回 [`crate::Error`]：网络/HTTP/解析经三层嵌套
-/// `Error::Wecom(wecom::Error::Transport(_))`；业务错误（`errcode != 0`）由
+/// `Error::Wecom(wecom::Error::Wrapped(_))`；业务错误（`errcode != 0`）由
 /// [`FlatRes`](crate::transport::envelope::FlatRes) 信封层校验并构造
 /// `wecom_transport::Error::Api`（消息取后台 errmsg，body 透传原始响应）；
 /// 响应格式不符为 transport 层 [`Parse`](wecom_transport::Error::Parse)
@@ -326,7 +326,7 @@ mod tests {
         assert!(json.get("bot_id").is_some());
     }
 
-    /// P0：默认端点指向 product/正式环境的新接口
+    /// P0：默认端点指向 product/正式环境的引导接口
     /// 条件：未设置 WECOM_CLI_AUTH_ENDPOINT（默认 feature 下 env/config 均不生效）
     /// 断言：resolve_auth_endpoint() 返回默认 product 端点
     #[test]

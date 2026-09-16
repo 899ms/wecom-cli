@@ -35,5 +35,5 @@ wecom --version
 
 ## 关键上下文
 
-- `crates/wecom/src/client/run.rs`：`--version` 判断在 `run()` 最前面，直接 `self.output()` 后返回 `Ok(())`。
+- `crates/wecom/src/client/run/execute.rs`：`CliRun::execute` 在开头检测 `-V` / `--version`，经 `output.print()` 输出 `CLI_INFO` 后提前返回 `Ok(())`。
 - 输出来自 `CliInfo` 的 `Display`，格式 `{name} {version} ({distribution} {build_time} {commit})`，包含 `BUILD_VERSION`、`WECOM_CLI_DISTRIBUTION`、`GIT_COMMIT_ID` 和 RFC 3339 构建时间。

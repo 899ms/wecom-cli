@@ -1,6 +1,7 @@
 //! Drop-guarded byte counter for HTTP response body streams.
 //!
-//! Wraps a [`ByteStream`] so that `res.body_len` and `duration.total_ms`
+//! Wraps a [`ByteStream`](crate::ByteStream) so that `res.body_len` and
+//! `duration.total_ms`
 //! are recorded on the attached `http.request` span exactly once when the
 //! stream is dropped (EOF, cancel, or error).
 

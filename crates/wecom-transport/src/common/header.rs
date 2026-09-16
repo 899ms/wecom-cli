@@ -7,7 +7,7 @@
 //! `.await` so chaining stays ergonomic.
 //!
 //! These traits are the public seam between the builder macros (see
-//! [`crate::builder_macros`]) and concrete request types, and are
+//! [`crate::macros`]) and concrete request types, and are
 //! re-exported from the crate root so business code rarely needs to refer
 //! to this module directly.
 

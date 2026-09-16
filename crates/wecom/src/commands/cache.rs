@@ -2,6 +2,7 @@ use std::path::Path;
 
 use clap::{ArgMatches, Command, FromArgMatches, Subcommand};
 use serde_json::json;
+use wecom_fs::Error as FsError;
 
 use crate::{CliRun, CliRunOutput, Error, Result, fs};
 
@@ -20,27 +21,25 @@ pub fn build_cache_cmd() -> Command {
 }
 
 pub async fn handle_cache_cmd(run: &CliRun<'_>, matches: &ArgMatches) -> Result<()> {
+    let fs = run.get_client().private_fs().as_ref();
+
     let output = run.get_output();
     let cache_dir = run.get_cache_dir();
 
-    // cache 命令使用独立的 Fs，仅放开 cache 目录的读写权限，
-    // 不受 CliRun 全局沙箱（readable/writable_dirs）限制。
-    let cache_fs = fs::Fs::new_with_permissions(
-        &cache_dir,
-        Some(&[cache_dir.as_path()]),
-        Some(&[cache_dir.as_path()]),
-    );
-
     match CacheCmds::from_arg_matches(matches) {
-        Ok(CacheCmds::Status) => handle_cache_status(&cache_fs, &cache_dir, output).await,
-        Ok(CacheCmds::Clear) => handle_cache_clear(&cache_fs, &cache_dir, output).await,
-        _ => Err(Error::Other("Unknown cache subcommand".into())),
+        Ok(CacheCmds::Status) => handle_cache_status(fs, &cache_dir, output).await,
+        Ok(CacheCmds::Clear) => handle_cache_clear(fs, &cache_dir, output).await,
+        _ => Err(Error::other("Unknown cache subcommand".into())),
     }
 }
 
 /// 列出当前缓存目录下所有文件及其修改时间。
 #[tracing::instrument(level = "debug", name = "cache.status", skip_all)]
-async fn handle_cache_status(fs: &fs::Fs, cache_dir: &Path, output: &CliRunOutput) -> Result<()> {
+async fn handle_cache_status(
+    fs: &dyn fs::Fs,
+    cache_dir: &Path,
+    output: &CliRunOutput,
+) -> Result<()> {
     tracing::info!(cache_dir = %cache_dir.display(), "listing cache status");
 
     let files: Vec<_> = fs
@@ -48,13 +47,14 @@ async fn handle_cache_status(fs: &fs::Fs, cache_dir: &Path, output: &CliRunOutpu
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|p| p.is_file())
+        .filter(|e| e.is_file)
+        .map(|e| e.path)
         .collect();
 
     let mut entries: Vec<_> = Vec::new();
     for path in &files {
         if let Ok(metadata) = fs.metadata(path).await
-            && let Ok(modified) = metadata.modified()
+            && let Some(modified) = metadata.modified
             && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
         {
             entries.push(serde_json::json!({
@@ -70,15 +70,25 @@ async fn handle_cache_status(fs: &fs::Fs, cache_dir: &Path, output: &CliRunOutpu
 
 /// 清除缓存目录下所有文件。
 #[tracing::instrument(level = "debug", name = "cache.clear", skip_all)]
-async fn handle_cache_clear(fs: &fs::Fs, cache_dir: &Path, output: &CliRunOutput) -> Result<()> {
+async fn handle_cache_clear(
+    fs: &dyn fs::Fs,
+    cache_dir: &Path,
+    output: &CliRunOutput,
+) -> Result<()> {
     tracing::info!(cache_dir = %cache_dir.display(), "clearing cache");
 
+    // Both listing and deletion are internal maintenance of a CLI-owned
+    // directory: `cache_dir` and every target under it are constructed
+    // entirely by CLI implementation code and reached through the
+    // private-domain Fs instance — `wecom cache clear` being model-callable
+    // does not move these paths into the workspace domain.
     let files: Vec<_> = fs
         .list_dir(cache_dir)
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|p| p.is_file())
+        .filter(|entry| entry.is_file)
+        .map(|entry| entry.path)
         .collect();
     let mut removed = Vec::new();
 
@@ -92,6 +102,9 @@ async fn handle_cache_clear(fs: &fs::Fs, cache_dir: &Path, output: &CliRunOutput
                         .to_string(),
                 );
             }
+            // Permission errors abort the whole clear; convert to the crate
+            // error type so the caller renders it in the usual taxonomy.
+            Err(error @ FsError::Permission(_)) => return Err(error.into()),
             Err(e) => {
                 tracing::info!(path = %path.display(), error = %e, "Failed to remove cache file");
             }
@@ -127,24 +140,25 @@ mod tests {
     //! ### 关键分支与异常路径
     //! - handle_cache_status：空目录返回空数组；有文件时返回文件列表
     //! - handle_cache_clear：空目录返回提示信息；有文件时删除并返回统计
-    //! - handle_cache_cmd：使用独立 Fs（仅以 cache_dir 为 root），
-    //!   即使 CliRun 全局沙箱不含 cache_dir 也能正常工作
+    //! - handle_cache_cmd：status / clear 均经 client.private_fs() 访问私有域，
+    //!   不受 run 的 workspace 实例覆盖影响
     //!
     //! ### 上下游交互
     //! - 上游：[commands::handle_cache_cmd]（接受 &CliRun）调用本模块
-    //! - 下游：本模块内部构造独立 [fs::Fs]（仅以 cache_dir 为 root），
-    //!   不使用 [CliRun::fs]
+    //! - 下游：status / clear 经 Client 的私有域 Fs 实例访问缓存目录
 
     use std::fs as stdfs;
     use std::io::Write;
+    // Unix-only: set_mode() used by the cfg(unix)-gated test below
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
     use assert_json_diff::assert_json_eq;
     use tempfile::TempDir;
 
     use super::*;
     use crate::Client;
+    use crate::fs::Fs;
 
     /// A cloneable buffer for capturing output.
     #[derive(Clone)]
@@ -169,19 +183,14 @@ mod tests {
     }
 
     fn build_client(home: &std::path::Path) -> Client {
-        Client::builder()
-            .home_dir(home)
-            .tmp_dir(home)
-            .build()
-            .unwrap()
+        Client::builder().config_dir(home).build().unwrap()
     }
 
     // ── handle_cache_status ──
 
-    /// 构造一个仅以 cache_dir 为读写 root 的独立 Fs，等价于
-    /// `handle_cache_cmd` 内部的 fs。
-    fn build_cache_fs(cache_dir: &std::path::Path) -> fs::Fs {
-        fs::Fs::new_with_permissions(cache_dir, Some(&[cache_dir]), Some(&[cache_dir]))
+    /// 构造一个以 cache_dir 为工作目录的 TestFs。
+    fn build_cache_fs(cache_dir: &std::path::Path) -> wecom_fs::SandboxedFs {
+        wecom_fs::SandboxedFs::confined_to(&[cache_dir])
     }
 
     /// P0：[handle_cache_status] 在空缓存目录下返回空数组
@@ -230,29 +239,31 @@ mod tests {
 
     // ── handle_cache_clear ──
 
-    /// P1：[handle_cache_clear] 清除空缓存目录时返回提示信息
-    /// 条件：缓存目录存在但不包含任何文件
-    /// 断言：输出中包含 "没有需要清除的缓存文件" 提示文本
+    /// P1：[handle_cache_clear] 缺失缓存无副作用
+    /// 条件：缓存目录不存在
+    /// 断言：返回成功且不创建目录
     #[tokio::test]
-    async fn cache_clear_empty() {
+    async fn cache_clear_missing_directory() {
         let tmp = TempDir::new().unwrap();
         let buf = SharedBuf::new();
         let cache_dir = tmp.path().join("cache");
         let output = CliRunOutput::new(buf.clone());
-
-        stdfs::create_dir_all(&cache_dir).unwrap();
         let cache_fs = build_cache_fs(&cache_dir);
 
         let result = handle_cache_clear(&cache_fs, &cache_dir, &output).await;
         assert!(result.is_ok());
 
-        let output = buf.contents();
-        assert!(output.contains("没有需要清除的缓存文件"));
+        let text = buf.contents();
+        assert!(text.contains("没有需要清除的缓存文件"));
+        assert!(!cache_dir.exists());
     }
 
     /// P1：[handle_cache_clear] 清除缓存目录时删除所有文件并返回统计
-    /// 条件：缓存目录中包含 old.json 和 stale.json 两个文件
-    /// 断言：目录变空且输出包含 "已清除 2 个缓存文件"
+    /// 条件：缓存目录有两个普通文件、子目录和指向外部的符号链接
+    ///      （符号链接夹具仅 Unix 生效：Windows 创建链接需特权，CI agent 不保证）
+    /// 断言：只删除两个普通文件，保留子目录、链接与外部目标
+    /// （仅 Unix：符号链接夹具；Windows 创建 symlink 需特权，门控跳过）
+    #[cfg(unix)]
     #[tokio::test]
     async fn cache_clear_removes_files() {
         let tmp = TempDir::new().unwrap();
@@ -263,6 +274,18 @@ mod tests {
         stdfs::create_dir_all(&cache_dir).unwrap();
         stdfs::write(cache_dir.join("old.json"), "x").unwrap();
         stdfs::write(cache_dir.join("stale.json"), "y").unwrap();
+        let nested = cache_dir.join("nested");
+        stdfs::create_dir(&nested).unwrap();
+        stdfs::write(nested.join("keep.json"), "keep").unwrap();
+        // Symlink fixture is Unix-only (see doc comment above).
+        #[cfg(unix)]
+        let (outside, link) = {
+            let outside = tmp.path().join("outside.json");
+            stdfs::write(&outside, "private").unwrap();
+            let link = cache_dir.join("link.json");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            (outside, link)
+        };
         let cache_fs = build_cache_fs(&cache_dir);
 
         let result = handle_cache_clear(&cache_fs, &cache_dir, &output).await;
@@ -274,40 +297,50 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .filter(|p| p.is_file())
+            .filter(|e| e.is_file)
             .collect();
         assert!(remaining.is_empty());
+        assert!(nested.join("keep.json").exists());
+        #[cfg(unix)]
+        {
+            assert!(
+                stdfs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(stdfs::read_to_string(&outside).unwrap(), "private");
+        }
 
         let output = buf.contents();
         assert!(output.contains("已清除 2 个缓存文件"));
     }
 
-    // ── handle_cache_cmd（独立 fs 行为）──
+    // ── handle_cache_cmd（私有域实例可达性守卫）──
 
-    /// P0：[handle_cache_cmd] 即使 CliRun 全局沙箱不含 cache_dir，
-    /// `cache status` 仍可正常列出 cache_dir 中的文件。
-    /// 条件：CliRun 设置 readable/writable_dirs 为另一个无关目录；
-    ///       cache_dir 内有一个 entry.json 文件
-    /// 断言：cache status 返回成功，输出 JSON 数组包含 entry.json
+    /// P0：[handle_cache_cmd] `cache status` 经 client.private_fs() 访问缓存目录。
+    /// 条件：workspace_fs 全拒绝（ErrFs），run 再覆盖一个不相关的 workspace 实例；
+    ///       private_fs 为以 config_dir 为 root 的真实沙箱
+    /// 断言：status 成功并返回 entry.json（私有域与 run 级 workspace 覆盖无关）
     #[tokio::test]
-    async fn cache_cmd_uses_independent_fs_for_status() {
+    async fn cache_cmd_status_uses_private_fs() {
         let tmp = TempDir::new().unwrap();
         let buf = SharedBuf::new();
-        let client = build_client(tmp.path());
+        let client = Client::builder()
+            .config_dir(tmp.path())
+            .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+            .workspace_fs(std::sync::Arc::new(crate::fs::testing::ErrFs))
+            .build()
+            .unwrap();
         let cache_dir = client.cache_dir();
         stdfs::create_dir_all(&cache_dir).unwrap();
         stdfs::write(cache_dir.join("entry.json"), "{}").unwrap();
-
-        // 一个完全不含 cache_dir 的目录，作为 CliRun 全局沙箱 root
-        let unrelated = TempDir::new().unwrap();
-        let unrelated_path: PathBuf = unrelated.path().to_path_buf();
 
         let cache_matches = build_cache_cmd().get_matches_from(["cache", "status"]);
         let run = client
             .run(vec!["test".into()])
             .output(CliRunOutput::new(buf.clone()))
-            .readable_dirs(vec![unrelated_path.clone()])
-            .writable_dirs(vec![unrelated_path]);
+            .fs(std::sync::Arc::new(crate::fs::testing::ErrFs));
         let result = handle_cache_cmd(&run, &cache_matches).await;
         assert!(result.is_ok(), "cache status failed: {result:?}");
 
@@ -318,38 +351,72 @@ mod tests {
         assert_json_eq!(arr[0]["file"], serde_json::json!("entry.json"));
     }
 
-    /// P0：[handle_cache_cmd] 即使 CliRun 全局沙箱不含 cache_dir，
-    /// `cache clear` 仍可正常删除 cache_dir 中的文件。
-    /// 条件：CliRun 设置 readable/writable_dirs 为另一个无关目录；
-    ///       cache_dir 内有 a.json / b.json 两个文件
-    /// 断言：clear 成功，cache_dir 内无文件，输出包含 "已清除 2 个缓存文件"
+    /// P0：`cache clear` 列举与删除均经 client.private_fs()（CLI 自有缓存目录）。
+    /// 条件：workspace_fs 全拒绝（ErrFs）；private_fs 为以 config_dir 为 root 的真实沙箱
+    /// 断言：clear 成功删除两个缓存文件并输出统计
     #[tokio::test]
-    async fn cache_cmd_uses_independent_fs_for_clear() {
+    async fn cache_cmd_clear_uses_private_fs() {
         let tmp = TempDir::new().unwrap();
         let buf = SharedBuf::new();
-        let client = build_client(tmp.path());
+        let client = Client::builder()
+            .config_dir(tmp.path())
+            .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+            .workspace_fs(std::sync::Arc::new(crate::fs::testing::ErrFs))
+            .build()
+            .unwrap();
         let cache_dir = client.cache_dir();
         stdfs::create_dir_all(&cache_dir).unwrap();
         stdfs::write(cache_dir.join("a.json"), "x").unwrap();
         stdfs::write(cache_dir.join("b.json"), "y").unwrap();
 
-        let unrelated = TempDir::new().unwrap();
-        let unrelated_path: PathBuf = unrelated.path().to_path_buf();
-
         let cache_matches = build_cache_cmd().get_matches_from(["cache", "clear"]);
         let run = client
             .run(vec!["test".into()])
-            .output(CliRunOutput::new(buf.clone()))
-            .readable_dirs(vec![unrelated_path.clone()])
-            .writable_dirs(vec![unrelated_path]);
+            .output(CliRunOutput::new(buf.clone()));
         let result = handle_cache_cmd(&run, &cache_matches).await;
         assert!(result.is_ok(), "cache clear failed: {result:?}");
 
-        // 文件被清理
-        assert!(stdfs::read_dir(&cache_dir).unwrap().next().is_none());
-
+        assert_eq!(stdfs::read_dir(&cache_dir).unwrap().count(), 0);
         let output = buf.contents();
         assert!(output.contains("已清除 2 个缓存文件"));
+    }
+
+    /// P0：双域隔离：workspace 实例够不到 config_dir，private 实例够不到 cwd
+    /// 条件：workspace_fs roots=[cwd] + extra deny home；private_fs roots=[home]
+    /// 断言：workspace_fs 读 home 内文件被拒；private_fs 读 cwd 内文件被拒
+    #[tokio::test]
+    async fn private_and_workspace_fs_are_mutually_isolated() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        stdfs::write(home.path().join("config.json"), "{}").unwrap();
+        stdfs::write(cwd.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let private_fs = wecom_fs::SandboxedFs::confined_to(&[home.path()]);
+        let workspace_fs = wecom_fs::SandboxedFs::new().with_policy(
+            wecom_fs::Policy::new()
+                .with_allowed_dirs(&[cwd.path()])
+                .with_deny(
+                    wecom_fs::DenyRule::globs([home.path().to_string_lossy().into_owned()])
+                        .expect("test deny glob must compile"),
+                ),
+        );
+
+        let err = workspace_fs
+            .read_to_string(&home.path().join("config.json"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, wecom_fs::Error::Permission(_)),
+            "workspace_fs must not reach config_dir: {err}"
+        );
+        let err = private_fs
+            .read_to_string(&cwd.path().join("main.rs"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, wecom_fs::Error::Permission(_)),
+            "private_fs must not reach cwd: {err}"
+        );
     }
 
     // ── build_cache_cmd ──
@@ -387,8 +454,10 @@ mod tests {
     // ── handle_cache_clear 移除文件失败 ──
 
     /// P2：[handle_cache_clear] 移除文件失败不中断清除流程
-    /// 条件：缓存目录中存在一个文件，但移除时模拟失败场景
+    /// 条件：缓存目录中存在一个文件，但移除时模拟失败场景（chmod 只读目录，
+    ///      仅 Unix 可构造：Windows 目录只读属性不阻止删除其中文件）
     /// 断言：函数成功返回（Err 分支被静默吞掉）
+    #[cfg(unix)]
     #[tokio::test]
     async fn cache_clear_remove_file_error_does_not_abort() {
         let tmp = TempDir::new().unwrap();
@@ -403,9 +472,8 @@ mod tests {
         let mut perms = stdfs::metadata(&cache_dir).unwrap().permissions();
         perms.set_mode(0o500); // read-only dir: r-x------
         stdfs::set_permissions(&cache_dir, perms).unwrap();
+        let cache_fs = build_cache_fs(&cache_dir);
 
-        // Use unrestricted Fs so the permission error comes from the actual OS call
-        let cache_fs = fs::Fs::new(&cache_dir);
         let result = handle_cache_clear(&cache_fs, &cache_dir, &output).await;
         assert!(result.is_ok());
 

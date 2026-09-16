@@ -27,4 +27,4 @@ client.run(vec!["wecom", "hr", "department", "list"]).output(output).await
 
 ## 关键上下文
 
-- `client/run.rs`：`run()` 解析 argv → 匹配 service/method → 执行请求 → 输出
+- `client/run/execute.rs`：`CliRun::execute` 解析 argv → 匹配 service/method → 执行请求 → 输出

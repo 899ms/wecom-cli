@@ -21,5 +21,5 @@
 
 ## 关键上下文
 
-- `http/request.rs`：HttpRequest header 构造
+- `http_client/request.rs`：HttpRequest header 构造
 - `http_client/response.rs`：HttpResponse header 解析

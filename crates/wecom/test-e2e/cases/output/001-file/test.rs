@@ -15,10 +15,13 @@ async fn run() {
 
     let buf = SharedBuf::new();
     let client = wecom::Client::builder()
-        .home_dir(tmp.path())
-        .tmp_dir(tmp.path())
+        .config_dir(tmp.path())
         .transport(build_test_http_transport("test-token", &server.uri()))
-        .writable_dirs(vec![tmp.path().to_path_buf()])
+        .private_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+        .workspace_fs(std::sync::Arc::new(
+            wecom_fs::SandboxedFs::new()
+                .with_write_policy(wecom_fs::Policy::new().with_allowed_dirs(&[tmp.path()])),
+        ))
         .build()
         .unwrap();
 

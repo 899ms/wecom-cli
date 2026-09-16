@@ -27,4 +27,4 @@ client.list_services().await
 
 ## 关键上下文
 
-- `client/invoke.rs`：`list_services()` → discovery HTTP 请求 → 解析 catalog
+- `client/mod.rs`：`list_services()` → discovery HTTP 请求 → 解析 catalog

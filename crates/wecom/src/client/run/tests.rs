@@ -47,13 +47,13 @@ use crate::registry::{ServiceInfo, ServiceSchema};
 
 /// Build an isolated [Client] for unit tests.
 ///
-/// Uses a leaked tempdir as `home_dir` so that tests never touch
+/// Uses a leaked tempdir as `config_dir` so that tests never touch
 /// the real `~/.config/wecom` directory.
 fn build_isolated_client() -> Client {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     std::mem::forget(tmp);
-    Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+    Client::builder().config_dir(&dir).build().unwrap()
 }
 
 // ── CliRunOutput ──
@@ -205,103 +205,131 @@ fn run_returns_cli_run() {
     assert_into_future(&cli_run);
 }
 
-/// P1：[CliRun] fs_mut / cwd / Debug 格式化可正常调用
-/// 条件：构造 CliRun 后调用 fs_mut、cwd，并格式化 Debug
-/// 断言：不 panic，Debug 输出包含 "CliRun"
+/// P1：[CliRun] get_fs / fs 覆盖 / Debug 格式化可正常调用
+/// 条件：构造 CliRun 后调用 get_fs、以新实例调用 fs 覆盖，并格式化 Debug
+/// 断言：不 panic，Debug 输出包含 "CliRun"；fs 覆盖替换实例
 #[test]
-fn cli_run_fs_mut_cwd_and_debug() {
+fn cli_run_fs_override_and_debug() {
     let client = build_isolated_client();
+    let before = std::sync::Arc::clone(client.workspace_fs());
     let mut run = client.run(vec!["wecom".to_owned()]);
 
-    let _ = run.fs_mut();
-    run = run.cwd("/tmp/wecom-test-cwd");
+    let _ = run.get_fs();
+    run = run.fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()));
     let debug = format!("{run:?}");
     assert!(debug.contains("CliRun"));
+    assert!(!std::sync::Arc::ptr_eq(run.get_fs(), &before));
+}
+
+/// P1：[CliRun::get_cwd] 未覆盖时返回 client 钉死的工作目录
+/// 条件：ClientBuilder 显式设置 cwd，run 不调用 .cwd()
+/// 断言：run.get_cwd() 等于 client.cwd()
+#[test]
+fn cli_run_cwd_forwards_client_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let client = Client::builder()
+        .config_dir(config.path())
+        .cwd(tmp.path())
+        .build()
+        .unwrap();
+    let run = client.run(vec!["wecom".to_owned()]);
+    assert_eq!(run.get_cwd(), client.cwd());
+    assert_eq!(run.get_cwd(), tmp.path());
+}
+
+/// P1：[CliRun::get_cwd] run 级覆盖生效且不影响 client 值
+/// 条件：run 调用 .cwd("/other/dir")
+/// 断言：run.get_cwd() 返回 "/other/dir"；client.cwd() 不变
+#[test]
+fn cli_run_cwd_override_takes_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let client = Client::builder()
+        .config_dir(config.path())
+        .cwd(tmp.path())
+        .build()
+        .unwrap();
+    let run = client.run(vec!["wecom".to_owned()]).cwd("/other/dir");
+    assert_eq!(run.get_cwd(), std::path::Path::new("/other/dir"));
+    assert_eq!(client.cwd(), tmp.path());
+}
+
+/// P1：[CliRun::get_fs] 未覆盖时返回 client 注入的 fs 实例
+/// 条件：构造 CliRun 后不调用 .fs()
+/// 断言：run.get_fs() 与 client 注入实例为同一 Arc（Arc::ptr_eq）
+#[test]
+fn cli_run_get_fs_defaults_to_client_instance() {
+    let client = Client::builder()
+        .private_fs(std::sync::Arc::new(crate::fs::testing::ErrFs))
+        .workspace_fs(std::sync::Arc::new(crate::fs::testing::ErrFs))
+        .build()
+        .unwrap();
+    let before = std::sync::Arc::clone(client.workspace_fs());
+
+    let run = client.run(vec!["wecom".to_owned()]);
+
+    assert!(std::sync::Arc::ptr_eq(run.get_fs(), &before));
+    // 工作区实例与私有实例互不串扰：run 侧只能触及 workspace_fs。
+    assert!(!std::sync::Arc::ptr_eq(run.get_fs(), client.private_fs()));
 }
 
 // ── Path overrides ──
 
-/// P0：[CliRun::get_home_dir] 未设置覆盖时返回 client 的 home_dir
-/// 条件：不调用 .home_dir()
-/// 断言：get_home_dir() 等于 client.home_dir()
+/// P0：[CliRun::get_config_dir] 返回 client 的 config_dir
+/// 条件：config_dir 仅 client 级可配
+/// 断言：get_config_dir() 等于 client.config_dir()
 #[test]
-fn get_home_dir_defaults_to_client() {
+fn get_config_dir_defaults_to_client() {
     let client = build_isolated_client();
     let run = client.run(vec!["test".into()]);
-    assert_eq!(run.get_home_dir(), client.home_dir());
+    assert_eq!(run.get_config_dir(), client.config_dir());
 }
 
-/// P0：[CliRun::get_tmp_dir] 未设置覆盖时返回 client 的 tmp_dir
-/// 条件：不调用 .tmp_dir()
-/// 断言：get_tmp_dir() 等于 client.tmp_dir()
+/// P0：[CliRun::get_default_output_dir] 未配置时读时回退到 run 的 cwd
+/// 条件：client 未配置 default_output_dir
+/// 断言：get_default_output_dir() 等于 run.get_cwd()；run 级 .cwd() 覆盖生效
 #[test]
-fn get_tmp_dir_defaults_to_client() {
+fn get_default_output_dir_falls_back_to_cwd() {
     let client = build_isolated_client();
     let run = client.run(vec!["test".into()]);
-    assert_eq!(run.get_tmp_dir(), client.tmp_dir());
-}
+    assert_eq!(run.get_default_output_dir(), run.get_cwd());
 
-/// P0：[CliRun::home_dir] 设置覆盖后 get_home_dir 返回覆盖值
-/// 条件：调用 .home_dir("/custom/home")
-/// 断言：get_home_dir() 返回 "/custom/home"
-#[test]
-fn home_dir_override_takes_precedence() {
-    let client = build_isolated_client();
-    let run = client.run(vec!["test".into()]).home_dir("/custom/home");
-    assert_eq!(run.get_home_dir(), Path::new("/custom/home"));
-}
-
-/// P0：[CliRun::tmp_dir] 设置覆盖后 get_tmp_dir 返回覆盖值
-/// 条件：调用 .tmp_dir("/custom/tmp")
-/// 断言：get_tmp_dir() 返回 "/custom/tmp"
-#[test]
-fn tmp_dir_override_takes_precedence() {
-    let client = build_isolated_client();
-    let run = client.run(vec!["test".into()]).tmp_dir("/custom/tmp");
-    assert_eq!(run.get_tmp_dir(), Path::new("/custom/tmp"));
-}
-
-/// P1：[CliRun::get_cache_dir] 派生自 get_home_dir 的覆盖值
-/// 条件：调用 .home_dir("/custom/home")
-/// 断言：get_cache_dir() 返回 "/custom/home/cache"
-#[test]
-fn get_cache_dir_derived_from_overridden_home() {
-    let client = build_isolated_client();
-    let run = client.run(vec!["test".into()]).home_dir("/custom/home");
-    assert_eq!(run.get_cache_dir(), PathBuf::from("/custom/home/cache"));
-}
-
-/// P1：[CliRun::get_request_storage_dir] 派生自 get_tmp_dir 的覆盖值
-/// 条件：调用 .tmp_dir("/custom/tmp")
-/// 断言：get_request_storage_dir() 返回 "/custom/tmp/requests"
-#[test]
-fn get_request_storage_dir_derived_from_overridden_tmp() {
-    let client = build_isolated_client();
-    let run = client.run(vec!["test".into()]).tmp_dir("/custom/tmp");
+    let run = client
+        .run(vec!["test".into()])
+        .cwd(std::path::PathBuf::from("/custom/cwd"));
     assert_eq!(
-        run.get_request_storage_dir(),
-        PathBuf::from("/custom/tmp/requests")
+        run.get_default_output_dir(),
+        std::path::Path::new("/custom/cwd")
     );
 }
 
-/// P1：[CliRun::get_cache_dir] 未覆盖时派生自 client 的 home_dir
-/// 条件：不调用 .home_dir()
+/// P0：[CliRun::get_default_output_dir] 返回 client 配置的 default_output_dir
+/// 条件：client 经 default_output_dir() 配置（仅 client 级可配）
+/// 断言：get_default_output_dir() 等于配置目录
+#[test]
+fn get_default_output_dir_returns_configured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let client = crate::Client::builder()
+        .config_dir(tmp.path().join("config"))
+        .default_output_dir(tmp.path().join("out"))
+        .build()
+        .unwrap();
+    let run = client.run(vec!["test".into()]);
+    assert_eq!(
+        run.get_default_output_dir(),
+        tmp.path().join("out").as_path()
+    );
+}
+
+/// P0：[CliRun::get_cache_dir] 派生自 client 的 config_dir
+/// 条件：config_dir 仅 client 级可配
 /// 断言：get_cache_dir() 等于 client.cache_dir()
 #[test]
 fn get_cache_dir_defaults_to_client_derived() {
     let client = build_isolated_client();
     let run = client.run(vec!["test".into()]);
     assert_eq!(run.get_cache_dir(), client.cache_dir());
-}
-
-/// P1：[CliRun::get_request_storage_dir] 未覆盖时派生自 client 的 tmp_dir
-/// 条件：不调用 .tmp_dir()
-/// 断言：get_request_storage_dir() 等于 client.request_storage_dir()
-#[test]
-fn get_request_storage_dir_defaults_to_client_derived() {
-    let client = build_isolated_client();
-    let run = client.run(vec!["test".into()]);
-    assert_eq!(run.get_request_storage_dir(), client.request_storage_dir());
 }
 
 // ── timeout（每笔独立请求超时） ──
@@ -328,21 +356,19 @@ fn timeout_default_none() {
     assert!(run.get_timeout().is_none());
 }
 
-/// P1：[CliRun::timeout] 与 .header() / .home_dir() 等其他 setter 可链式叠加
-/// 条件：先 .timeout(5s)，再 .header("x-a", "1")，再 .home_dir("/h")
-/// 断言：timeout / headers / home_dir 各自正确生效
+/// P1：[CliRun::timeout] 与 .header() 等其他 setter 可链式叠加
+/// 条件：先 .timeout(5s)，再 .header("x-a", "1")
+/// 断言：timeout / headers 各自正确生效
 #[test]
 fn timeout_chains_with_other_setters() {
     let client = build_isolated_client();
     let run = client
         .run(vec!["test".into()])
         .timeout(std::time::Duration::from_secs(5))
-        .header("x-a", "1")
-        .home_dir("/h");
+        .header("x-a", "1");
     assert_eq!(run.get_timeout(), Some(std::time::Duration::from_secs(5)));
     let hdrs = run.get_headers();
     assert_eq!(hdrs.get("x-a").unwrap().to_str().unwrap(), "1");
-    assert_eq!(run.get_home_dir(), Path::new("/h"));
 }
 
 /// P1：[CliRun::timeout] 多次调用后写覆盖前写
@@ -500,8 +526,7 @@ fn build_capture_client(
         captured: captured.clone(),
     };
     let client = Client::builder()
-        .home_dir(&root)
-        .cwd(&root)
+        .config_dir(&root)
         .transport(
             wecom_transport::TransportBuilder::new(backend)
                 .extension(ext)
@@ -514,7 +539,7 @@ fn build_capture_client(
 }
 
 /// P0：[CliRun → TransportRequest] transport 默认扩展袋经业务调用到达后端 execute
-/// 条件：捕获型后端 + 已播种缓存；TransportBuilder 级 RunExt(1)，run 级不再设置
+/// 条件：捕获型后端 + 已播种缓存；TransportBuilder 级 RunExt(1)，run 级不设置
 /// 断言：execute 恰好收到 1 次请求，options.extensions 含 RunExt(1)
 #[tokio::test]
 async fn run_transport_extensions_reach_backend_execute() {
@@ -895,8 +920,7 @@ async fn execute_custom_command_shadows_same_name_service() {
         captured: captured.clone(),
     };
     let client = crate::Client::builder()
-        .home_dir(&root)
-        .cwd(&root)
+        .config_dir(&root)
         .transport(
             wecom_transport::TransportBuilder::new(backend)
                 .build()
@@ -946,8 +970,7 @@ async fn execute_multi_service_catalog_builds_others_without_schema() {
         captured: captured.clone(),
     };
     let client = crate::Client::builder()
-        .home_dir(&root)
-        .cwd(&root)
+        .config_dir(&root)
         .transport(
             wecom_transport::TransportBuilder::new(backend)
                 .build()
@@ -1246,8 +1269,7 @@ async fn remote_doc_help_remote_doc_hit_returns_doc() {
     let root = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let client = crate::Client::builder()
-        .home_dir(&root)
-        .cwd(&root)
+        .config_dir(&root)
         .transport(
             wecom_transport::TransportBuilder::new(RemoteDocOkBackend)
                 .build()

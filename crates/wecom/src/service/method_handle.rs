@@ -120,12 +120,14 @@ impl MethodHandle<'_> {
     /// Returns a [`MethodInvokeRequest`] that can be `.await`-ed directly
     /// or customised with `.headers()` / `.header()` before sending.
     ///
-    /// Unlike [`run`], this bypasses all directive, pagination, and
+    /// Unlike [`run`](MethodHandle::run), this bypasses all directive, pagination, and
     /// output-writing logic. Exactly one request is sent and the parsed
     /// [`serde_json::Value`] is returned.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```rust,no_run
+    /// # fn example(method: &wecom::MethodHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// # async fn run(method: &wecom::MethodHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// // Direct await (no extra headers)
     /// let value = method.invoke(serde_json::json!({"userid": "alice"})).await?;
     /// println!("{}", value["name"]);
@@ -135,10 +137,15 @@ impl MethodHandle<'_> {
     ///     .invoke(serde_json::json!({"userid": "alice"}))
     ///     .header("x-custom", "value")
     ///     .await?;
+    /// # let _ = value;
+    /// # Ok(())
+    /// # }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn invoke(&self, payload: serde_json::Value) -> MethodInvokeRequest<'_> {
-        // 构造期就把 endpoint 派生出来并 move 进 TransportRequest；所有 setter
-        // 通过 inner 直接操作底层 builder。
+        // 构造期就把 endpoint 派生出来并 move 进 TransportRequest，所有 setter
+        // 通过 inner 直接操作底层 builder，无需在外层暂存 headers/timeout/on_poll。
         let endpoint = self.endpoint();
         let inner = self.client.transport().invoke(endpoint, payload);
         MethodInvokeRequest { inner }
@@ -190,7 +197,7 @@ impl MethodHandle<'_> {
 
     pub(crate) fn parse_http_method(&self) -> Result<reqwest::Method> {
         reqwest::Method::from_bytes(self.schema.http_method.as_bytes())
-            .map_err(|e| Error::Other(format!("Invalid HTTP method: {}", e).into()))
+            .map_err(|e| Error::other(format!("Invalid HTTP method: {}", e).into()))
     }
 
     fn collect_directives<'a>(
@@ -199,9 +206,13 @@ impl MethodHandle<'_> {
         request_schema: Option<&'a JsonSchema>,
     ) -> (Vec<directive::Directive<'a>>, bool) {
         if let Some(schema) = request_schema {
-            let directives =
-                directive::collect_directives(&self.service_schema.schemas, schema, payload);
-            let multipart = directive::check_has_octet_stream(schema);
+            let directives = directive::collect_directives(
+                &self.service_schema.schemas,
+                schema,
+                payload,
+                self.client.cwd(),
+            );
+            let multipart = directive::check_has_octet_stream(&self.service_schema.schemas, schema);
             (directives, multipart)
         } else {
             (vec![], false)
@@ -223,19 +234,26 @@ impl MethodHandle<'_> {
 /// before sending.
 ///
 /// # Examples
-/// ```ignore
+/// ```rust,no_run
+/// # fn example(method: &wecom::MethodHandle<'_>, payload: serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+/// # async fn run(method: &wecom::MethodHandle<'_>, payload: serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
 /// // No extra headers — just await
-/// let val = method.invoke(payload).await?;
+/// let val = method.invoke(payload.clone()).await?;
 ///
 /// // With extra headers
 /// let val = method.invoke(payload)
-///     .header("x-trace-id", "abc123")?
+///     .header("x-trace-id", "abc123")
 ///     .await?;
+/// # let _ = val;
+/// # Ok(())
+/// # }
+/// # Ok(())
+/// # }
 /// ```
 pub struct MethodInvokeRequest<'a> {
     /// 直接持有底层 [`wecom_transport::TransportRequest`]——所有 setter
     /// （`headers` / `header` / `header_sensitive` / `timeout` / `on_poll`
-    /// 等）转发到 inner，自身不再额外维护 headers/timeout/on_poll 等字段。
+    /// 等）转发到 inner，自身不持有 headers/timeout/on_poll 等字段。
     inner: wecom_transport::TransportRequest<'a>,
 }
 
@@ -391,7 +409,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+        Client::builder().config_dir(&dir).build().unwrap()
     }
 
     static TEST_CLIENT: std::sync::LazyLock<Client> =
@@ -452,8 +470,7 @@ mod tests {
         let transport: wecom_transport::Transport =
             wecom_transport::HttpTransportBackend::default().into();
         let client = Client::builder()
-            .home_dir(&dir)
-            .cwd(&dir)
+            .config_dir(&dir)
             .transport(transport.with_extension(InvokeExt(3)))
             .build()
             .unwrap();

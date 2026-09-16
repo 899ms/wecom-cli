@@ -83,7 +83,7 @@ fn token_expired_errcode_matches() {
 fn other_errors_do_not_match() {
     assert!(!is_token_expired(&api_error(Some(40001))));
     assert!(!is_token_expired(&api_error(None)));
-    assert!(!is_token_expired(&wecom_transport::Error::Other(
+    assert!(!is_token_expired(&wecom_transport::Error::other(
         "x".into()
     )));
 }
@@ -201,7 +201,7 @@ async fn injects_auth_when_require_auth_and_token_available() {
 
 /// P0：[WecomBackend] 挂 RequireAuth + 无 token → Err(Error::Auth)，请求不发出
 /// 条件：endpoint 挂 RequireAuth，无 token；mock expect(0)
-/// 断言：invoke 返回 Err(wecom_transport::Error::Other(CliError::Auth))，mock 未被调用
+/// 断言：invoke 返回 Err(Wrapped(OtherError(CliError::Auth)))，mock 未被调用
 #[tokio::test]
 async fn rejects_require_auth_without_token() {
     let server = MockServer::start().await;
@@ -216,14 +216,17 @@ async fn rejects_require_auth_without_token() {
     let endpoint = ep(&server.uri(), "/auth").with(RequireAuth);
     let err = transport.invoke(&endpoint, json!({})).await.unwrap_err();
     match err {
-        wecom_transport::Error::Other(e) => {
-            let inner = e.downcast_ref::<CliError>();
+        wecom_transport::Error::Wrapped(w) => {
+            let inner = w
+                .as_any()
+                .downcast_ref::<wecom_error::OtherError>()
+                .and_then(|o| o.0.downcast_ref::<CliError>());
             assert!(
                 inner.is_some_and(|e| matches!(e, CliError::Auth(_))),
                 "expected CliError::Auth, got {inner:?}"
             );
         }
-        other => panic!("expected Error::Other(CliError::Auth), got {other:?}"),
+        other => panic!("expected Wrapped(CliError::Auth), got {other:?}"),
     }
     server.verify().await;
 }

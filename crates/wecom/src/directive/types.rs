@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::json_path::PathSegment;
 use crate::schema::FileSaveOptions;
 
@@ -5,12 +7,16 @@ use crate::schema::FileSaveOptions;
 pub enum Directive<'a> {
     UploadMedia {
         path: Vec<PathSegment>,
-        file_path: String,
+        /// Local file to upload (derived from the request payload — always
+        /// accessed through the workspace-domain filesystem).
+        file_path: PathBuf,
         with_file_path: bool,
     },
     UploadMultipart {
         path: Vec<PathSegment>,
-        file_path: String,
+        /// Local file to upload (derived from the request payload — always
+        /// accessed through the workspace-domain filesystem).
+        file_path: PathBuf,
     },
     Save {
         path: Vec<PathSegment>,
@@ -47,7 +53,7 @@ mod tests {
     fn directive_upload_media_debug() {
         let d = Directive::UploadMedia {
             path: vec![PathSegment::Key("media".into())],
-            file_path: "/tmp/file.txt".to_string(),
+            file_path: PathBuf::from("/tmp/file.txt"),
             with_file_path: false,
         };
         let debug_str = format!("{:?}", d);
@@ -62,7 +68,7 @@ mod tests {
     fn directive_upload_multipart_debug() {
         let d = Directive::UploadMultipart {
             path: vec![PathSegment::Key("file".into())],
-            file_path: "/tmp/file.txt".to_string(),
+            file_path: PathBuf::from("/tmp/file.txt"),
         };
         let debug_str = format!("{:?}", d);
         assert!(debug_str.contains("UploadMultipart"));

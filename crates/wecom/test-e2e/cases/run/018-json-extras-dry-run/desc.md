@@ -1,6 +1,6 @@
 # CLI `--json` 中 `dry_run` 被 apply_extras 提取并触发干跑模式
 
-- **场景**：验证通过 `--json` 传入 `dry_run: true` 时，`extract_json_extras` 正确提取并阻止实际 API 调用
+- **场景**：验证通过 `--json` 传入 `dry_run: true` 时，`apply_extras` 正确提取并阻止实际 API 调用
 - **Transport**：HTTP（wiremock）
 - **来源**：apply_extras 干跑路径
 
@@ -28,5 +28,5 @@ client.run(vec!["wecom", "hr", "department", "list", "--json", "{"dry_run": true
 
 ## 关键上下文
 
-- `service/command/arg_types.rs`：`apply_extras` 需要正确处理 clap 对 `Option<bool>` + `SetTrue` 字段的默认填充（`Some(false)`），将 `Value::Bool(false)` 视为"未设置"
+- `service/command/assemble.rs`：`apply_extras` 需要正确处理 clap 对 `Option<bool>` + `SetTrue` 字段的默认填充（`Some(false)`），将 `Value::Bool(false)` 视为"未设置"
 - `service/handler.rs`：`args.dry_run == Some(true)` 时输出预演信息并提前返回，不发起请求

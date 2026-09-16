@@ -1,7 +1,7 @@
 //! 远程文档生成（remote_doc）。
 //!
 //! 当 discovery schema 中 service / resource / method 任一层级声明
-//! `remote_doc: true` 时，对应节点的 `--doc` / `--help` / `--schema` 不再本地
+//! `remote_doc: true` 时，对应节点的 `--doc` / `--help` / `--schema` 不由本地
 //! 渲染，而是向固定 endpoint（[`EndpointKey::RemoteDoc`]）发送
 //! `{ "id": <节点 id>, "type": <doc|help|schema> }`，将返回的文档文本直接
 //! 输出到 stdout。
@@ -17,7 +17,7 @@
 //!   `id` 为目标节点在 schema 中声明的 `id` 字段；endpoint 不携带 base_url，
 //!   执行时由 transport 回填默认值。
 //! - 响应：gateway 信封，`result` 固定为 `{"doc": <文档文本>}`；形状不符
-//!   时报 `Error::Transport(Error::Parse)`。
+//!   时报 `Error::Wrapped(Error::Parse)`。
 
 use serde::Deserialize;
 
@@ -74,7 +74,7 @@ pub(crate) fn resolve_remote_doc_id<'a>(
 }
 
 /// alias 感知的 help 路径解析：先经 method alias 映射到真实路径再走
-/// [resolve_node]；未命中 alias 时按字面路径解析。
+/// [`resolve_remote_doc_id`]；未命中 alias 时按字面路径解析。
 pub(crate) fn resolve_remote_doc_id_with_alias<'a>(
     schema: &'a ServiceSchema,
     service_name: &str,
@@ -134,7 +134,7 @@ mod tests {
     //! ### 关键分支与异常路径
     //! - method / resource / service 三层 remote_doc 就近覆盖
     //! - 路径未命中节点（helper / 拼写错误 / method 非叶子）→ None → 本地渲染
-    //! - 响应 result 形状不符 → Error::Transport(Error::Parse)
+    //! - 响应 result 形状不符 → Error::Wrapped(Error::Parse)
     //!
     //! ### 上下游交互
     //! - 上游：[handler::handle_service_cmd]（--doc/--schema/--help 分派）、
@@ -382,8 +382,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         crate::Client::builder()
-            .home_dir(&root)
-            .cwd(&root)
+            .config_dir(&root)
             .transport(
                 wecom_transport::TransportBuilder::new(StaticBackend { result })
                     .build()
@@ -406,18 +405,17 @@ mod tests {
 
     /// P1：[fetch_remote_doc] 响应 result 形状不符时报 Parse 错误
     /// 条件：后端 result = {"text": "x"}（缺 doc 字段）
-    /// 断言：返回 Err(Error::Transport(Error::Parse))，endpoint 为 "remote_doc"
+    /// 断言：错误经 Wrapped 透传 transport Parse 的结构化 JSON（type=ParseError，
+    ///       endpoint="remote_doc"）——以能力断言替代 downcast，避免不可覆盖的
+    ///       let-else panic 分支
     #[tokio::test]
     async fn fetch_remote_doc_rejects_malformed_result() {
         let client = build_static_client(serde_json::json!({ "text": "x" }));
         let run = client.run(vec!["wecom".into()]);
         let err = fetch_remote_doc(&run, "m-list", "help").await.unwrap_err();
-        match err {
-            crate::Error::Transport(wecom_transport::Error::Parse { endpoint, .. }) => {
-                assert_eq!(endpoint, "remote_doc");
-            }
-            other => panic!("expect Transport(Parse), got {other:?}"),
-        }
+        let json = err.to_json();
+        assert_eq!(json["error"]["type"], "ParseError");
+        assert_eq!(json["error"]["endpoint"], "remote_doc");
     }
 
     /// 测试夹具：固定返回 transport 错误的后端（模拟 wire 层失败）。
@@ -441,21 +439,20 @@ mod tests {
                     + 'a,
             >,
         > {
-            Box::pin(async { Err(wecom_transport::Error::Other("backend boom".into())) })
+            Box::pin(async { Err(wecom_transport::Error::other("backend boom".into())) })
         }
     }
 
     /// P1：[fetch_remote_doc] wire 请求失败时透传 transport 错误
     /// 条件：后端 execute 返回 Err(Error::Other)
-    /// 断言：返回 Err(Error::Transport(Error::Other))，message() 含 "backend boom"
+    /// 断言：返回 Err(Error::Wrapped(_))，message() 含 "backend boom"
     #[tokio::test]
     async fn fetch_remote_doc_propagates_backend_error() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         let client = crate::Client::builder()
-            .home_dir(&root)
-            .cwd(&root)
+            .config_dir(&root)
             .transport(
                 wecom_transport::TransportBuilder::new(FailingBackend)
                     .build()
@@ -466,13 +463,13 @@ mod tests {
         let run = client.run(vec!["wecom".into()]);
         let err = fetch_remote_doc(&run, "m-list", "help").await.unwrap_err();
         match err {
-            crate::Error::Transport(e @ wecom_transport::Error::Other(_)) => {
+            crate::Error::Wrapped(inner) => {
                 assert!(
-                    e.message().contains("backend boom"),
-                    "expect backend error: {e}"
+                    inner.message().contains("backend boom"),
+                    "expect backend error: {inner}"
                 );
             }
-            other => panic!("expect Transport(Other), got {other:?}"),
+            other => panic!("expect Wrapped, got {other:?}"),
         }
     }
 }

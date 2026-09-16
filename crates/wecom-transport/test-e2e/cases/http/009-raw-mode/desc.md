@@ -22,5 +22,5 @@
 
 ## 关键上下文
 
-- `http/mod.rs`：HttpTransport raw 模式
+- `http/mod.rs`：`HttpTransportBackend` raw 模式
 - `http/protocol.rs`：raw 模式下的请求/响应处理

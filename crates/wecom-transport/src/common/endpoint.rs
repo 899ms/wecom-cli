@@ -15,20 +15,26 @@
 //!
 //! Import the extension trait for the capability you need:
 //!
-//! ```ignore
+//! ```rust
 //! use wecom_transport::EndpointHttpExt;  // .base_url(), .path(), .full_url(), .host(), …
 //! ```
 //!
-//! Or use the new typed API:
+//! Or use the typed API:
 //!
-//! ```ignore
+//! ```rust
+//! use wecom_transport::{Endpoint, HttpEndpoint};
+//!
+//! let ep = Endpoint::new().with(HttpEndpoint::new("/cgi/action"));
 //! let http = ep.get::<HttpEndpoint>().unwrap();
 //! let url  = http.full_url();
+//! # let _ = url;
 //! ```
 //!
 //! # Constructing endpoints
 //!
-//! ```ignore
+//! ```rust
+//! use wecom_transport::{Endpoint, HttpEndpoint, PassthroughReq};
+//!
 //! // HTTP-only (base_url from transport default)
 //! let ep = Endpoint::new().with(HttpEndpoint::new("/cgi/action"));
 //!
@@ -38,8 +44,9 @@
 //! );
 //!
 //! // With a custom request envelope strategy
-//! let http = HttpEndpoint::new("/cgi").with_req_envelope(custom_req_envelope);
+//! let http = HttpEndpoint::new("/cgi").with_req_envelope(PassthroughReq);
 //! let ep = Endpoint::new().with(http);
+//! # let _ = ep;
 //! ```
 
 use std::any::{Any, TypeId};
@@ -135,8 +142,12 @@ impl Endpoint {
     /// Pairs with capability-specific derivations such as
     /// [`HttpEndpoint::with_path_derived`](crate::http::HttpEndpoint::with_path_derived):
     ///
-    /// ```ignore
+    /// ```rust
+    /// use wecom_transport::{Endpoint, HttpEndpoint};
+    ///
+    /// let ep = Endpoint::new().with(HttpEndpoint::new("/cgi/action"));
     /// let new_ep = ep.map::<HttpEndpoint>(|e| e.with_path_derived("/task/query"));
+    /// # let _ = new_ep;
     /// ```
     #[must_use]
     pub fn map<T: EndpointExt>(mut self, f: impl FnOnce(T) -> T) -> Self {
@@ -212,13 +223,12 @@ mod tests {
     //! ### 关键分支与异常路径
     //! - 仅 HTTP / 多能力端点构造
     //! - 路径规范化：缺前导斜杠自动补 `/`，空路径 → `"/"`
-    //! - envelope 默认 StandardEnvelope；with_envelope 仅替换策略
     //! - [Endpoint::require] 能力缺失 → Err(Config)
     //! - req/res envelope 默认 PassthroughReq / GatewayRes；with_req_envelope 仅替换策略
     //! - [Endpoint::set] 原地覆盖；[Endpoint::with] 同类型后者胜出
     //!
     //! ### 上下游交互
-    //! - 上游：调用方（wecom、bot-lib、transport e2e helpers）构造 Endpoint
+    //! - 上游：调用方（wecom、transport e2e helpers 及下游集成方）构造 Endpoint
     //! - 下游：TransportRequest → TransportBackend::execute 消费 Endpoint 做路由
 
     use super::*;
@@ -249,7 +259,7 @@ mod tests {
 
     // ── envelope ──
 
-    /// 测试用自定义请求侧信封（core 只提供 PassthroughReq 默认策略）。
+    /// 测试用自定义请求侧信封：把 payload 包进 `{"payload": "<json-string>"}`。
     #[derive(Debug, Clone, Copy, Default)]
     struct WrapPayloadReq;
     impl crate::http::envelope::RequestEnvelope for WrapPayloadReq {

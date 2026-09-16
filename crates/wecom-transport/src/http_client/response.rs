@@ -13,7 +13,7 @@ pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 /// 原始 HTTP 响应。
 ///
 /// Carries the `http.request` tracing span so that body / `res.body_len`
-/// can be recorded after the body is actually consumed (see `docs/design/telemetry.md` §4).
+/// can be recorded after the body is actually consumed.
 pub struct HttpResponse {
     pub(crate) endpoint: String,
     pub(crate) status: u16,
@@ -578,7 +578,7 @@ mod tests {
                 if r.status == 200 {
                     Ok(r)
                 } else {
-                    Err(Error::Other(
+                    Err(Error::other(
                         format!("unexpected status {}", r.status).into(),
                     ))
                 }
@@ -777,7 +777,7 @@ mod tests {
     async fn json_parse_error_path_returns_err() {
         let resp = make_json_response(r#"{"ok":true}"#);
         let result: Result<serde_json::Value> = resp
-            .json_parse(|_v: serde_json::Value| Err(Error::Other("parse failed".into())))
+            .json_parse(|_v: serde_json::Value| Err(Error::other("parse failed".into())))
             .await;
         assert!(result.is_err());
     }

@@ -89,16 +89,12 @@ mod tests {
     use super::*;
 
     /// Build an isolated [`crate::Client`] for unit tests (leaked tempdir as
-    /// `home_dir`, never touches the real `~/.config/wecom`).
+    /// `config_dir`, never touches the real `~/.config/wecom`).
     fn build_isolated_client() -> crate::Client {
         let tmp = tempfile::tempdir().expect("failed to create tempdir for test isolation");
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        crate::Client::builder()
-            .home_dir(&dir)
-            .cwd(&dir)
-            .build()
-            .unwrap()
+        crate::Client::builder().config_dir(&dir).build().unwrap()
     }
 
     /// P1：[CustomCommand::name] 返回 clap 命令定义的名称
@@ -157,12 +153,12 @@ mod tests {
     }
 
     /// P2：[CustomCommand::handle] handler 返回 `Err` 时错误原样传播（对齐 wecom-cli 的 `auth` 错误路径）
-    /// 条件：handler 返回 `Error::Other("boom")`，调用 handle
+    /// 条件：handler 返回 `Error::other("boom")`，调用 handle
     /// 断言：handle 返回同一错误，message 为 "boom"
     #[tokio::test]
     async fn handle_propagates_handler_error() {
         let cmd = CustomCommand::new(clap::Command::new("auth"), |_run, _matches| {
-            Box::pin(async { Err(crate::Error::Other("boom".into())) })
+            Box::pin(async { Err(crate::Error::other("boom".into())) })
         });
 
         let client = build_isolated_client();
@@ -170,9 +166,7 @@ mod tests {
         let matches = clap::Command::new("auth").get_matches_from(vec!["auth"]);
 
         let err = cmd.handle(&run, &matches).await.unwrap_err();
-        match err {
-            crate::Error::Other(msg) => assert_eq!(msg.to_string(), "boom"),
-            other => panic!("expected Error::Other, got {other:?}"),
-        }
+        assert_eq!(err.code(), crate::E_OTHER);
+        assert_eq!(err.message(), "boom");
     }
 }

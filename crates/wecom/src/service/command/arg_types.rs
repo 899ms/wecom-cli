@@ -103,7 +103,7 @@ pub struct MethodCmdArgs {
     #[serde(default)]
     pub output: Option<String>,
 
-    /// 将响应与附件写入目录
+    /// 将下载的文件写入指定目录
     #[arg(long, alias = "output_dir", help_heading = "选项")]
     #[serde(default)]
     pub output_dir: Option<String>,

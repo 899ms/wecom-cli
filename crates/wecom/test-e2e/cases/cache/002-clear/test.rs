@@ -9,8 +9,7 @@ async fn run() {
 
     let buf = SharedBuf::new();
     let client = wecom::Client::builder()
-        .home_dir(tmp.path())
-        .tmp_dir(tmp.path())
+        .config_dir(tmp.path())
         .transport(build_test_http_transport("test-token", "http://localhost"))
         .build()
         .unwrap();

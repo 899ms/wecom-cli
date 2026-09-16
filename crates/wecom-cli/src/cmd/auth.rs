@@ -45,7 +45,7 @@ struct InitArgs {
     /// 直接指定 Secret
     #[arg(long, hide = true, requires = "bot_id")]
     secret: Option<String>,
-    /// 将扫码二维码输出为 PNG 文件（仅支持当前目录下的路径，如 qr.png）
+    /// 将扫码二维码输出为 PNG 文件（相对路径基于当前目录解析）
     #[arg(long, value_name = "PATH", conflicts_with_all = ["manual", "bot_id"])]
     output_qrcode: Option<PathBuf>,
 }
@@ -141,7 +141,13 @@ async fn handle_init(run: &wecom::CliRun<'_>, args: InitArgs) -> Result<()> {
 
     let (bot, bind_source) = match method {
         "qrcode" => (
-            scan_qrcode_for_bot(args.no_browser, args.output_qrcode).await?,
+            scan_qrcode_for_bot(
+                run.get_fs().as_ref(),
+                run.get_cwd(),
+                args.no_browser,
+                args.output_qrcode,
+            )
+            .await?,
             auth::BindSource::Qrcode,
         ),
         // select 的 item value 仅有 "qrcode" / "manual" 两个取值
@@ -240,8 +246,8 @@ fn resolve_bind_mode(noninteractive: bool, manual: bool, is_tty: bool) -> Result
         if is_tty {
             return Ok(BindMode::Manual);
         }
-        return Err(wecom::Error::Validation(
-            "手动输入需要终端，非交互环境请使用 --noninteractive 直接扫码接入".into(),
+        return Err(wecom::Error::validation(
+            "手动输入需要终端，非交互环境请使用 --noninteractive 直接扫码接入",
         )
         .into());
     }
@@ -284,15 +290,25 @@ fn prompt_bot_credentials() -> Result<auth::Bot> {
 // ---------------------------------------------------------------------------
 
 /// 扫码接入完整流程：创建会话 → 终端渲染二维码 → 可选输出 PNG → 浏览器打开 → 轮询结果。
+///
+/// 输出路径是外部输入：与 `--output` 同模式「先创建后请求」——会话创建前经
+/// 注入的 workspace fs（生产为 `CliRun` 的实例）排他预留文件，创建即完成沙箱
+/// 授权（roots + deny），后续经句柄写入，无 TOCTOU 窗口。
 async fn scan_qrcode_for_bot(
+    fs: &dyn wecom::Fs,
+    base: &Path,
     no_browser: bool,
     output_qrcode: Option<PathBuf>,
 ) -> Result<auth::Bot> {
-    // 早失败：输出路径参数校验，确定性错误在扫码前暴露。
-    if let Some(path) = &output_qrcode {
-        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        validate_qrcode_output_path(path, &base)?;
-    }
+    // 先创建后请求：预留输出文件，确定性错误（deny / 越界 / 文件已存在）在扫码前暴露。
+    let output_file = match output_qrcode {
+        Some(path) => Some(
+            fs.create_file(&wecom::absolutize(base, &path))
+                .await
+                .map_err(wecom::Error::from)?,
+        ),
+        None => None,
+    };
 
     println!("正在获取二维码...");
     let session = auth::QrSession::create().await?;
@@ -307,10 +323,10 @@ async fn scan_qrcode_for_bot(
     }
 
     // 输出失败不中断扫码流程，warn 后继续轮询。
-    if let Some(path) = output_qrcode {
-        match render_qrcode_png(&session.auth_url, &path) {
-            Ok(()) => println!("二维码已保存到: {}", path.display()),
-            Err(e) => tracing::warn!(error = %e, path = %path.display(), "二维码 PNG 输出失败"),
+    if let Some((resolved, mut file)) = output_file {
+        match render_qrcode_png(&session.auth_url, &mut file).await {
+            Ok(()) => println!("二维码已保存到: {}", resolved.display()),
+            Err(e) => tracing::warn!(error = %e, path = %resolved.display(), "二维码 PNG 输出失败"),
         }
     }
 
@@ -350,48 +366,33 @@ fn render_qrcode_unicode(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// 渲染二维码为黑白 PNG 并写入指定路径。
-fn render_qrcode_png(url: &str, path: &Path) -> Result<()> {
+/// 渲染二维码为黑白 PNG，写入预留文件的写端。
+///
+/// 文件在会话创建前已经由 workspace fs 排他创建（创建即完成沙箱授权），
+/// 此处只负责编码与写数据，句柄级写入天然无 TOCTOU 窗口。
+async fn render_qrcode_png(url: &str, file: &mut wecom::FileWriter) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let code = QrCode::new(url).map_err(|e| Error::Other(format!("二维码渲染失败: {e}").into()))?;
     let image: image::ImageBuffer<image::Luma<u8>, Vec<u8>> = code
         .render::<image::Luma<u8>>()
         .quiet_zone(true) // 安静区（默认 4 模块，显式声明）
         .module_dimensions(8, 8) // 8px/模块，便于移动端扫码
         .build();
-    image
-        .save(path)
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma8(image)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| Error::Other(format!("二维码 PNG 编码失败: {e}").into()))?;
+
+    file.write_all(buf.get_ref())
+        .await
         .map_err(|e| Error::Other(format!("二维码 PNG 写入失败: {e}").into()))?;
-    Ok(())
-}
 
-/// 校验二维码输出路径：仅允许解析后落在 base（cwd）内的路径（相对或绝对），早失败。
-///
-/// 复用 [`wecom::Fs`] 沙箱校验（`..` 逃逸 / symlink 绕行 / 越界绝对路径）；
-/// 父目录存在性与非目录单独补充（Fs 不校验父目录存在性）。不展开 `~`。
-fn validate_qrcode_output_path(path: &Path, base: &Path) -> Result<()> {
-    // writable roots = [base]：越界（`..`/symlink/绝对路径出界）→ Permission，转译为友好文案。
-    let fs = wecom::Fs::new_with_permissions(base, None, Some(&[base]));
-    fs.check_writable(path).map_err(|e| -> Error {
-        if matches!(e, wecom::Error::Permission(_)) {
-            wecom::Error::Validation("仅支持当前目录下的路径（如 qr.png 或 sub/qr.png）".into())
-                .into()
-        } else {
-            e.into()
-        }
-    })?;
+    file.flush()
+        .await
+        .map_err(|e| Error::Other(format!("二维码 PNG 写入失败: {e}").into()))?;
 
-    // 父目录存在性（空父路径跳过，`qr.png` 合法）；`~/x` 父段字面不存在 → 自然报错。
-    if let Some(parent) = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty() && !base.join(p).is_dir())
-    {
-        return Err(
-            wecom::Error::Validation(format!("输出目录不存在: {}", parent.display())).into(),
-        );
-    }
-    if base.join(path).is_dir() {
-        return Err(wecom::Error::Validation(format!("输出路径是目录: {}", path.display())).into());
-    }
     Ok(())
 }
 
@@ -544,149 +545,77 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    // ── validate_qrcode_output_path ──
+    // ── --output-qrcode 预留 + 写入 ──
 
-    /// P0：父目录不存在 → Err（消息含"输出目录不存在"与父目录路径）
-    /// 条件：base 下 no_such_dir 不存在
-    /// 断言：返回 Err，消息含"输出目录不存在: no_such_dir"
-    #[test]
-    fn validate_rejects_missing_parent_dir() {
+    /// 测试夹具：与生产一致的 workspace 域 fs（roots=[base, 系统临时目录] + deny 规则）。
+    fn workspace_fs(base: &Path) -> std::sync::Arc<dyn wecom::Fs> {
+        wecom::default_workspace_fs(base)
+    }
+
+    /// P0：预留文件命中 deny → Err（创建即授权，敏感形状在请求前被拦截）
+    /// 条件：base 下 .config/wecom 形状路径
+    /// 断言：create_file 返回 Err
+    #[tokio::test]
+    async fn reserve_output_file_rejects_deny_rule_hit() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
-        let err = validate_qrcode_output_path(Path::new("no_such_dir/qr.png"), base).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("输出目录不存在"), "got: {msg}");
-        assert!(msg.contains("no_such_dir"), "got: {msg}");
+        let result = workspace_fs(base)
+            .create_file(&base.join(".config/wecom/qr.png"))
+            .await;
+        assert!(result.is_err(), "deny shape must be rejected");
     }
 
-    /// P0：无父路径（`qr.png`）→ Ok（相对 base 合法）
-    /// 条件：裸文件名，父路径为空
-    /// 断言：返回 Ok
-    #[test]
-    fn validate_accepts_bare_filename() {
+    /// P0：预留文件已存在 → Err（排他创建，与 --output 一致不覆盖）
+    /// 条件：base 下 qr.png 已存在
+    /// 断言：create_file 返回 Err
+    #[tokio::test]
+    async fn reserve_output_file_rejects_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        validate_qrcode_output_path(Path::new("qr.png"), dir.path()).unwrap();
-    }
-
-    /// P0：path 为目录 → Err（消息含"输出路径是目录"）
-    /// 条件：base 下已存在目录 sub，path 指向 sub
-    /// 断言：返回 Err，消息含"输出路径是目录"
-    #[test]
-    fn validate_rejects_path_is_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
         #[allow(clippy::disallowed_methods)] // 测试写入临时目录。
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        let err = validate_qrcode_output_path(Path::new("sub"), dir.path()).unwrap_err();
-        assert!(err.to_string().contains("输出路径是目录"), "got: {err}");
+        std::fs::write(base.join("qr.png"), b"old").unwrap();
+        let result = workspace_fs(base).create_file(&base.join("qr.png")).await;
+        assert!(result.is_err(), "existing file must be rejected");
     }
 
-    /// P1：父目录存在 → Ok
-    /// 条件：base 下建 sub 目录，path 为 sub/qr.png
-    /// 断言：返回 Ok
-    #[test]
-    fn validate_accepts_existing_parent_dir() {
+    /// P1：render_qrcode_png 写入预留文件生成有效 PNG
+    /// 条件：经 workspace fs 预留 base 下 qr.png 后写入
+    /// 断言：文件以 PNG 魔数 \x89PNG 开头
+    #[tokio::test]
+    async fn render_qrcode_png_writes_valid_file() {
         let dir = tempfile::tempdir().unwrap();
-        #[allow(clippy::disallowed_methods)] // 测试写入临时目录。
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        validate_qrcode_output_path(Path::new("sub/qr.png"), dir.path()).unwrap();
-    }
-
-    /// P0：base 外的绝对路径 → Err（越界，D12-A 友好文案）
-    /// 条件：path 为 base 外的绝对路径 /tmp/qr.png
-    /// 断言：返回 Err，消息含"仅支持当前目录下的路径"
-    #[test]
-    fn validate_rejects_absolute_path_outside_base() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let abs = outside.path().join("qr.png");
-        let err = validate_qrcode_output_path(&abs, dir.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("仅支持当前目录下的路径"), "got: {msg}");
-    }
-
-    /// P0：base 内的绝对路径 → Ok（去除 is_absolute 拦截后的合法输入）
-    /// 条件：path 为 base 内的绝对路径 <base>/qr.png
-    /// 断言：返回 Ok
-    #[test]
-    fn validate_accepts_absolute_path_inside_base() {
-        let dir = tempfile::tempdir().unwrap();
-        let abs = dir.path().join("qr.png");
-        validate_qrcode_output_path(&abs, dir.path()).unwrap();
-    }
-
-    /// P0：含 `..` 的路径 → Err（越界，D12-A 友好文案）
-    /// 条件：path 为 ../qr.png
-    /// 断言：返回 Err，消息含"仅支持当前目录下的路径"
-    #[test]
-    fn validate_rejects_dotdot_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = validate_qrcode_output_path(Path::new("../qr.png"), dir.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("仅支持当前目录下的路径"), "got: {msg}");
-    }
-
-    /// P0：symlink 逃逸 → Err（canonicalize 解析后越界拒绝）
-    /// 条件：base 下 link 是指向 base 外的符号链接，path 为 link/qr.png
-    /// 断言：返回 Err，消息含"仅支持当前目录下的路径"
-    #[cfg(unix)]
-    #[test]
-    fn validate_rejects_symlink_escape() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
-        let err = validate_qrcode_output_path(Path::new("link/qr.png"), dir.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("仅支持当前目录下的路径"), "got: {msg}");
-    }
-
-    /// P0：tilde 不展开 → Err（父段字面，消息"输出目录不存在: ~/Downloads"）
-    /// 条件：path 为 ~/Downloads/qr.png
-    /// 断言：返回 Err，消息含"~/Downloads"（验证不展开）
-    #[test]
-    fn validate_rejects_tilde_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let err =
-            validate_qrcode_output_path(Path::new("~/Downloads/qr.png"), dir.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("输出目录不存在"), "got: {msg}");
-        assert!(msg.contains("~/Downloads"), "got: {msg}");
-    }
-
-    /// P1：render_qrcode_png 生成有效 PNG 文件
-    /// 条件：写入临时路径
-    /// 断言：文件存在且以 PNG 魔数 \x89PNG 开头
-    #[test]
-    fn render_qrcode_png_writes_valid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("qr.png");
-        render_qrcode_png("https://example.com/auth", &path).unwrap();
+        let base = dir.path();
+        let (resolved, mut file) = workspace_fs(base)
+            .create_file(&base.join("qr.png"))
+            .await
+            .unwrap();
+        render_qrcode_png("https://example.com/auth", &mut file)
+            .await
+            .unwrap();
+        drop(file);
         #[allow(clippy::disallowed_methods)] // 测试读取临时目录文件。
-        let data = std::fs::read(&path).unwrap();
+        let data = std::fs::read(&resolved).unwrap();
         assert_eq!(&data[..4], b"\x89PNG", "not a valid PNG file");
     }
 
     /// P1：render_qrcode_png 输出可被 image 解码回读，尺寸为 (模块数+8)×8
     /// 条件：固定 URL 生成 PNG 并解码
     /// 断言：解码成功，宽高相等（正方形）且为 8 的倍数（含 4 模块安静区）
-    #[test]
-    fn render_qrcode_png_is_decodable_square() {
+    #[tokio::test]
+    async fn render_qrcode_png_is_decodable_square() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("qr.png");
-        render_qrcode_png("https://example.com/auth", &path).unwrap();
-        let img = image::open(&path).unwrap();
+        let base = dir.path();
+        let (resolved, mut file) = workspace_fs(base)
+            .create_file(&base.join("qr.png"))
+            .await
+            .unwrap();
+        render_qrcode_png("https://example.com/auth", &mut file)
+            .await
+            .unwrap();
+        drop(file);
+        let img = image::open(&resolved).unwrap();
         let (w, h) = (img.width(), img.height());
         assert_eq!(w, h, "QR should be square");
         assert!(w % 8 == 0, "width {} should be multiple of 8", w);
-    }
-
-    /// P1：render_qrcode_png 非法路径（目录不存在）返回 Err
-    /// 条件：写入不存在的目录下的路径
-    /// 断言：返回 Err（不 panic）
-    #[test]
-    fn render_qrcode_png_invalid_path_returns_err() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("no_such_dir").join("qr.png");
-        let err = render_qrcode_png("https://example.com/auth", &path).unwrap_err();
-        assert!(err.to_string().contains("PNG 写入失败"), "got: {err}");
     }
 }

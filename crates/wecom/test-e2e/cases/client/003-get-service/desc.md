@@ -28,5 +28,5 @@ let method = svc.method(&["department", "list"]);
 
 ## 关键上下文
 
-- `client/invoke.rs`：`service()` → discovery HTTP 请求 → ServiceHandle
+- `client/mod.rs`：`service()` → discovery HTTP 请求 → ServiceHandle
 - `service/service_handle.rs`：`method()` 按路径查找 method

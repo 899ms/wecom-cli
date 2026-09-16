@@ -25,10 +25,13 @@ type CommandAugment = Box<dyn Fn(Command) -> Command + Send + Sync>;
 /// Prefer constructing via the builder so the request / response schemas can
 /// be derived from plain Rust types instead of hand-written JSON Schema:
 ///
-/// ```ignore
-/// HelperMeta::new("+upload", "上传媒体文件")
-///     .with_request::<UploadRequest>()
-///     .with_response::<UploadResponse>()
+/// ```rust
+/// use wecom::HelperMeta;
+///
+/// let meta = HelperMeta::new("+upload", "上传媒体文件")
+///     .with_request::<String>()
+///     .with_response::<String>();
+/// # let _ = meta;
 /// ```
 pub struct HelperMeta {
     /// Display name shown in help text.
@@ -108,10 +111,13 @@ impl HelperMeta {
     /// letting a helper add CLI-only presentation such as `after_help` or
     /// extra arguments:
     ///
-    /// ```ignore
-    /// HelperMeta::new("+upload", "上传媒体文件")
-    ///     .with_request::<UploadRequest>()
-    ///     .with_command_augment(|cmd| cmd.after_help("示例：wecom media +upload ..."))
+    /// ```rust
+    /// use wecom::HelperMeta;
+    ///
+    /// let meta = HelperMeta::new("+upload", "上传媒体文件")
+    ///     .with_request::<String>()
+    ///     .with_command_augment(|cmd| cmd.after_help("示例：wecom media +upload ..."));
+    /// # let _ = meta;
     /// ```
     #[must_use]
     pub fn with_command_augment<F>(mut self, f: F) -> Self
@@ -233,7 +239,7 @@ pub trait Helper: Send + Sync {
     ///
     /// `run` is the active [`CliRun`] context, giving access to the
     /// [`Client`](crate::Client) (`run.get_client()`), the sandboxed
-    /// filesystem (`run.fs()`), and the output sink (`run.get_output()`).
+    /// filesystem (`run.get_fs()`), and the output sink (`run.get_output()`).
     ///
     /// `params` is a JSON object whose keys match the properties
     /// declared in [`about().request`](HelperMeta::request).
@@ -425,8 +431,7 @@ mod tests {
     async fn helper_execute_ok() {
         let tmp = tempfile::tempdir().unwrap();
         let client = crate::Client::builder()
-            .home_dir(tmp.path())
-            .cwd(tmp.path())
+            .config_dir(tmp.path())
             .build()
             .unwrap();
         let run = client.run(vec!["test".into()]);

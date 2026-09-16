@@ -36,19 +36,17 @@ pub fn build_test_http_transport(token: &str, base_url: &str) -> wecom::transpor
 
 /// Build a test [`wecom::Client`] pointed at the given mock server URL.
 ///
-/// Output is no longer part of the client — pass a [`wecom::CliRunOutput`]
-/// via `.output()` on `client.run()` to capture output.
+/// To capture output, pass a [`wecom::CliRunOutput`] via `.output()` on
+/// `client.run()`.
 pub fn build_test_client(server_url: &str) -> wecom::Client {
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
     let transport = wecom::transport::HttpTransportBackend::builder()
         .base_url(server_url)
         .header_sensitive("Authorization", "Bearer test-token", true)
         .build()
         .expect("add header");
     wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
         .transport(transport)
         .build()
         .expect("build test client")
@@ -115,7 +113,10 @@ pub fn assert_download_result(buf: &SharedBuf, content_type: &str) -> serde_json
 
 /// Assert file exists and return content as String.
 pub fn assert_file_exists(path: &Path) -> String {
-    assert!(path.exists(), "file does not exist: {}", path.display());
+    // Test fixture: probing tempdir, not through CLI sandbox.
+    #[allow(clippy::disallowed_methods)]
+    let exists = path.exists();
+    assert!(exists, "file does not exist: {}", path.display());
     #[allow(clippy::disallowed_methods)]
     // Test fixture: reading from tempdir, not through CLI sandbox.
     std::fs::read_to_string(path).unwrap_or_else(|e| {

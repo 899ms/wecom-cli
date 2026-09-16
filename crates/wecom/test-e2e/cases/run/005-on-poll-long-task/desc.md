@@ -32,5 +32,5 @@ client.run(vec!["wecom", "hr", "department", "list"]).on_poll(callback).output(o
 
 ## 关键上下文
 
-- `client/run.rs`：`run()` 检测 taskid → 轮询 `/task/query` → on_poll 回调
+- `client/run/mod.rs`：`.on_poll()` 注册长任务轮询回调，请求检测到 taskid 时轮询 `/task/query` 并触发回调
 - 终态轮不触发 on_poll

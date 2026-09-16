@@ -21,4 +21,4 @@ client.run(vec!["wecom", "--help"]).output(output).await
 
 ## 关键上下文
 
-- `client/run.rs`：`--help` 触发 clap 帮助输出，需要 discovery 提供服务的 command tree
+- `client/run/parse_error.rs`：`--help` 触发 clap 帮助输出，需要 discovery 提供服务的 command tree

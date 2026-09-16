@@ -58,7 +58,8 @@ pub struct HttpEndpoint {
     /// Response-side envelope (body decoding). `None` (default) →
     /// [`GatewayRes`]: standard gateway `result`/`error` envelope parsing.
     res_envelope: Option<Arc<dyn ResponseEnvelope>>,
-    /// Ranged-download chunk size (bytes). See [`crate::TransportRequest::ranged`].
+    /// Ranged-download chunk size (bytes). When set, an eligible binary
+    /// download is split into chunks of this size.
     ///
     /// `None` (default) — binary response is streamed as one continuous body.
     /// `Some(n)` where `n > 0` — binary response is fetched in fixed-size
@@ -239,13 +240,17 @@ impl HttpEndpoint {
     ///
     /// This is the `&self` (derived) counterpart of the consuming `with_*` builder
     /// family: it clones the receiver and normalizes the given `path` via
-    /// [`normalize_path`]. `base_url`, `envelope`, and `range_size` are carried
+    /// `normalize_path`. `base_url`, `envelope`, and `range_size` are carried
     /// over unchanged.
     ///
     /// Designed to be used with [`Endpoint::map`](crate::Endpoint::map):
     ///
-    /// ```ignore
+    /// ```rust
+    /// use wecom_transport::{Endpoint, HttpEndpoint};
+    ///
+    /// let ep = Endpoint::new().with(HttpEndpoint::new("/cgi/action"));
     /// let new_ep = ep.map::<HttpEndpoint>(|e| e.with_path_derived("/task/query"));
+    /// # let _ = new_ep;
     /// ```
     #[must_use]
     pub fn with_path_derived(&self, path: impl Into<String>) -> Self {
@@ -286,17 +291,12 @@ impl HttpEndpoint {
 
 /// Extension methods for reading HTTP-specific fields from an [`Endpoint`] bag.
 ///
-/// These replace the old `Endpoint::base_url()` / `Endpoint::full_url()` etc.
-/// methods. Import this trait to use them on any `&Endpoint`.
+/// Import this trait to use them on any `&Endpoint`.
 ///
 /// This is the **defaulting layer**: getters return concrete fallback values
 /// (`""`, `"/"`, [`PassthroughReq`], [`GatewayRes`]) when the capability or
 /// field is absent. For the faithful `Option`-returning accessors, use the
 /// `HttpEndpoint` methods directly (e.g. `ep.get::<HttpEndpoint>()`).
-///
-/// # Migration
-///
-/// - **Old**: `ep.base_url()` → **New**: import [`EndpointHttpExt`], same call site.
 pub trait EndpointHttpExt {
     /// HTTP base URL from the [`HttpEndpoint`] capability, or `""` if absent.
     fn base_url(&self) -> &str;
@@ -436,7 +436,7 @@ mod tests {
     use super::*;
     use crate::http::envelope::RequestEnvelope;
 
-    /// 测试用自定义请求侧信封（core 只提供 PassthroughReq 默认策略）。
+    /// 测试用自定义请求侧信封：把 payload 包进 `{"payload": "<json-string>"}`。
     #[derive(Debug, Clone, Copy, Default)]
     struct WrapPayloadReq;
     impl RequestEnvelope for WrapPayloadReq {

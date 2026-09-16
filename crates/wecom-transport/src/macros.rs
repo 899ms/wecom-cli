@@ -1,6 +1,7 @@
 //! Builder-shaped macros for request types.
 //!
-//! Provides a single declarative macro [`impl_request_builder!`] that injects
+//! Provides a single declarative macro [`impl_request_builder!`](crate::impl_request_builder)
+//! that injects
 //! a uniform builder surface into any struct used as an HTTP request
 //! builder, with optional `+options` / `+wire` capability switches.
 //!
@@ -37,7 +38,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! // Headers only (default error type = wecom_transport::Error):
 //! impl_request_builder!(Builder);
 //!
@@ -52,19 +53,19 @@
 //!     ClientInvokeRequest<'a>,
 //!     +options,
 //!     error_type = Error,
-//!     error_wrapper = Error::Other,
+//!     error_wrapper = Error::other,
 //! );
 //! ```
 //!
 //! # Error type
 //!
 //! The `header_error` field type is `Option<$error_ty>`. When not specified,
-//! defaults to `$crate::Error` with wrapper `$crate::Error::Other`.
+//! defaults to `$crate::Error` with wrapper `$crate::Error::other`.
 //! Custom error types must implement `std::error::Error + Send + Sync + 'static`.
 
 /// Inject a uniform builder surface into a request type.
 ///
-/// See the module-level documentation in [`crate::macros`] for the
+/// See the module-level documentation in `crate::macros` for the
 /// full description of generated methods, field requirements, and feature
 /// flags. The grammar is:
 ///
@@ -387,7 +388,7 @@ macro_rules! impl_request_builder {
     // With lifetimes, default error
     ($name:ident < $($lt:lifetime),+ > $(,)?) => {
         $crate::impl_request_builder!(
-            @headers_block [< $($lt),+ > $name< $($lt),+ >] $crate::Error::Other
+            @headers_block [< $($lt),+ > $name< $($lt),+ >] $crate::Error::other
         );
     };
     // With lifetimes, custom error
@@ -398,7 +399,7 @@ macro_rules! impl_request_builder {
     };
     // Without lifetimes, default error
     ($name:ident $(,)?) => {
-        $crate::impl_request_builder!(@headers_block [$name] $crate::Error::Other);
+        $crate::impl_request_builder!(@headers_block [$name] $crate::Error::other);
     };
     // Without lifetimes, custom error
     ($name:ident, error_type = $error_ty:ty, error_wrapper = $error_wrapper:path $(,)?) => {
@@ -410,7 +411,7 @@ macro_rules! impl_request_builder {
     // With lifetimes, default error
     ($name:ident < $($lt:lifetime),+ >, +options $(,)?) => {
         $crate::impl_request_builder!(
-            @headers_block_options [< $($lt),+ > $name< $($lt),+ >] $crate::Error::Other
+            @headers_block_options [< $($lt),+ > $name< $($lt),+ >] $crate::Error::other
         );
         $crate::impl_request_builder!(@options_block [< $($lt),+ > $name< $($lt),+ >]);
     };
@@ -423,7 +424,7 @@ macro_rules! impl_request_builder {
     };
     // Without lifetimes, default error
     ($name:ident, +options $(,)?) => {
-        $crate::impl_request_builder!(@headers_block_options [$name] $crate::Error::Other);
+        $crate::impl_request_builder!(@headers_block_options [$name] $crate::Error::other);
         $crate::impl_request_builder!(@options_block [$name]);
     };
     // Without lifetimes, custom error
@@ -437,7 +438,7 @@ macro_rules! impl_request_builder {
     // With lifetimes, default error
     ($name:ident < $($lt:lifetime),+ >, +wire $(,)?) => {
         $crate::impl_request_builder!(
-            @headers_block_wire [< $($lt),+ > $name< $($lt),+ >] $crate::Error::Other
+            @headers_block_wire [< $($lt),+ > $name< $($lt),+ >] $crate::Error::other
         );
         $crate::impl_request_builder!(@wire_block [< $($lt),+ > $name< $($lt),+ >]);
     };
@@ -450,7 +451,7 @@ macro_rules! impl_request_builder {
     };
     // Without lifetimes, default error
     ($name:ident, +wire $(,)?) => {
-        $crate::impl_request_builder!(@headers_block_wire [$name] $crate::Error::Other);
+        $crate::impl_request_builder!(@headers_block_wire [$name] $crate::Error::other);
         $crate::impl_request_builder!(@wire_block [$name]);
     };
     // Without lifetimes, custom error

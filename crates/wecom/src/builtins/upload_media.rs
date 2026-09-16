@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::Deserialize;
 use wecom_transport::{HttpRequestPayload, RequestOptions};
 
@@ -14,24 +16,24 @@ pub struct UploadMediaResponse {
     pub extra: indexmap::IndexMap<String, serde_json::Value>,
 }
 
+/// `fs` is taken as `&Arc` (not `&dyn Fs`) because the multipart form
+/// factory closure requires a `'static` clone.
 #[tracing::instrument(level = "info", name = "media.upload", skip_all)]
 pub(crate) async fn upload_media(
     client: &Client,
-    fs: &fs::Fs,
-    file_path: &str,
+    fs: &std::sync::Arc<dyn fs::Fs>,
+    file_path: PathBuf,
     options: &RequestOptions,
 ) -> Result<UploadMediaResponse> {
-    tracing::info!(%file_path, "upload_media begin");
+    tracing::info!(file_path = %file_path.display(), "upload_media begin");
 
     // multipart 经工厂包装（延迟物化）：每次发送/重放时重新打开文件构建独立表单。
-    let fs = fs.clone();
-    let file_path = file_path.to_string();
+    let fs = std::sync::Arc::clone(fs);
     let form = HttpRequestPayload::form(move || {
-        let fs = fs.clone();
+        let fs = std::sync::Arc::clone(&fs);
         let file_path = file_path.clone();
         async move {
-            let part = fs
-                .open_as_multipart_part(&file_path)
+            let part = fs::open_as_multipart_part(fs.as_ref(), &file_path)
                 .await
                 .map_err(crate::util::to_transport_error)?;
             Ok(reqwest::multipart::Form::new()
@@ -54,12 +56,12 @@ pub(crate) async fn upload_media(
 
     let response = UploadMediaResponse::deserialize(&response)
         .map_err(|e| {
-            Error::Transport(wecom_transport::Error::Parse {
+            Error::Wrapped(Box::new(wecom_transport::Error::Parse {
                 message: format!("Failed to deserialize 'upload_media' response: {e:#}"),
                 endpoint: "utils://upload_media".into(),
                 body: Box::new(response),
                 source: Some(e),
-            })
+            }))
         })
         .inspect_err(|e| tracing::warn!(error = %e, "deserialize upload_media response failed"))?;
 
@@ -101,9 +103,10 @@ mod tests {
             .build()
             .unwrap();
         Client::builder()
-            .home_dir(home.path())
-            .cwd(tmp)
-            .writable_dir(tmp)
+            .config_dir(home.path())
+            .workspace_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::confined_to(&[
+                tmp,
+            ])))
             .transport(transport)
             .build()
             .unwrap()
@@ -133,13 +136,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fs = crate::fs::Fs::new(tmp.path());
+        let fs = wecom_fs::SandboxedFs::new();
         let factory = wecom_transport::HttpRequestPayload::form(move || {
             let fs = fs.clone();
-            let file_path = file_path_str.clone();
+            let file_path = std::path::PathBuf::from(file_path_str.clone());
             async move {
-                let part = fs
-                    .open_as_multipart_part(&file_path)
+                let part = fs::open_as_multipart_part(&fs, &file_path)
                     .await
                     .map_err(crate::util::to_transport_error)?;
                 Ok(reqwest::multipart::Form::new()
@@ -201,10 +203,15 @@ mod tests {
             .await;
 
         let client = make_http_test_client(&server.uri(), tmp.path());
-        let fs = client.default_fs();
-        let result = upload_media(&client, &fs, &file_path_str, &RequestOptions::default())
-            .await
-            .expect("upload_media HTTP should succeed");
+        let fs = client.workspace_fs().clone();
+        let result = upload_media(
+            &client,
+            &fs,
+            std::path::PathBuf::from(&file_path_str),
+            &RequestOptions::default(),
+        )
+        .await
+        .expect("upload_media HTTP should succeed");
 
         assert_eq!(result.media_id, "HTTP_MEDIA_001");
     }

@@ -104,7 +104,7 @@ deser_bool_opt!(deser_wecom_bool_opt, WecomBoolValue);
 /// Value of boolean directives (`x-wecom-octet-stream`, `x-wecom-confirm`,
 /// `x-wecom-hidden`): wraps a JSON object for future extension fields.
 ///
-/// When empty, serializes as `true` for backward compatibility.
+/// An empty object serializes as `true`.
 /// `false` is represented as `None` at the `Option` level.
 ///
 /// | JSON      | Meaning                        |

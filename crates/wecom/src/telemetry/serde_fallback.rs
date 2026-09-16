@@ -40,7 +40,7 @@ pub(crate) trait FieldLabel {
 
 /// Define zero-sized [`FieldLabel`] markers in a batch.
 ///
-/// ```ignore
+/// ```text
 /// use crate::telemetry::schema_field_labels;
 ///
 /// schema_field_labels! {
@@ -352,6 +352,15 @@ mod tests {
     // EmitDefaultOnError — DeserializeAs
     // ════════════════════════════════════════════════════════════════
 
+    /// 测试 helper：注册共享 emit callsite 并重建 interest 缓存（机理见
+    /// crate::telemetry::event_capture 测试模块的同名 helper）。
+    /// 使用时机：`set_default` 之后、`CaptureScope::new()` 之前；
+    /// 热身事件不进入断言。
+    fn warm_up_emit_callsite() {
+        crate::telemetry::emit("test_warmup", &serde_json::json!({}));
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     /// P0：[EmitDefaultOnError] 合法值正常反序列化
     /// 条件：输入 JSON 字符串 "hello"
     /// 断言：返回 String "hello"
@@ -390,6 +399,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -417,6 +427,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -519,6 +530,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -547,6 +559,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -637,6 +650,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -665,6 +679,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -719,6 +734,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();
@@ -751,6 +767,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::Registry::default().with(TelemetryLayer::new()),
         );
+        warm_up_emit_callsite();
         let collected: Arc<Mutex<Vec<ClientEvent>>> = Default::default();
         let c = collected.clone();
         let scope = CaptureScope::new();

@@ -22,7 +22,7 @@ pub fn api_response(data: &Value) -> String {
     .to_string()
 }
 
-/// GatewayEnvelope request wrapping: `{"payload": "<stringified-json>"}`.
+/// 网关请求包裹：请求体为 `{"payload": "<json 字符串>"}`。
 pub fn payload_wrap(data: &Value) -> Value {
     json!({ "payload": serde_json::to_string(data).unwrap() })
 }

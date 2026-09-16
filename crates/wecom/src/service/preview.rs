@@ -30,16 +30,17 @@ pub(super) fn build_request_infos(
                 file_path,
                 with_file_path,
             } => {
+                let file_str = file_path.as_path().to_string_lossy().into_owned();
                 let value = if *with_file_path {
                     serde_json::json!({
-                        "media_id": format!("[media_id:{file_path}]"),
-                        "file_path": file_path,
+                        "media_id": format!("[media_id:{file_str}]"),
+                        "file_path": file_str,
                     })
                 } else {
-                    serde_json::Value::String(format!("[media_id:{file_path}]"))
+                    serde_json::Value::String(format!("[media_id:{file_str}]"))
                 };
                 json_path::set_value_deep(payload, path, value);
-                media_files.push(file_path);
+                media_files.push(file_str);
             }
             directive::Directive::UploadMultipart { path, .. } => {
                 multipart_files.insert(json_path::segments_to_path(path));
@@ -146,7 +147,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+        Client::builder().config_dir(&dir).build().unwrap()
     }
 
     static TEST_CLIENT: std::sync::LazyLock<Client> =
@@ -230,7 +231,7 @@ mod tests {
         let mut payload = serde_json::json!({"media_id": "/tmp/photo.jpg", "other": "data"});
         let dirs = vec![directive::Directive::UploadMedia {
             path: vec![crate::json_path::PathSegment::Key("media_id".into())],
-            file_path: "/tmp/photo.jpg".into(),
+            file_path: std::path::PathBuf::from("/tmp/photo.jpg"),
             with_file_path: false,
         }];
 
@@ -269,7 +270,7 @@ mod tests {
         let mut payload = serde_json::json!({"file": "/tmp/doc.pdf", "name": "doc"});
         let dirs = vec![directive::Directive::UploadMultipart {
             path: vec![crate::json_path::PathSegment::Key("file".into())],
-            file_path: "/tmp/doc.pdf".into(),
+            file_path: std::path::PathBuf::from("/tmp/doc.pdf"),
         }];
 
         let infos = build_request_infos(
@@ -310,12 +311,12 @@ mod tests {
         let dirs = vec![
             directive::Directive::UploadMedia {
                 path: vec![crate::json_path::PathSegment::Key("image".into())],
-                file_path: "/tmp/a.jpg".into(),
+                file_path: std::path::PathBuf::from("/tmp/a.jpg"),
                 with_file_path: false,
             },
             directive::Directive::UploadMultipart {
                 path: vec![crate::json_path::PathSegment::Key("file".into())],
-                file_path: "/tmp/b.pdf".into(),
+                file_path: std::path::PathBuf::from("/tmp/b.pdf"),
             },
         ];
 

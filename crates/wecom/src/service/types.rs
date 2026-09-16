@@ -9,15 +9,14 @@ use crate::client::CliRun;
 
 /// Options for a programmatic API call.
 ///
-/// Holds a reference to the [`CliRun`] that created it so that per-run
-/// path overrides (home_dir, tmp_dir, etc.) are automatically respected
+/// Holds a reference to the [`CliRun`] that created it so that client-level
+/// paths (config_dir, default_output_dir, etc.) are automatically respected
 /// by downstream code without duplicating fields.
 pub struct RunOptions<'r> {
     /// Back-reference to the originating [`CliRun`].
     ///
-    /// Downstream code can call `run.get_request_storage_dir()`,
-    /// `run.get_cache_dir()`, etc. to obtain paths that honour per-run
-    /// overrides.
+    /// Downstream code can call `run.get_cwd()`,
+    /// `run.get_cache_dir()`, etc. to obtain client-level paths.
     pub run: &'r CliRun<'r>,
     /// Request payload (default `{}`).
     pub payload: Value,
@@ -25,9 +24,12 @@ pub struct RunOptions<'r> {
     pub page_count: Option<u32>,
     /// Delay between pages in milliseconds.
     pub page_delay_ms: u64,
-    /// Output file path (for binary downloads).
+    /// Output file path (for binary downloads). Both this and `output_dir`
+    /// are externally-derived values — they are always accessed through the
+    /// workspace-domain filesystem ([`CliRun::get_fs`]).
     pub output_path: Option<PathBuf>,
-    /// Output directory (for binary downloads / file-save directives).
+    /// Output directory (for binary downloads / file-save directives). Same
+    /// domain rule as `output_path`.
     pub output_dir: Option<PathBuf>,
 }
 
@@ -45,21 +47,20 @@ impl<'r> RunOptions<'r> {
         }
     }
 
-    /// Effective output directory: explicit `output_dir` override, or the
-    /// request storage directory derived from the [`CliRun`].
-    ///
-    /// Centralises the fallback logic shared by `handle_binary_output` and
-    /// `process_file_save`.
+    /// Effective output directory for downloaded files: the explicit
+    /// `output_dir` override, or the run's default output directory (the
+    /// working directory unless the client configured one — matching
+    /// wget / curl `-O` / `gh release download`, which all default to cwd).
     pub fn output_dir(&self) -> PathBuf {
         self.output_dir
             .clone()
-            .unwrap_or_else(|| self.run.get_request_storage_dir())
+            .unwrap_or_else(|| self.run.get_default_output_dir().to_path_buf())
     }
 }
 
 /// Structured schema information for a service.
 ///
-/// Returned by [`ServiceHandle::schema()`].
+/// Returned by [`ServiceHandle::schema()`](crate::service::ServiceHandle::schema).
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceSchemaInfo {
     /// Service name.
@@ -83,7 +84,8 @@ pub struct MethodSummary {
 
 /// Structured schema information for a method.
 ///
-/// Returned by [`MethodHandle::schema()`] — contains the method path,
+/// Returned by [`MethodHandle::schema()`](crate::service::MethodHandle::schema)
+/// — contains the method path,
 /// description, request/response references, and resolved schema definitions.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
@@ -102,7 +104,8 @@ pub struct MethodSchemaInfo {
 
 /// A single HTTP request that would be sent during a dry-run.
 ///
-/// Returned by [`MethodHandle::preview()`] — one entry per request
+/// Returned by [`MethodHandle::preview()`](crate::service::MethodHandle::preview)
+/// — one entry per request
 /// (media uploads produce additional entries before the main request).
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
@@ -151,13 +154,14 @@ mod tests {
     //!
     //! ### 关键分支与异常路径
     //! - output_dir 显式设置 → 返回显式值
-    //! - output_dir 未设置 → 回退到 request_storage_dir
-    //! - tmp_dir 覆盖 → 路径随覆盖变化
+    //! - output_dir 未设置 → 回退到 cwd（含 run 级 .cwd() 覆盖）
     //! - multipart=None → skip_serializing_none 跳过
     //!
     //! ### 上下游交互
     //! - 上游：service::execute、service::output 等使用 RunOptions
     //! - 下游：序列化为 JSON 输出给 CLI 用户或上传接口
+
+    use std::path::Path;
 
     use assert_json_diff::assert_json_eq;
     use serde_json::json;
@@ -170,7 +174,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+        Client::builder().config_dir(&dir).build().unwrap()
     }
 
     /// P0：RunOptions::new 默认值正确
@@ -217,72 +221,76 @@ mod tests {
         assert_json_eq!(opts.payload["key"], serde_json::json!("value"));
         assert_eq!(opts.page_count, Some(3));
         assert_eq!(opts.page_delay_ms, 200);
-        assert_eq!(opts.output_path.unwrap(), PathBuf::from("/tmp/out.json"));
-        assert_eq!(opts.output_dir.unwrap(), PathBuf::from("/tmp/outdir"));
+        assert_eq!(opts.output_path.unwrap(), Path::new("/tmp/out.json"));
+        assert_eq!(opts.output_dir.unwrap(), Path::new("/tmp/outdir"));
     }
 
-    /// P1：RunOptions 通过 run 引用可访问路径覆盖
-    /// 条件：CliRun 设置了 tmp_dir 覆盖
-    /// 断言：opts.run.get_request_storage_dir() 返回覆盖后的路径
-    #[test]
-    fn run_options_accesses_path_overrides_via_run() {
-        let client = build_isolated_client();
-        let run = client.run(vec!["test".into()]).tmp_dir("/custom/tmp");
-        let opts = RunOptions::new(&run);
-        assert_eq!(
-            opts.run.get_request_storage_dir(),
-            std::path::PathBuf::from("/custom/tmp/requests")
-        );
-    }
-
-    /// P1：RunOptions 无 tmp_dir 覆盖时回退到 client 默认值
-    /// 条件：CliRun 未设置 tmp_dir 覆盖
-    /// 断言：run.get_request_storage_dir() 返回 client.request_storage_dir()
+    /// P1：RunOptions 经 run 引用取得生效的 default_output_dir
+    /// 条件：client 未配置 default_output_dir
+    /// 断言：run.get_default_output_dir() 读时回退到 run 的 cwd
     #[test]
     fn run_options_falls_back_to_client_without_override() {
         let client = build_isolated_client();
         let run = client.run(vec!["test".into()]);
         let opts = RunOptions::new(&run);
-        assert_eq!(
-            opts.run.get_request_storage_dir(),
-            client.request_storage_dir()
-        );
+        assert_eq!(opts.run.get_default_output_dir(), run.get_cwd());
     }
 
     // ── output_dir ──
 
     /// P0：[RunOptions::output_dir] 在 output_dir 为 Some 时返回显式目录
     /// 条件：output_dir 设置为 "/explicit/dir"
-    /// 断言：返回 PathBuf("/explicit/dir")
+    /// 断言：返回显式目录
     #[test]
     fn effective_output_dir_returns_explicit_when_set() {
         let client = build_isolated_client();
         let run = client.run(vec!["test".into()]);
         let mut opts = RunOptions::new(&run);
         opts.output_dir = Some(PathBuf::from("/explicit/dir"));
-        assert_eq!(opts.output_dir(), PathBuf::from("/explicit/dir"));
+        let p = opts.output_dir();
+        assert_eq!(p, Path::new("/explicit/dir"));
     }
 
-    /// P0：[RunOptions::output_dir] 在 output_dir 为 None 时回退到 request_storage_dir
-    /// 条件：output_dir 未设置
-    /// 断言：返回 run.get_request_storage_dir()
+    /// P0：[RunOptions::output_dir] 在 output_dir 为 None 时回退到 default_output_dir
+    /// 条件：output_dir 未设置，client 未配置 default_output_dir
+    /// 断言：返回 run.get_default_output_dir()（即 run 的 cwd）
     #[test]
-    fn effective_output_dir_falls_back_to_request_storage_dir() {
+    fn effective_output_dir_falls_back_to_cwd() {
         let client = build_isolated_client();
         let run = client.run(vec!["test".into()]);
         let opts = RunOptions::new(&run);
-        assert_eq!(opts.output_dir(), run.get_request_storage_dir());
+        let p = opts.output_dir();
+        assert_eq!(p, run.get_default_output_dir());
     }
 
-    /// P1：[RunOptions::output_dir] 在 tmp_dir 覆盖时使用覆盖后的路径
-    /// 条件：CliRun 设置了 tmp_dir 覆盖，output_dir 未设置
-    /// 断言：返回覆盖后的 request_storage_dir
+    /// P1：[RunOptions::output_dir] 未配置时跟随 run 级 cwd 覆盖
+    /// 条件：output_dir 未设置；CliRun 经 .cwd() 覆盖工作目录锚点
+    /// 断言：返回覆盖后的 cwd
     #[test]
-    fn effective_output_dir_respects_tmp_dir_override() {
+    fn effective_output_dir_respects_run_cwd_override() {
         let client = build_isolated_client();
-        let run = client.run(vec!["test".into()]).tmp_dir("/custom/tmp");
+        let run = client
+            .run(vec!["test".into()])
+            .cwd(std::path::PathBuf::from("/custom/cwd"));
         let opts = RunOptions::new(&run);
-        assert_eq!(opts.output_dir(), PathBuf::from("/custom/tmp/requests"));
+        assert_eq!(opts.output_dir(), Path::new("/custom/cwd"));
+    }
+
+    /// P0：[RunOptions::output_dir] client 配置 default_output_dir 后优先于 cwd
+    /// 条件：output_dir 未设置；client 配置 default_output_dir
+    /// 断言：返回配置目录（相对值已锚定 cwd）
+    #[test]
+    fn effective_output_dir_respects_client_default_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = Client::builder()
+            .config_dir(tmp.path().join("config"))
+            .cwd(tmp.path())
+            .default_output_dir("downloads")
+            .build()
+            .unwrap();
+        let run = client.run(vec!["test".into()]);
+        let opts = RunOptions::new(&run);
+        assert_eq!(opts.output_dir(), tmp.path().join("downloads"));
     }
 
     /// P0：ServiceSchemaInfo 可正确序列化为 JSON

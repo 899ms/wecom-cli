@@ -1,6 +1,6 @@
-# json repair 成功时 stderr 输出修复前后 JSON
+# json repair 成功时 stderr 输出提示
 
-- **场景**：`--json` 传入格式错误 JSON 被自动修复后，stderr 输出提示与修复前后 JSON
+- **场景**：`--json` 传入格式错误 JSON 被自动修复后，stderr 输出提示
 - **Transport**：HTTP（mockito）
 - **来源**：wecom-cli main.rs 挂载的 telemetry 事件监听
 
@@ -8,7 +8,7 @@
 
 **P1**（json repair 成功时 stderr 提示）
 - **条件**：`--json '{bad: "value"}'`（键名无引号），mock server 返回 catalog + hr detail + method 响应
-- **断言**：退出码 0，stdout 正常业务输出，stderr 含 `json repair` 提示、修复前原文 `{bad: "value"}`、修复后 `"bad": "value"`
+- **断言**：退出码 0，stdout 正常业务输出，stderr 含 `json repair` 提示
 
 ## 前置条件
 
@@ -24,7 +24,7 @@ wecom-cli hr department list --json '{bad: "value"}'
 ## 断言 — CLI
 
 - 退出码：`0`
-- stderr：含 `json repair`、`--- 修复前 ---`、`--- 修复后 ---` 及对应 JSON 内容
+- stderr：含 `json repair` 提示
 - stdout：正常业务输出（不受影响）
 
 ## 断言 — HTTP Endpoint
@@ -38,5 +38,5 @@ wecom-cli hr department list --json '{bad: "value"}'
 
 ## 关键上下文
 
-- wecom crate 的 `json_repair` 事件在 `ok_repaired` 时携带 `input`（修复前）与 `output`（修复后）字段
-- wecom-cli 监听该事件，仅对 `outcome=ok_repaired` 输出 stderr 提示
+- wecom crate 的 `json_repair` 事件在 `ok_repaired` 时仅携带 `strategy` 与 `candidates` 字段（不含修复前后原文）
+- wecom-cli 监听该事件，仅对 `outcome=ok_repaired` 输出 stderr 提示（不含具体 JSON 内容）

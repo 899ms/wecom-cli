@@ -2,9 +2,11 @@
 //!
 //! Internal modules:
 //! - `endpoint`   — [`HttpEndpoint`] capability (path, base_url, envelope, range_size).
-//! - `envelope`   — request/response envelope strategy ([`Envelope`] and built-ins).
+//! - `envelope`   — request/response envelope strategy ([`RequestEnvelope`] /
+//!   [`ResponseEnvelope`] and built-ins).
 //! - `polling`    — long-task polling for HTTP transport.
-//! - `protocol`   — API protocol parsing ([`ApiResponse`] / [`ApiErrorInfo`]).
+//! - `protocol`   — API protocol parsing
+//!   ([`protocol::ApiResponse`] / [`protocol::ApiErrorInfo`]).
 //! - `request`    — execute pipeline helpers (envelope application, ranged download, polling, decoding).
 //! - `resumable`  — HTTP Range resumption download.
 

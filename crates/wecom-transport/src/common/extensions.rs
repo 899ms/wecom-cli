@@ -40,7 +40,7 @@ impl<T: Any + Debug + Send + Sync + 'static> Extension for T {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
 /// #[derive(Debug)]
 /// pub struct RetryConfig { pub max_retries: u32 }
 ///

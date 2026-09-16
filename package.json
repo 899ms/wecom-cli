@@ -27,8 +27,10 @@
     "fmt": "git ls-files '*.rs' | xargs rustfmt +nightly",
     "fmt:check": "git ls-files '*.rs' | xargs rustfmt +nightly --check",
     "lint": "cargo clippy --workspace --all-targets --features custom-endpoint -- -D warnings",
+    "lint:all": "cargo hack clippy --workspace --all-targets --feature-powerset -- -D warnings",
     "prepare": "lefthook install",
-    "test": "cargo test --workspace --all-targets --features custom-endpoint"
+    "test": "cargo test --workspace --all-targets --features custom-endpoint",
+    "test:doc": "cargo test --workspace --doc"
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
@@ -46,7 +48,7 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.57.2"
   },
-  "packageManager": "pnpm@11.21.0",
+  "packageManager": "pnpm@12.3.4",
   "engines": {
     "node": ">=18"
   }

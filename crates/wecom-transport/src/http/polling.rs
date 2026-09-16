@@ -82,7 +82,7 @@ pub(crate) async fn poll_long_task(
             wire.headers.insert(
                 HeaderName::from_static("x-long-poll-taskid"),
                 HeaderValue::from_str(taskid).map_err(|e| {
-                    Error::Other(format!("invalid taskid for X-Long-Poll-TaskId: {e:#}").into())
+                    Error::other(format!("invalid taskid for X-Long-Poll-TaskId: {e:#}").into())
                 })?,
             );
             (Cow::Borrowed(ctx.request_endpoint), serde_json::json!({}))

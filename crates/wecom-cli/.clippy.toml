@@ -7,7 +7,7 @@ disallowed-methods = [
     { path = "std::fs::read_to_string", reason = "Use Fs::read_to_string to enforce sandbox. If this is a legitimate bypass, add #[allow(clippy::disallowed_methods)] with a safety comment." },
     { path = "std::fs::write", reason = "Use Fs::atomic_write to enforce sandbox." },
     { path = "std::fs::remove_file", reason = "Use Fs::remove_file to enforce sandbox." },
-    { path = "std::fs::remove_dir_all", reason = "Use Fs::remove_dir_all to enforce sandbox." },
+    { path = "std::fs::remove_dir_all", reason = "Fs has no recursive deletion; remove files individually via Fs::remove_file to enforce sandbox." },
     { path = "std::fs::metadata", reason = "Use Fs::metadata to enforce sandbox." },
     { path = "std::fs::read_dir", reason = "Use Fs::list_files to enforce sandbox." },
     { path = "std::fs::File::open", reason = "Use Fs read methods to enforce sandbox." },

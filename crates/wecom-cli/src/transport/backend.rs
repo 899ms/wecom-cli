@@ -30,8 +30,8 @@ pub(crate) const TOKEN_EXPIRED_ERRCODE: i64 = 853004;
 /// 扁平响应等请求/响应封装由 wecom-transport 的 endpoint envelope 驱动，
 /// 本层不做特殊分流。
 ///
-/// 所有载荷均可重放：经 [`HttpRequestPayload`](wecom_transport::HttpRequestPayload)
-/// 工厂克隆（Arc 零成本），重放 = 再次 build。
+/// 所有载荷均可重放：经 [`HttpRequestPayload`] 工厂克隆（Arc 零成本），
+/// 重放 = 再次 build。
 #[derive(Clone)]
 pub(crate) struct WecomBackend {
     /// 底层 HTTP 传输（信封解析 + 长任务轮询路径）。
@@ -84,7 +84,7 @@ impl WecomBackend {
     /// 经 botid+signature 重新换取 token：落盘 + 写入内存缓存，返回新 token。
     ///
     /// `stale_token` 为本次失败请求所用的 token；锁内双检——若凭据中的 token
-    /// 已不同于它，说明并发请求已完成刷新，直接复用、不再重复换取。
+    /// 已不同于它，说明并发请求已完成刷新，直接复用、不重复换取。
     ///
     /// `options` 为触发刷新的请求携带的请求选项（含 transport 默认叠加的
     /// headers / timeout / extensions），引导请求复用它们，保证传输配置一致。

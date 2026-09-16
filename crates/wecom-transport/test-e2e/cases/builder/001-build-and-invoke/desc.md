@@ -1,6 +1,6 @@
 # Transport Builder 构建 HTTP Transport 并调用
 
-- **场景**：验证 `HttpTransport::builder()` 构建 HTTP Transport，设置 header 后发送请求
+- **场景**：验证 `HttpTransportBackend::builder()` 构建 HTTP Transport，设置 header 后发送请求
 - **Transport**：HTTP（reqwest）
 
 ## 测试等级
@@ -17,7 +17,7 @@
 
 ```rust
 // HTTP
-HttpTransport::builder().header("x-custom", "custom-val").build()
+HttpTransportBackend::builder().header("x-custom", "custom-val").build()
 ```
 
 ## 断言
@@ -27,4 +27,4 @@ HttpTransport::builder().header("x-custom", "custom-val").build()
 
 ## 关键上下文
 
-- `http/mod.rs`：`HttpBuilder` 构造 HTTP transport
+- `http/mod.rs`：`HttpTransportBackend::builder()` 返回 `TransportBuilder<HttpTransportBackend>`（链式 `.header()` / `.build()`）

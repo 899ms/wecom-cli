@@ -9,8 +9,8 @@
 //! - **token refresh**：命中 853004 时经 botid+signature 静默换 token、落盘并重试一次。
 //!
 //! 网关扁平协议（`{errcode, errmsg, results_json}`）由本模块定义
-//! （[`envelope::FlatApiResponse`] / [`envelope::validate_flat_api_response`] /
-//! [`envelope::NestedRes`]），并经 [`endpoint_catalog`] 注入到 Client 的
+//! （[`envelope::FlatApiResponse`] / [`envelope::NestedRes`]），并经
+//! [`endpoint_catalog`] 注入到 Client 的
 //! 内置 endpoint 目录。
 //!
 //! 模块划分：

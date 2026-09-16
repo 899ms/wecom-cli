@@ -1,27 +1,26 @@
 use serde_json::json;
 use thiserror::Error;
-use wecom_transport::trunc_display;
-
+use wecom_error::WecomError;
 // Transport error codes (E_NETWORK / E_HTTP / E_PARSE) are owned
-// by the `wecom-transport` crate. This crate delegates to them via
-// `Error::Transport`.
+// by the `wecom-transport` crate. This crate carries its errors (like any
+// other capability-bearing error) via `Error::Wrapped`.
 //
 // Error code range: 893000 - 893999, this crate uses 893000 - 893099.
 
-/// Input validation error code (missing required field, empty method path, etc.).
-pub const E_VALIDATION: i64 = 893001;
+// Shared category codes — single source of truth in `wecom_error::codes`.
+// `E_VALIDATION` / `E_IO` / `E_PERMISSION` are shared with `wecom-fs`;
+// `E_CONFIG_CLIENT` backs `MessageError::config` / [`Error::config`].
+pub use wecom_error::codes::{E_CONFIG_CLIENT, E_IO, E_PERMISSION, E_VALIDATION};
+use wecom_transport::trunc_display;
 // Method / service not found error code.
 pub const E_SUBCMD: i64 = 893002;
-/// Filesystem I/O error code.
-pub const E_IO: i64 = 893003;
 /// CLI output error code (help, version, usage error).
 pub const E_CLI: i64 = 893004;
-/// Client / builder configuration error code.
-pub const E_CONFIG_CLIENT: i64 = 893005;
-/// Permission denied error code (sandbox path violation).
-pub const E_PERMISSION: i64 = 893006;
 /// Catch-all error code for wecom-layer failures.
-pub const E_OTHER: i64 = 893999;
+///
+/// Single source of truth lives in [`wecom_error::codes`] — shared by every
+/// crate.
+pub use wecom_error::codes::E_OTHER;
 
 /// 后台接口返回该错误码时，视为参数/用法错误并展示当前命令的 help。
 ///
@@ -34,29 +33,20 @@ pub const ERRCODE_SHOW_HELP: i64 = 10021;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// Transport-layer error (network, HTTP, parse, API, other).
+    /// Capability-carrying wrapper for errors retained behind a trait object.
     ///
-    /// The manual [`From<wecom_transport::Error>`] impl (not `#[from]`)
-    /// additionally recovers wecom-layer errors that round-tripped through
-    /// [`wecom_transport::Error::Other`] — see [`crate::util::to_transport_error`].
-    Transport(#[source] wecom_transport::Error),
-
-    /// Input validation failed (e.g. missing required field, empty method path).
-    Validation(String),
-
-    /// Client / builder configuration error (e.g. invalid access token,
-    /// unknown transport type, malformed config file).
-    Config(String),
-
-    /// Permission denied (e.g. path outside sandbox roots).
-    Permission(String),
-
-    /// I/O errors (filesystem, temp files, etc.).
-    Io {
-        message: String,
-        #[source]
-        source: std::io::Error,
-    },
+    /// Transport-layer errors (network, HTTP, parse, API, …) arrive here via
+    /// [`From<wecom_transport::Error>`]; higher-layer errors round-tripping
+    /// through transport callbacks arrive nested inside
+    /// [`wecom_transport::Error::Wrapped`]. Either way the payload keeps its
+    /// full [`WecomError`] capability set, so `code()` / `error_type()` /
+    /// `to_json()` / `render()` delegate straight through — no downcast
+    /// required for rendering or reporting.
+    ///
+    /// When the concrete type is genuinely needed (handing an error back into
+    /// a transport callback, or matching a transport variant structurally),
+    /// recover it via [`WecomError::as_any`] / [`WecomError::into_any`].
+    Wrapped(Box<dyn WecomError>),
 
     /// Pre-rendered CLI output (e.g. `--help`, `--version`, or usage error).
     ///
@@ -73,62 +63,89 @@ pub enum Error {
         #[source]
         source: Option<clap::Error>,
     },
-
-    /// Catch-all for errors that don't fit other variants.
-    Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<std::io::Error> for Error {
+    /// Raw I/O errors are carried by [`wecom_fs::Error::Io`] (the I/O taxonomy
+    /// owner), wrapped capability-preserving.
     fn from(e: std::io::Error) -> Self {
-        Error::Io {
-            message: e.to_string(),
-            source: e,
-        }
+        Error::Wrapped(Box::new(wecom_fs::Error::from(e)))
+    }
+}
+
+impl From<wecom_fs::Error> for Error {
+    /// Fs errors share this crate's taxonomy and codes (the `E_VALIDATION` /
+    /// `E_PERMISSION` / `E_IO` constants in `wecom_error::codes` are theirs),
+    /// so they are wrapped capability-preserving — no variant-by-variant
+    /// flattening, and future fs variants keep their codes for free.
+    fn from(e: wecom_fs::Error) -> Self {
+        Error::Wrapped(Box::new(e))
     }
 }
 
 impl From<wecom_transport::Error> for Error {
-    /// Recover wecom-layer errors that round-tripped through the transport
-    /// boundary: [`crate::util::to_transport_error`] boxes non-`Transport`
-    /// variants into [`wecom_transport::Error::Other`] (payload factories must
-    /// return transport errors), and downcasting here restores the original
-    /// variant so `code` / `type` / structured rendering survive the trip.
-    /// Foreign `Other` payloads (plain strings, reqwest internals) keep the
-    /// `Transport` wrapper unchanged.
+    /// Carry a transport error as an [`Error::Wrapped`] payload. Higher-layer
+    /// errors that round-tripped through the transport arrive as
+    /// [`wecom_transport::Error::Wrapped`] and simply nest one level
+    /// deeper — capabilities delegate through the whole chain unchanged, so
+    /// no `downcast` is needed for rendering / reporting. Recover the concrete
+    /// type with [`WecomError::as_any`] when structural inspection is
+    /// genuinely required.
     fn from(e: wecom_transport::Error) -> Self {
-        match e {
-            wecom_transport::Error::Other(inner) => match inner.downcast::<Error>() {
-                Ok(original) => *original,
-                Err(other) => Error::Transport(wecom_transport::Error::Other(other)),
-            },
-            other => Error::Transport(other),
-        }
+        Error::Wrapped(Box::new(e))
     }
 }
 
 impl Error {
-    /// Create an `Io` variant with the `context` followed by the error reason.
+    /// Input validation failed (missing required field, empty method path, …).
+    ///
+    /// Carried by a wrapped [`wecom_error::MessageError`] (`ValidationError`
+    /// / `E_VALIDATION`).
+    #[must_use]
+    pub fn validation(message: impl Into<String>) -> Self {
+        Error::Wrapped(Box::new(wecom_error::MessageError::validation(message)))
+    }
+
+    /// Client / builder configuration error (invalid access token, unknown
+    /// transport type, malformed config file, …).
+    ///
+    /// Carried by a wrapped [`wecom_error::MessageError`] (`ConfigError` /
+    /// `E_CONFIG_CLIENT`).
+    #[must_use]
+    pub fn config(message: impl Into<String>) -> Self {
+        Error::Wrapped(Box::new(wecom_error::MessageError::config(message)))
+    }
+
+    /// Create an I/O error (a wrapped [`wecom_fs::Error::Io`]) with the
+    /// `context` followed by the error reason.
     ///
     /// Produces messages like `"Failed to open /path: No such file (os error 2)"`.
     #[must_use]
     pub fn io(context: impl std::fmt::Display, source: std::io::Error) -> Self {
-        Error::Io {
-            message: format!("{context}: {source}"),
-            source,
-        }
+        Error::Wrapped(Box::new(wecom_fs::Error::io(context, source)))
     }
 
-    /// Convert this error into a structured JSON [`Value`].
+    /// Catch-all for errors that don't fit the other constructors: wraps the
+    /// payload in [`wecom_error::OtherError`] behind [`Error::Wrapped`]
+    /// (`UnknownError` / `E_OTHER`).
     ///
-    /// - `Transport` → delegates to [`wecom_transport::Error::to_json`]
-    ///   (each inner variant produces its own JSON shape; `Api` returns the
-    ///   raw server body).
+    /// The concrete `Box<dyn Error>` parameter keeps call sites unambiguous.
+    #[must_use]
+    pub fn other(payload: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Error::Wrapped(Box::new(wecom_error::OtherError(payload)))
+    }
+
+    /// Convert this error into a structured JSON [`Value`](serde_json::Value).
+    ///
+    /// - `Wrapped` → delegates to the payload's own `to_json` (a
+    ///   `wecom_transport::Error` payload produces its per-variant shape;
+    ///   `Api` returns the raw server body).
     /// - `CliOutput` → `{"error": {"code": …, "message": …}}`.
     /// - All other variants → structured JSON with `type`, `message`, `code`.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Error::Transport(inner) => inner.to_json(),
+            Error::Wrapped(inner) => inner.to_json(),
 
             Error::CliOutput {
                 code,
@@ -144,66 +161,23 @@ impl Error {
                     "exit_code": code,
                 },
             }),
-
-            Error::Validation(message) => json!({
-                "error": {
-                    "type": "ValidationError",
-                    "code": self.code(),
-                    "message": message,
-                },
-            }),
-
-            Error::Config(message) => json!({
-                "error": {
-                    "type": "ConfigError",
-                    "code": self.code(),
-                    "message": message,
-                },
-            }),
-
-            Error::Permission(message) => json!({
-                "error": {
-                    "type": "PermissionError",
-                    "code": self.code(),
-                    "message": message,
-                },
-            }),
-
-            Error::Io { message, source } => json!({
-                "error": {
-                    "type": "IOError",
-                    "code": self.code(),
-                    "message": message,
-                    "kind": format!("{:?}", source.kind()),
-                },
-            }),
-
-            Error::Other(e) => json!({
-                "error": {
-                    "type": "UnknownError",
-                    "code": self.code(),
-                    "message": e.to_string(),
-                },
-            }),
         }
     }
 
     /// Render the error as a ready-to-display string.
     ///
-    /// - `Transport` → delegates to [`wecom_transport::Error::render`]
-    ///   (structured JSON per inner variant; `Api` returns the raw body).
+    /// - `Wrapped` → delegates to the payload's own `render` (a
+    ///   `wecom_transport::Error` payload renders its per-variant JSON;
+    ///   `Api` returns the raw body).
     /// - `CliOutput` → returns the pre-rendered `message` as-is
     ///   (the `source` clap error is intentionally ignored — the rendered
     ///   text already contains all user-facing information).
-    /// - All other variants → pretty-printed JSON via [`Error::to_json`].
     #[must_use]
     pub fn render(&self) -> String {
         match self {
-            Error::Transport(inner) => return inner.render(),
-            Error::CliOutput { message, .. } => return message.clone(),
-            _ => {}
+            Error::Wrapped(inner) => inner.render(),
+            Error::CliOutput { message, .. } => message.clone(),
         }
-        serde_json::to_string_pretty(&self.to_json()).unwrap_or_else(|_| self.to_string())
     }
 
     /// Suggested process exit code.
@@ -220,38 +194,70 @@ impl Error {
 
     /// Category error code for this variant.
     ///
-    /// Returns one of the `E_*` constants. For [`Error::Transport`] this
-    /// delegates to [`wecom_transport::Error::code`], which maps each inner
-    /// variant to `E_NETWORK` / `E_HTTP` / `E_PARSE` /
-    /// `E_OTHER`. For [`wecom_transport::Error::Api`] this passes through
-    /// the backend error code directly (defaults to 0).
+    /// Returns one of the `E_*` constants. For [`Error::Wrapped`] this
+    /// delegates to the payload's own `code` — a `wecom_transport::Error`
+    /// payload maps each inner variant to `E_NETWORK` / `E_HTTP` / `E_PARSE` /
+    /// `E_OTHER`, and [`wecom_transport::Error::Api`] passes the
+    /// backend error code through directly (defaults to 0).
     #[must_use]
     pub fn code(&self) -> i64 {
         match self {
-            Error::Transport(inner) => inner.code(),
-            Error::Validation(_) => E_VALIDATION,
-            Error::Permission(_) => E_PERMISSION,
-            Error::Config(_) => E_CONFIG_CLIENT,
-            Error::Io { .. } => E_IO,
+            Error::Wrapped(inner) => inner.code(),
             Error::CliOutput { source, .. } => match source.as_ref().map(|e| e.kind()) {
                 Some(clap::error::ErrorKind::InvalidSubcommand) => E_SUBCMD,
                 _ => E_CLI,
             },
-            Error::Other(_) => E_OTHER,
         }
     }
 
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Error::Transport(inner) => inner.message(),
-            Error::Validation(message) => message.clone(),
-            Error::Permission(message) => message.clone(),
-            Error::Config(message) => message.clone(),
-            Error::Io { message, .. } => message.clone(),
+            Error::Wrapped(inner) => inner.message(),
             Error::CliOutput { message, .. } => message.clone(),
-            Error::Other(e) => e.to_string(),
         }
+    }
+}
+
+impl WecomError for Error {
+    fn code(&self) -> i64 {
+        Error::code(self)
+    }
+
+    fn message(&self) -> String {
+        Error::message(self)
+    }
+
+    fn error_type(&self) -> &'static str {
+        match self {
+            Error::Wrapped(inner) => inner.error_type(),
+            Error::CliOutput { .. } => "CliOutput",
+        }
+    }
+
+    // The `CliOutput` variant embeds both a numeric exit code and a
+    // pre-rendered message, neither of which matches the trait's 3-key
+    // default shape, so we delegate to the inherent implementation.
+    fn to_json(&self) -> serde_json::Value {
+        Error::to_json(self)
+    }
+
+    // `CliOutput` renders as the caller-supplied message verbatim
+    // (already colored), so the inherent `render` is preserved.
+    fn render(&self) -> String {
+        Error::render(self)
+    }
+
+    fn exit_code(&self) -> i32 {
+        Error::exit_code(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 
@@ -259,20 +265,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let code = self.code();
         match self {
-            Error::Transport(inner) => write!(f, "{inner}"),
-            Error::Validation(msg) => {
-                write!(f, "ValidationError: {msg} [code={code}]")
-            }
-            Error::Config(msg) => {
-                write!(f, "ConfigError: {msg} [code={code}]")
-            }
-            Error::Permission(msg) => {
-                write!(f, "PermissionError: {msg} [code={code}]")
-            }
-            Error::Io { message, source } => {
-                let kind = format!("{:?}", source.kind());
-                write!(f, "IoError: {message} [code={code}, kind={kind}]")
-            }
+            // Transparent passthrough: the payload already renders its own
+            // `[code=…]` tail; appending another one would stack duplicates.
+            Error::Wrapped(inner) => write!(f, "{inner}"),
             Error::CliOutput {
                 code: exit_code,
                 message,
@@ -286,9 +281,6 @@ impl std::fmt::Display for Error {
                     "CliOutput: {message} [code={code}, exit={exit_code}, kind={kind_display}]"
                 )
             }
-            Error::Other(e) => {
-                write!(f, "UnknownError: {e} [code={code}]")
-            }
         }
     }
 }
@@ -298,29 +290,30 @@ mod tests {
     //! ## 模块摘要：Error（统一错误类型）
     //!
     //! ### 关键接口
-    //! - [Error::to_json] — 将错误转换为结构化 JSON Value（Transport 委托
-    //!   wecom_transport::Error::to_json）
+    //! - [Error::to_json] — 将错误转换为结构化 JSON Value（Wrapped 委托负载
+    //!   自身的 to_json，transport 负载保持其各变体形状）
     //! - [Error::render] — 将错误渲染为可展示字符串（JSON 或预渲染消息）；
     //!   对 JSON 变体内部调用 [to_json] 后格式化
     //! - [Error::exit_code] — 返回建议的进程退出码（CliOutput 用自身 code，其余为 1）
-    //! - [Error::code] — 返回该错误对应的 893xxx 分类码（Transport 子变体映射到 E_NETWORK/E_HTTP/E_PARSE/E_OTHER，Api 直接透传后台错误码）
-    //! - `From<std::io::Error> for Error` — 将 io::Error 自动转换为 Error::Io 变体
-    //! - `From<wecom_transport::Error> for Error` — Transport 变体透传；`Other` 内
-    //!   经 [crate::util::to_transport_error] 装箱的 wecom::Error 负载 downcast 还原
+    //! - [Error::code] — 返回该错误对应的 893xxx 分类码（Wrapped 委托负载 code：
+    //!   transport 子变体映射到 E_NETWORK/E_HTTP/E_PARSE/E_OTHER，Api 直接透传后台错误码）
+    //! - `From<std::io::Error> for Error` — 将 io::Error 装箱为 Wrapped(fs Io 变体)
+    //! - `From<wecom_transport::Error> for Error` — 装箱为 Wrapped 变体（保留
+    //!   完整能力集）；经 [crate::util::to_transport_error] 往返的 wecom::Error
+    //!   负载嵌套为 Wrapped(Wrapped(inner))，能力沿链逐级委托（无 downcast）
     //!
     //! ### 关键分支与异常路径
-    //! - From<transport>：Other(boxed wecom::Error) → 还原原始变体（code/type 恢复）；
-    //!   Other(外部负载) / 其余变体 → 保持 Error::Transport 包装
-    //! - to_json：Transport 委托内层；CliOutput 返回结构化 JSON（含 code/type/字段）
-    //! - render：Transport 委托内层 render；CliOutput 直接返回预渲染 message（忽略 source）；其余调用 to_json → to_string_pretty
+    //! - From<transport>：一律装箱为 Error::Wrapped；code/type/message 经委托透传
+    //! - to_json：Wrapped 委托负载；CliOutput 返回结构化 JSON（含 code/type/字段）
+    //! - render：Wrapped 委托负载 render；CliOutput 直接返回预渲染 message（忽略 source）；其余调用 to_json → to_string_pretty
     //! - exit_code：CliOutput 返回 code 字段，其他变体统一返回 1
-    //! - code：Transport(Api) 直接透传后台错误码（无则默认 0）；未知 Transport 变体兜底 E_OTHER
-    //! - From impl：io::Error 包装为 Error::Io { message, source }
+    //! - code：Wrapped 内的 Api 直接透传后台错误码（无则默认 0）；Other 负载兜底 E_OTHER
+    //! - From impl：io::Error / wecom_fs::Error 装箱为 Wrapped（fs 承载 Io/Permission 分类）
     //! - Validation：CLI 用户输入校验失败；Config：ClientBuilder 配置 / 环境变量 / 配置文件格式错误
     //!
     //! ### 上下游交互
     //! - 上游：整个 wecom crate 各模块通过 `?` 操作符产生 Error；CliOutput 由 [crate::client::run] 在 clap 解析失败时构造，并把原始 `clap::Error` 放入 `source`
-    //! - 下游：依赖 wecom_transport::Error（Transport 变体）、std::io::Error（Io 变体）、clap::Error（CliOutput.source 字段）
+    //! - 下游：依赖 wecom_transport::Error / wecom_fs::Error（Wrapped 负载的主要来源）、clap::Error（CliOutput.source 字段）
 
     use assert_json_diff::assert_json_eq;
     use serde_json::Value;
@@ -329,14 +322,42 @@ mod tests {
 
     use super::*;
 
+    // ── 码段范围门禁 ──
+
+    /// P0：本 crate 分配的专属码全部落在 wecom 码段（893000-893099）内
+    ///
+    /// 与 [`wecom_error::codes::range::WECOM`] 保持一致；`E_OTHER` 是
+    /// 全 workspace 共享的兜底码（893999），不在 crate 专属段内，故排除。
+    /// wecom 新增专属错误码时若落在段外，本测试失败而非静默越界。
+    #[test]
+    fn crate_owned_codes_stay_in_wecom_range() {
+        let owned = [
+            E_VALIDATION,
+            E_SUBCMD,
+            E_IO,
+            E_CLI,
+            E_CONFIG_CLIENT,
+            E_PERMISSION,
+        ];
+        let range = wecom_error::codes::range::WECOM;
+        for code in owned {
+            assert!(
+                range.contains(&code),
+                "wecom-owned code {code} escapes range {range:?}"
+            );
+        }
+        // 共享兜底码不受 crate 专属段约束（此处仅为「确实共享」的防回归断言）
+        assert_eq!(E_OTHER, 893999);
+    }
+
     // ── render() ──
 
     /// P0：Validation 错误的 render 输出包含正确的类型、消息和错误码
-    /// 条件：创建 Error::Validation("field is required")
+    /// 条件：创建 Error::validation("field is required")
     /// 断言：JSON 结构为 {"error": {"type":"ValidationError","code":893001,"message":"field is required"}}
     #[test]
     fn render_validation() {
-        let e = Error::Validation("field is required".into());
+        let e = Error::validation("field is required");
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v,
@@ -351,11 +372,11 @@ mod tests {
     }
 
     /// P0：Config 错误的 render 输出包含正确的类型、消息和错误码
-    /// 条件：创建 Error::Config("invalid transport type")
+    /// 条件：创建 Error::config("invalid transport type")
     /// 断言：JSON 结构为 {"error": {"type":"ConfigError","code":893005,"message":"invalid transport type"}}
     #[test]
     fn render_config() {
-        let e = Error::Config("invalid transport type".into());
+        let e = Error::config("invalid transport type");
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v,
@@ -369,12 +390,12 @@ mod tests {
         );
     }
 
-    /// P0：Permission 错误的 render 输出包含正确的类型、消息和错误码
-    /// 条件：创建 Error::Permission("路径超出沙箱")
+    /// P0：Permission 错误（Wrapped 包裹 fs 变体）的 render 输出包含正确的类型、消息和错误码
+    /// 条件：由 wecom_fs::Error::Permission("路径超出沙箱") 转换
     /// 断言：JSON 结构为 {"error": {"type":"PermissionError","code":893006,"message":"路径超出沙箱"}}
     #[test]
     fn render_permission() {
-        let e = Error::Permission("路径超出沙箱".into());
+        let e: Error = wecom_fs::Error::Permission("路径超出沙箱".into()).into();
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v,
@@ -388,12 +409,14 @@ mod tests {
         );
     }
 
-    /// P1：网络错误（Transport::Other）的 render 输出包含原始消息
-    /// 条件：创建 Transport::Error::Other("connection refused")
+    /// P1：网络错误（Wrapped 包裹的 transport Other）的 render 输出包含原始消息
+    /// 条件：创建 Wrapped(transport::Error::other("connection refused"))
     /// 断言：render 结果的 message 字段匹配 "connection refused"
     #[test]
     fn render_network() {
-        let e = Error::Transport(wecom_transport::Error::Other("connection refused".into()));
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::other(
+            "connection refused".into(),
+        )));
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v["error"]["message"],
@@ -402,15 +425,15 @@ mod tests {
     }
 
     /// P1：HTTP 错误的 render 输出包含类型、状态码和 endpoint
-    /// 条件：创建 Transport::Error::Http，status=404，endpoint 为 example.com/api
+    /// 条件：创建 Wrapped(transport::Error::Http)，status=404，endpoint 为 example.com/api
     /// 断言：JSON 结构为 {"error":{"type":"HTTPError","code":893102,"message":"not found","endpoint":"https://example.com/api","status":404}}
     #[test]
     fn render_http() {
-        let e = Error::Transport(wecom_transport::Error::Http {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::Http {
             message: "not found".into(),
             endpoint: "https://example.com/api".into(),
             status: 404,
-        });
+        }));
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v,
@@ -427,30 +450,31 @@ mod tests {
     }
 
     /// P1：API 错误的 render 直接返回原始响应体
-    /// 条件：创建 Transport::Error::Api，body 含 errcode 和 errmsg
+    /// 条件：创建 Wrapped(transport::Error::Api)，body 含 errcode 和 errmsg
     /// 断言：render 结果等于原始 body JSON
     #[test]
     fn render_api_returns_body() {
         let body = serde_json::json!({"errcode":40001,"errmsg":"invalid credential"});
-        let e = Error::Transport(wecom_transport::Error::Api {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::Api {
             message: "invalid credential".into(),
             action: "test".into(),
             code: Some(40001),
             body: Box::new(body.clone()),
-        });
+        }));
         let rendered: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(rendered, body);
     }
 
-    /// P0：IO 错误的 render 输出包含 type、message 和 kind
-    /// 条件：创建 Error::Io，message 为 "disk full"
+    /// P0：IO 错误（Wrapped 包裹 fs 变体）的 render 输出包含 type、message 和 kind
+    /// 条件：由 wecom_fs::Error::Io 转换，message 为 "disk full"
     /// 断言：JSON 中 type 为 IOError，message 和 kind 匹配
     #[test]
     fn render_io() {
-        let e = Error::Io {
+        let e: Error = wecom_fs::Error::Io {
             message: "disk full".into(),
             source: std::io::Error::other("disk full"),
-        };
+        }
+        .into();
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(v["error"]["type"], serde_json::json!("IOError"));
         assert_json_eq!(v["error"]["message"], serde_json::json!("disk full"));
@@ -458,16 +482,16 @@ mod tests {
     }
 
     /// P1：解析错误的 render 输出包含类型、错误码、消息、endpoint 和 body
-    /// 条件：创建 Transport::Error::Parse，消息为 "missing field 'media_id'"
+    /// 条件：创建 Wrapped(transport::Error::Parse)，消息为 "missing field 'media_id'"
     /// 断言：JSON 结构含 type=ParseError, code=893103, endpoint, body
     #[test]
     fn render_parse() {
-        let e = Error::Transport(wecom_transport::Error::Parse {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::Parse {
             message: "missing field 'media_id'".into(),
             endpoint: "test".into(),
             body: Box::new(serde_json::json!({"unexpected":"data"})),
             source: None,
-        });
+        }));
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v,
@@ -483,12 +507,14 @@ mod tests {
         );
     }
 
-    /// P1：Transport::Other 错误的 render 输出含 type=UnknownError
-    /// 条件：创建 Transport::Error::Other("something went wrong")
+    /// P1：Wrapped 包裹的 transport Other 错误的 render 输出含 type=UnknownError
+    /// 条件：创建 Wrapped(transport::Error::other("something went wrong"))
     /// 断言：message 匹配，且 type 为 UnknownError
     #[test]
     fn render_other() {
-        let e = Error::Transport(wecom_transport::Error::Other("something went wrong".into()));
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::other(
+            "something went wrong".into(),
+        )));
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v["error"]["message"],
@@ -556,35 +582,31 @@ mod tests {
     }
 
     /// P1：[Error::exit_code] 非 CliOutput 错误统一返回退出码 1
-    /// 条件：分别创建 Validation 和 Transport::Other 错误
+    /// 条件：分别创建 Validation 和 Wrapped(transport::Other) 错误
     /// 断言：exit_code 均为 1
     #[test]
     fn exit_code_non_cli_output_is_1() {
-        assert_eq!(Error::Validation("x".into()).exit_code(), 1);
+        assert_eq!(Error::validation("x").exit_code(), 1);
         assert_eq!(
-            Error::Transport(wecom_transport::Error::Other("x".into())).exit_code(),
+            Error::Wrapped(Box::new(wecom_transport::Error::other("x".into()))).exit_code(),
             1
         );
     }
 
     // ── code() ──
 
-    /// P0：[Error::code] 顶层非 Transport 变体返回各自的分类码
-    /// 条件：分别构造 Validation / Permission / Config / Io / CliOutput / Other
+    /// P0：[Error::code] 顶层变体与 fs 包裹错误返回各自的分类码
+    /// 条件：分别构造 Validation / Config / CliOutput / Other，以及 fs 包裹的 Permission / Io
     /// 断言：code() 分别返回对应分类码
     #[test]
     fn code_top_level_variants() {
-        assert_eq!(Error::Validation("x".into()).code(), E_VALIDATION);
-        assert_eq!(Error::Permission("x".into()).code(), E_PERMISSION);
-        assert_eq!(Error::Config("x".into()).code(), E_CONFIG_CLIENT);
+        assert_eq!(Error::validation("x").code(), E_VALIDATION);
+        assert_eq!(Error::config("x").code(), E_CONFIG_CLIENT);
         assert_eq!(
-            Error::Io {
-                message: "x".into(),
-                source: std::io::Error::other("x"),
-            }
-            .code(),
-            E_IO
+            Error::from(wecom_fs::Error::Permission("x".into())).code(),
+            E_PERMISSION
         );
+        assert_eq!(Error::from(std::io::Error::other("x")).code(), E_IO);
         assert_eq!(
             Error::CliOutput {
                 code: 0,
@@ -594,71 +616,72 @@ mod tests {
             .code(),
             E_CLI
         );
-        assert_eq!(Error::Other("x".into()).code(), E_OTHER);
+        assert_eq!(Error::other("x".into()).code(), E_OTHER);
     }
 
-    /// P0：[Error::code] Transport 子变体映射到正确分类码
-    /// 条件：分别构造 Transport(Http) / Transport(Parse) / Transport(Api) / Transport(Other)
+    /// P0：[Error::code] Wrapped 包裹的 transport 子变体经委托映射到正确分类码
+    /// 条件：分别构造 Wrapped(Http) / Wrapped(Parse) / Wrapped(Api) / Wrapped(Other)
     /// 断言：code() 分别返回 E_HTTP / E_PARSE / 透传后台错误码 / E_OTHER
     #[test]
-    fn code_transport_variants() {
+    fn code_wrapped_transport_variants() {
         assert_eq!(
-            Error::Transport(wecom_transport::Error::Http {
+            Error::Wrapped(Box::new(wecom_transport::Error::Http {
                 message: "x".into(),
                 endpoint: "http://e".into(),
                 status: 500,
-            })
+            }))
             .code(),
             E_HTTP
         );
         assert_eq!(
-            Error::Transport(wecom_transport::Error::Parse {
+            Error::Wrapped(Box::new(wecom_transport::Error::Parse {
                 message: "x".into(),
                 endpoint: "/e".into(),
                 body: Box::new(serde_json::Value::Null),
                 source: None,
-            })
+            }))
             .code(),
             E_PARSE
         );
         // Api should pass through the backend error code directly.
         assert_eq!(
-            Error::Transport(wecom_transport::Error::Api {
+            Error::Wrapped(Box::new(wecom_transport::Error::Api {
                 message: "x".into(),
                 action: "/a".into(),
                 code: Some(40001),
                 body: Box::new(serde_json::Value::Null),
-            })
+            }))
             .code(),
             40001
         );
         // Api with no code defaults to 0.
         assert_eq!(
-            Error::Transport(wecom_transport::Error::Api {
+            Error::Wrapped(Box::new(wecom_transport::Error::Api {
                 message: "x".into(),
                 action: "/a".into(),
                 code: None,
                 body: Box::new(serde_json::Value::Null),
-            })
+            }))
             .code(),
             0
         );
         assert_eq!(
-            Error::Transport(wecom_transport::Error::Other("x".into())).code(),
+            Error::Wrapped(Box::new(wecom_transport::Error::other("x".into()))).code(),
             E_OTHER
         );
     }
 
     // ── From impls ──
 
-    /// P0：std::io::Error 到 Error::Io 的 From 转换
+    /// P0：std::io::Error 经 From 装箱为 Wrapped（负载为 fs Io 变体）
     /// 条件：创建 NotFound 类型的 io::Error 并通过 .into() 转换
-    /// 断言：转换结果匹配 Error::Io 变体，message 为原 io::Error 消息
+    /// 断言：结果为 Wrapped，code == E_IO，message 为原 io::Error 消息
     #[test]
     fn from_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let e: Error = io_err.into();
-        assert!(matches!(e, Error::Io { .. }));
+        assert!(matches!(e, Error::Wrapped(_)));
+        assert_eq!(e.code(), E_IO);
         assert_eq!(e.exit_code(), 1);
         assert_eq!(e.message(), "no such file");
     }
@@ -666,11 +689,11 @@ mod tests {
     // ── to_json() ──
 
     /// P0：[Error::to_json] Validation 错误返回正确的 type、message 和 code
-    /// 条件：Error::Validation("field is required")
+    /// 条件：Error::validation("field is required")
     /// 断言：to_json() 含 type=ValidationError、code=E_VALIDATION、message 透传
     #[test]
     fn to_json_validation() {
-        let e = Error::Validation("field is required".into());
+        let e = Error::validation("field is required");
         assert_eq!(
             e.to_json(),
             json!({
@@ -684,11 +707,11 @@ mod tests {
     }
 
     /// P0：[Error::to_json] Config 错误返回正确的 type、message 和 code
-    /// 条件：Error::Config("invalid transport type")
+    /// 条件：Error::config("invalid transport type")
     /// 断言：to_json() 含 type=ConfigError、code=E_CONFIG_CLIENT、message 透传
     #[test]
     fn to_json_config() {
-        let e = Error::Config("invalid transport type".into());
+        let e = Error::config("invalid transport type");
         assert_eq!(
             e.to_json(),
             json!({
@@ -701,12 +724,12 @@ mod tests {
         );
     }
 
-    /// P0：[Error::to_json] Permission 错误返回正确的 type、message 和 code
-    /// 条件：Error::Permission("路径超出沙箱")
-    /// 断言：to_json() 含 type=PermissionError、code=E_PERMISSION、message 透传
+    /// P0：[Error::to_json] Permission 错误（fs 包裹）返回正确的 type、message 和 code
+    /// 条件：由 wecom_fs::Error::Permission 转换
+    /// 断言：to_json() 的 error 对象含 PermissionError 类型、消息与 code
     #[test]
     fn to_json_permission() {
-        let e = Error::Permission("路径超出沙箱".into());
+        let e: Error = wecom_fs::Error::Permission("路径超出沙箱".into()).into();
         assert_eq!(
             e.to_json(),
             json!({
@@ -719,15 +742,16 @@ mod tests {
         );
     }
 
-    /// P0：[Error::to_json] IO 错误返回正确的 type、message、code 和 kind
-    /// 条件：Error::Io { message:"disk full", source: io::Error::other("disk full") }
-    /// 断言：to_json() 含 type=IOError、code=E_IO、message 与 kind=Other
+    /// P0：[Error::to_json] IO 错误（fs 包裹）返回正确的 type、message、code 和 kind
+    /// 条件：由含 io::ErrorKind 的 fs Io 变体转换
+    /// 断言：to_json() 含 IOError 类型、消息、code 与 kind
     #[test]
     fn to_json_io() {
-        let e = Error::Io {
+        let e: Error = wecom_fs::Error::Io {
             message: "disk full".into(),
             source: std::io::Error::other("disk full"),
-        };
+        }
+        .into();
         assert_eq!(
             e.to_json(),
             json!({
@@ -742,11 +766,11 @@ mod tests {
     }
 
     /// P1：[Error::to_json] Other 错误返回正确的 code、message 和 type
-    /// 条件：Error::Other("something went wrong")
-    /// 断言：to_json() 含 type=UnknownError、code=E_OTHER、message 透传
+    /// 条件：构造 Error::other(自定义错误)
+    /// 断言：to_json() 含 OtherError 类型、消息与 code
     #[test]
     fn to_json_other() {
-        let e = Error::Other("something went wrong".into());
+        let e = Error::other("something went wrong".into());
         assert_eq!(
             e.to_json(),
             json!({
@@ -783,16 +807,16 @@ mod tests {
         );
     }
 
-    /// P1：[Error::to_json] Transport(Http) 委托内层 to_json，保留 type=HTTPError
-    /// 条件：Transport(wecom_transport::Error::Http { status:404, endpoint:"https://example.com/api" })
-    /// 断言：to_json() 含 type=HTTPError、code=E_HTTP、status=404、endpoint 透传
+    /// P1：[Error::to_json] Wrapped(Http) 委托负载 to_json，保留 type=HTTPError
+    /// 条件：构造 Wrapped(Http) 变体
+    /// 断言：to_json() 委托负载且 type 保持 HTTPError
     #[test]
-    fn to_json_transport_http() {
-        let e = Error::Transport(wecom_transport::Error::Http {
+    fn to_json_wrapped_http() {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::Http {
             message: "not found".into(),
             endpoint: "https://example.com/api".into(),
             status: 404,
-        });
+        }));
         assert_eq!(
             e.to_json(),
             json!({
@@ -807,18 +831,18 @@ mod tests {
         );
     }
 
-    /// P1：[Error::to_json] Transport(Api) 委托内层 to_json，返回原始 body
-    /// 条件：Transport(wecom_transport::Error::Api { code:40001, body:{errcode,errmsg} })
-    /// 断言：to_json() 直接等于原始 body（无 {error:{}} 包裹）
+    /// P1：[Error::to_json] Wrapped(Api) 委托负载 to_json，返回原始 body
+    /// 条件：构造 Wrapped(Api) 变体
+    /// 断言：to_json() 返回负载原始 body
     #[test]
-    fn to_json_transport_api_returns_body() {
+    fn to_json_wrapped_api_returns_body() {
         let body = serde_json::json!({"errcode": 40001, "errmsg": "invalid credential"});
-        let e = Error::Transport(wecom_transport::Error::Api {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::Api {
             message: "invalid credential".into(),
             action: "test".into(),
             code: Some(40001),
             body: Box::new(body.clone()),
-        });
+        }));
         let rendered = e.to_json();
         assert_eq!(rendered, body);
     }
@@ -870,11 +894,11 @@ mod tests {
     // ── render() for top-level Other ──
 
     /// P1：[Error::render] 顶层 Error::Other 输出包含 type=UnknownError
-    /// 条件：构造 Error::Other("unexpected failure")
+    /// 条件：构造 Error::other("unexpected failure")
     /// 断言：render 输出 JSON 含 UnknownError type 和正确的 code
     #[test]
     fn render_top_level_other() {
-        let e = Error::Other("unexpected failure".into());
+        let e = Error::other("unexpected failure".into());
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(v["error"]["type"], serde_json::json!("UnknownError"));
         assert_json_eq!(
@@ -892,18 +916,17 @@ mod tests {
     #[test]
     fn message_all_variants() {
         assert_eq!(
-            Error::Validation("invalid input".into()).message(),
+            Error::validation("invalid input").message(),
             "invalid input"
         );
-        assert_eq!(Error::Config("bad config".into()).message(), "bad config");
-        assert_eq!(Error::Permission("denied".into()).message(), "denied");
+        assert_eq!(Error::config("bad config").message(), "bad config");
         assert_eq!(
-            Error::Io {
-                message: "disk error".into(),
-                source: std::io::Error::other("e"),
-            }
-            .message(),
-            "disk error"
+            Error::from(wecom_fs::Error::Permission("denied".into())).message(),
+            "denied"
+        );
+        assert_eq!(
+            Error::io("disk error", std::io::Error::other("e")).message(),
+            "disk error: e"
         );
         assert_eq!(
             Error::CliOutput {
@@ -914,32 +937,32 @@ mod tests {
             .message(),
             "cli msg"
         );
-        assert_eq!(Error::Other("other error".into()).message(), "other error");
+        assert_eq!(Error::other("other error".into()).message(), "other error");
     }
 
-    /// P1：[Error::message] Transport 变体委托内层 message
-    /// 条件：Transport(wecom_transport::Error::Http { message:"not found", status:404 })
-    /// 断言：message() == "not found"
+    /// P1：[Error::message] Wrapped 变体委托负载 message
+    /// 条件：构造 Wrapped(transport Http 错误)
+    /// 断言：message() 委托负载消息
     #[test]
-    fn message_transport_variant() {
-        let e = Error::Transport(wecom_transport::Error::Http {
+    fn message_wrapped_variant() {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::Http {
             message: "not found".into(),
             endpoint: "/api".into(),
             status: 404,
-        });
+        }));
         assert_eq!(e.message(), "not found");
     }
 
     // ── Error::io() 构造器 ──
 
-    /// P0：[Error::io] 便利构造器生成带 context 前缀的 Io 变体
-    /// 条件：Error::io("Failed to open /path", io::Error::new(NotFound, "no such file"))
-    /// 断言：匹配 Error::Io；message()=="Failed to open /path: no such file"；code()==E_IO
+    /// P0：[Error::io] 便利构造器生成带 context 前缀的 Wrapped(fs Io) 错误
+    /// 条件：Error::io("ctx", io::Error)
+    /// 断言：生成的错误消息含 "ctx" 前缀，code == E_IO
     #[test]
     fn io_constructor_with_context() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let e = Error::io("Failed to open /path", io_err);
-        assert!(matches!(e, Error::Io { .. }));
+        assert!(matches!(e, Error::Wrapped(_)));
         assert_eq!(e.message(), "Failed to open /path: no such file");
         assert_eq!(e.code(), E_IO);
     }
@@ -947,11 +970,11 @@ mod tests {
     // ── Display impl ──
 
     /// P0：[Error::Display] Validation 变体格式化包含类型名、消息和错误码
-    /// 条件：Error::Validation("field required")
+    /// 条件：Error::validation("field required")
     /// 断言：Display 含 "ValidationError"、"field required"、code=893001
     #[test]
     fn display_validation() {
-        let e = Error::Validation("field required".into());
+        let e = Error::validation("field required");
         let s = format!("{e}");
         assert!(s.contains("ValidationError"));
         assert!(s.contains("field required"));
@@ -959,42 +982,41 @@ mod tests {
     }
 
     /// P0：[Error::Display] Config 变体格式化包含类型名、消息和错误码
-    /// 条件：Error::Config("bad transport")
+    /// 条件：Error::config("bad transport")
     /// 断言：Display 含 "ConfigError"、"bad transport"、code=893005
     #[test]
     fn display_config() {
-        let e = Error::Config("bad transport".into());
+        let e = Error::config("bad transport");
         let s = format!("{e}");
         assert!(s.contains("ConfigError"));
         assert!(s.contains("bad transport"));
         assert!(s.contains("code=893005"));
     }
 
-    /// P0：[Error::Display] Permission 变体格式化包含类型名、消息和错误码
-    /// 条件：Error::Permission("path denied")
-    /// 断言：Display 含 "PermissionError"、"path denied"、code=893006
+    /// P0：[Error::Display] Permission 错误（fs 包裹）格式化透传负载 Display
+    /// 条件：由 wecom_fs::Error::Permission 转换并格式化
+    /// 断言：to_string() 含 PermissionError 与消息
     #[test]
     fn display_permission() {
-        let e = Error::Permission("path denied".into());
+        let e: Error = wecom_fs::Error::Permission("path denied".into()).into();
         let s = format!("{e}");
         assert!(s.contains("PermissionError"));
         assert!(s.contains("path denied"));
-        assert!(s.contains("code=893006"));
     }
 
-    /// P0：[Error::Display] Io 变体格式化包含消息、错误码和 kind
-    /// 条件：Error::Io { message:"write failed", source: io::Error::new(PermissionDenied) }
-    /// 断言：Display 含 "IoError"、"write failed"、code=893003、kind=PermissionDenied
+    /// P0：[Error::Display] Io 错误（fs 包裹）格式化透传负载 Display
+    /// 条件：由含 io::ErrorKind 的 fs Io 变体转换并格式化
+    /// 断言：to_string() 含消息与 kind
     #[test]
     fn display_io() {
-        let e = Error::Io {
+        let e: Error = wecom_fs::Error::Io {
             message: "write failed".into(),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
-        };
+        }
+        .into();
         let s = format!("{e}");
         assert!(s.contains("IoError"));
         assert!(s.contains("write failed"));
-        assert!(s.contains("code=893003"));
         assert!(s.contains("kind=PermissionDenied"));
     }
 
@@ -1032,48 +1054,52 @@ mod tests {
     }
 
     /// P1：[Error::Display] UnknownError 变体包含消息和 code
-    /// 条件：Error::Other("unexpected")
+    /// 条件：Error::other("unexpected")
     /// 断言：Display 含 "UnknownError"、"unexpected"、code=893999
     #[test]
     fn display_other() {
-        let e = Error::Other("unexpected".into());
+        let e = Error::other("unexpected".into());
         let s = format!("{e}");
         assert!(s.contains("UnknownError"));
         assert!(s.contains("unexpected"));
         assert!(s.contains("code=893999"));
     }
 
-    /// P1：[Error::Display] Transport 变体委托内层 Display
-    /// 条件：Transport(wecom_transport::Error::Other("inner error"))
-    /// 断言：Display 含 "inner error"
+    /// P1：[Error::Display] Wrapped 变体透明透传负载 Display（不叠加 code 尾巴）
+    /// 条件：构造 Wrapped(transport Other 错误) 并格式化
+    /// 断言：to_string() 委托负载 Display
     #[test]
-    fn display_transport() {
-        let e = Error::Transport(wecom_transport::Error::Other("inner error".into()));
+    fn display_wrapped() {
+        let e = Error::Wrapped(Box::new(wecom_transport::Error::other(
+            "inner error".into(),
+        )));
         let s = format!("{e}");
         assert!(s.contains("inner error"));
     }
 
     // ── From<wecom_transport::Error> ──
 
-    /// P1：[From] wecom_transport::Error 自动转换为 Error::Transport
-    /// 条件：用 wecom_transport::Error::Other("wrapped") 触发 .into()
-    /// 断言：匹配 Error::Transport；message()=="wrapped"
+    /// P1：[From] wecom_transport::Error 自动装箱为 Error::Wrapped
+    /// 条件：将 wecom_transport::Error 经 ? 或 From 转为 wecom::Error
+    /// 断言：结果为 Error::Wrapped，能力委托不变
     #[test]
     fn from_transport_error() {
-        let transport_err = wecom_transport::Error::Other("wrapped".into());
+        let transport_err = wecom_transport::Error::other("wrapped".into());
         let e: Error = transport_err.into();
-        assert!(matches!(e, Error::Transport(_)));
+        assert!(matches!(e, Error::Wrapped(_)));
         assert_eq!(e.message(), "wrapped");
     }
 
-    /// P0：[From<wecom_transport::Error>] 经 to_transport_error 装箱的 Permission 错误被还原
-    /// 条件：Error::Permission 经 crate::util::to_transport_error 装箱为 transport::Other 后再经 From 转回
-    /// 断言：还原为 Error::Permission，code() == E_PERMISSION，to_json 恢复 PermissionError 结构
+    /// P0：[From<wecom_transport::Error>] 经 to_transport_error 装箱的 fs Permission 错误往返后能力不变
+    /// 条件：fs Permission 错误（经 From 包为 Wrapped）经 crate::util::to_transport_error
+    ///       装箱为 transport::Wrapped 后再经 From 转回
+    /// 断言：结果为 Error::Wrapped(_)，code() == E_PERMISSION，to_json 恢复 PermissionError 结构
     #[test]
-    fn from_transport_recovers_round_tripped_permission() {
-        let original = Error::Permission("路径超出沙箱".into());
+    fn from_transport_round_tripped_permission_keeps_capability() {
+        let original: Error = wecom_fs::Error::Permission("路径超出沙箱".into()).into();
         let round_tripped: Error = crate::util::to_transport_error(original).into();
-        assert!(matches!(round_tripped, Error::Permission(_)));
+        // 不还原变体；Wrapped 链逐级委托全部能力。
+        assert!(matches!(round_tripped, Error::Wrapped(_)));
         assert_eq!(round_tripped.code(), E_PERMISSION);
         assert_eq!(
             round_tripped.to_json(),
@@ -1085,55 +1111,62 @@ mod tests {
                 }
             })
         );
+        assert_eq!(round_tripped.message(), "路径超出沙箱");
     }
 
-    /// P0：[From<wecom_transport::Error>] 经 to_transport_error 装箱的 Io 错误被还原且 message 无重复 code 尾巴
-    /// 条件：Error::Io 经 crate::util::to_transport_error 装箱为 transport::Other 后再经 From 转回
-    /// 断言：还原为 Error::Io，code() == E_IO，message() 为原始消息（不含 Display 的 [code=…] 后缀）
+    /// P0：[From<wecom_transport::Error>] 经 to_transport_error 装箱的 Io 错误往返后能力不变且 message 无重复 code 尾巴
+    /// 条件：Error::Io 经 crate::util::to_transport_error 装箱为 transport::Wrapped 后再经 From 转回
+    /// 断言：code() == E_IO，message() 为原始消息（不含 Display 的 [code=…] 后缀）
     #[test]
-    fn from_transport_recovers_round_tripped_io() {
+    fn from_transport_round_tripped_io_keeps_capability() {
         let original = Error::io(
             "Failed to open /tmp/x",
             std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
         );
         let round_tripped: Error = crate::util::to_transport_error(original).into();
-        assert!(matches!(round_tripped, Error::Io { .. }));
         assert_eq!(round_tripped.code(), E_IO);
         assert_eq!(
             round_tripped.message(),
             "Failed to open /tmp/x: no such file"
         );
+        assert_eq!(round_tripped.to_json()["error"]["type"], "IOError");
     }
 
-    /// P1：[From<wecom_transport::Error>] Transport 变体装箱后拆包再转回保持 Transport 语义
-    /// 条件：Error::Transport(Http) 经 to_transport_error 拆包为 Http，再经 From 转回
-    /// 断言：结果为 Error::Transport(Http)，code() == E_HTTP（不经过 Other 还原路径）
+    /// P0：[From<wecom_transport::Error>] Wrapped 负载经 to_transport_error downcast 恢复为具体 transport 错误
+    /// 条件：Error::Wrapped(Http) 经 to_transport_error 向下转型拆包为 Http，再经 From 转回
+    /// 断言：code() == E_HTTP，且 as_any 可恢复出 Http { status: 404 } 具体变体
     #[test]
     fn from_transport_round_tripped_transport_variant() {
-        let original = Error::Transport(wecom_transport::Error::Http {
+        let original = Error::Wrapped(Box::new(wecom_transport::Error::Http {
             message: "not found".into(),
             endpoint: "https://example.com/api".into(),
             status: 404,
-        });
+        }));
         let round_tripped: Error = crate::util::to_transport_error(original).into();
-        assert!(matches!(
-            round_tripped,
-            Error::Transport(wecom_transport::Error::Http { status: 404, .. })
-        ));
+        assert!(matches!(round_tripped, Error::Wrapped(_)));
         assert_eq!(round_tripped.code(), E_HTTP);
+        // downcast 恢复：具体 transport 变体（含 status 字段）仍可结构化访问。
+        let Error::Wrapped(inner) = &round_tripped else {
+            panic!("expected Wrapped, got: {round_tripped:?}");
+        };
+        let recovered = inner
+            .as_any()
+            .downcast_ref::<wecom_transport::Error>()
+            .expect("payload should recover as wecom_transport::Error");
+        assert!(
+            matches!(recovered, wecom_transport::Error::Http { status: 404, .. }),
+            "expected Http 404, got: {recovered:?}"
+        );
     }
 
-    /// P1：[From<wecom_transport::Error>] Other 内非 wecom::Error 负载不还原
+    /// P1：[From<wecom_transport::Error>] transport::Other 内的外部负载能力按 E_OTHER 透传
     /// 条件：transport::Other 内装箱 io::Error（外部错误），经 From 转换
-    /// 断言：结果保持 Error::Transport(Other)，code() == E_OTHER
+    /// 断言：结果为 Error::Wrapped(_)，code() == E_OTHER，message 透传
     #[test]
-    fn from_transport_foreign_other_payload_not_recovered() {
-        let foreign = wecom_transport::Error::Other(Box::new(std::io::Error::other("disk full")));
+    fn from_transport_foreign_other_payload_delegates() {
+        let foreign = wecom_transport::Error::other(Box::new(std::io::Error::other("disk full")));
         let e: Error = foreign.into();
-        assert!(matches!(
-            e,
-            Error::Transport(wecom_transport::Error::Other(_))
-        ));
+        assert!(matches!(e, Error::Wrapped(_)));
         assert_eq!(e.code(), E_OTHER);
         assert_eq!(e.message(), "disk full");
     }
@@ -1170,5 +1203,83 @@ mod tests {
             source: None,
         };
         assert_eq!(e.code(), E_CLI);
+    }
+
+    // ── WecomError trait equivalence ──
+    /// P0：[WecomError] code / message / to_json / render / exit_code 与 inherent 完全等价
+    ///
+    /// 覆盖全部变体，锁定 trait 实现与 inherent 方法行为一致。
+    #[test]
+    fn wecom_error_trait_matches_inherent_methods() {
+        use wecom_error::WecomError;
+
+        let cases: Vec<Error> = vec![
+            Error::validation("bad"),
+            Error::config("cfg"),
+            wecom_fs::Error::Permission("denied".into()).into(),
+            Error::CliOutput {
+                code: 2,
+                message: "usage".into(),
+                source: None,
+            },
+            Error::other("wrapped".into()),
+            Error::Wrapped(Box::new(wecom_transport::Error::Http {
+                message: "h".into(),
+                endpoint: "/e".into(),
+                status: 500,
+            })),
+        ];
+
+        for e in &cases {
+            assert_eq!(WecomError::code(e), Error::code(e), "code drift on {e:?}");
+            assert_eq!(
+                WecomError::message(e),
+                Error::message(e),
+                "message drift on {e:?}"
+            );
+            assert_eq!(
+                WecomError::to_json(e),
+                Error::to_json(e),
+                "to_json drift on {e:?}"
+            );
+            assert_eq!(
+                WecomError::render(e),
+                Error::render(e),
+                "render drift on {e:?}"
+            );
+            assert_eq!(
+                WecomError::exit_code(e),
+                Error::exit_code(e),
+                "exit_code drift on {e:?}"
+            );
+        }
+    }
+
+    /// P0：[WecomError::error_type] 各变体均有稳定字面量
+    #[test]
+    fn wecom_error_error_type_stable_labels() {
+        use wecom_error::WecomError;
+
+        assert_eq!(Error::validation("x").error_type(), "ValidationError");
+        assert_eq!(
+            Error::from(wecom_fs::Error::Permission("x".into())).error_type(),
+            "PermissionError"
+        );
+        assert_eq!(Error::config("x").error_type(), "ConfigError");
+        assert_eq!(
+            Error::CliOutput {
+                code: 0,
+                message: "m".into(),
+                source: None,
+            }
+            .error_type(),
+            "CliOutput"
+        );
+        assert_eq!(Error::other("x".into()).error_type(), "UnknownError");
+        // Wrapped 委托负载自身的标签，与 to_json 内层标签一致。
+        assert_eq!(
+            Error::Wrapped(Box::new(wecom_transport::Error::Config("x".into()))).error_type(),
+            "ConfigError"
+        );
     }
 }

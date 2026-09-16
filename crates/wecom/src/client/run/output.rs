@@ -28,13 +28,16 @@ pub(crate) type ExtraDataCallback = Arc<dyn Fn(&IndexMap<String, serde_json::Val
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```rust
+/// use wecom::CliRunOutput;
+///
 /// // Capture output in a buffer:
 /// let buf: Vec<u8> = Vec::new();
 /// let output = CliRunOutput::new(buf);
 ///
 /// // Force color on:
 /// let output = CliRunOutput::stdout().force_color(true);
+/// # let _ = output;
 /// ```
 pub struct CliRunOutput {
     writer: Writer,
@@ -107,9 +110,14 @@ impl CliRunOutput {
     /// Returns a reference to the shared [`Writer`].
     ///
     /// Callers can lock it to perform multiple writes atomically:
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use std::io::Write;
+    /// # use wecom::CliRunOutput;
+    /// # fn example(output: &CliRunOutput) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut w = output.writer().lock().unwrap();
     /// writeln!(w, "hello")?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn writer(&self) -> &Writer {
         &self.writer

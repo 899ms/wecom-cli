@@ -11,7 +11,7 @@ use crate::Error;
 
 /// Apply an optional per-request timeout and build the [`reqwest::Request`].
 ///
-/// Build failures are mapped to [`Error::Other`] with a stable message so
+/// Build failures are mapped to [`Error::other`] with a stable message so
 /// both backends report the same text.
 pub(crate) fn finalize_request(
     builder: reqwest::RequestBuilder,
@@ -23,7 +23,7 @@ pub(crate) fn finalize_request(
     };
     builder
         .build()
-        .map_err(|e| Error::Other(format!("Failed to build request: {e}").into()))
+        .map_err(|e| Error::other(format!("Failed to build request: {e}").into()))
         .inspect_err(|e| tracing::error!(error = %e, "build request failed"))
 }
 
@@ -94,6 +94,25 @@ mod tests {
         let builder = client.get("http://localhost:0/health");
         let result = finalize_request(builder, Some(Duration::from_secs(30)));
         assert!(result.is_ok());
+    }
+
+    /// P1：[finalize_request] build 失败映射为 Error::other
+    /// 条件：非法 header value（含换行符）导致 build 失败
+    /// 断言：返回 Err(Error::other)，code == E_OTHER，且消息含 "Failed to build request"
+    #[test]
+    fn finalize_request_build_failure_maps_to_other() {
+        let client = reqwest::Client::new();
+        let builder = client
+            .get("http://localhost:0/health")
+            .header("x-bad", "bad\nvalue");
+        let result = finalize_request(builder, None);
+        match result {
+            Err(e) => {
+                assert_eq!(e.code(), crate::E_OTHER);
+                assert!(e.message().contains("Failed to build request"));
+            }
+            ok => panic!("expected Error::other, got {ok:?}"),
+        }
     }
 
     // ── network_error ──

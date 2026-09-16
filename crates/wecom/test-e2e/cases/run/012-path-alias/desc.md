@@ -27,4 +27,4 @@
 ## 关键上下文
 
 - `service/alias.rs`：path_alias 注册 hidden alias 子命令
-- `service/command.rs`：构建 clap command tree 时隐藏 alias
+- `service/command/build.rs`：构建 clap command tree 时隐藏 alias

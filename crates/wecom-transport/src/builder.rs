@@ -1,4 +1,4 @@
-//! Deferred-error builder for [`Transport`](crate::Transport).
+//! Deferred-error builder for [`Transport`].
 //!
 //! Provides a unified chain to configure both a backend (`B`) and
 //! transport-level options (headers, timeout) in a single call chain.
@@ -79,7 +79,7 @@ impl<B: TransportBackend + 'static> TransportBuilder<B> {
                 }
                 self.options.wire.headers.insert(n, v);
             }
-            (Err(e), _) | (_, Err(e)) => self.build_error = Some(Error::Other(e)),
+            (Err(e), _) | (_, Err(e)) => self.build_error = Some(Error::other(e)),
         }
         self
     }
@@ -121,7 +121,7 @@ impl<B: TransportBackend + 'static> TransportBuilder<B> {
     /// backend.
     ///
     /// After boxing, backend-specific setters (e.g. `base_url`)
-    /// are no longer available — only the generic public
+    /// are unavailable — only the generic public
     /// methods ([`header`](Self::header), [`timeout`](Self::timeout),
     /// [`extension`](Self::extension), [`build`](Self::build), ...) remain,
     /// which is useful for callers that hold the builder without naming a

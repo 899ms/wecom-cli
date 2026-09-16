@@ -21,16 +21,48 @@ async fn main() {
 
     let root_span = logging::init_logging();
 
-    // 挂载 json repair 提示监听：repair 成功时向 stderr 输出修复前后 JSON。
+    // 挂载 json repair 提示监听：repair 成功时向 stderr 输出提示。
     let scope = wecom_transport::telemetry::CaptureScope::attach(&root_span);
     telemetry::install_json_repair_listener(&scope);
 
     let run = async {
-        let cfg = config::load_config_file(&config::default_config_path())?.unwrap_or_default();
+        // 沙箱接线：双域实例。
+        //
+        // 两阶段构造（config_dir 不依赖 config 内容，无鸡生蛋问题）：
+        // 1. 算 config_dir（env / 默认）→ 经 default_private_fs 构造 PrivateFs
+        //    （roots = [config_dir]），用它读 config.json；
+        // 2. 构造 WorkspaceFs（读写同 roots = [cwd, 固定临时目录]——上传类
+        //    调用合法引用 mktemp/截图等外部产物，下载默认落盘 cwd；临时目录
+        //    用 pinned_temp_dir() 的固定取值而非 env 驱动的 temp_dir()；
+        //    配置目录叠加进其 deny 规则屏蔽，即使落在 cwd 内也不放行；
+        //    内建 glob 表含系统目录与凭据形状，root 落入 deny 时该 root
+        //    上的操作被逐次拒绝）。
+        //
+        // roots 与 deny 只能在构造期注入，无 env/flag/config 扩展口。
+        let fs_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let config_dir = config::default_home_dir();
+
+        let private_fs = wecom::default_private_fs(&config_dir);
+
+        let cfg = config::load_config_file(private_fs.as_ref(), &config::default_config_path())
+            .await?
+            .unwrap_or_default();
 
         let builder = wecom::Client::builder();
         let builder = config::apply_config(builder, &cfg)?;
         let builder = builder.endpoint_catalog(transport::endpoint_catalog());
+
+        let mut allowed_roots = vec![fs_cwd.as_path()];
+        let pinned_tmp = config::pinned_temp_dir();
+        if let Some(tmp) = &pinned_tmp {
+            allowed_roots.push(tmp.as_path());
+        }
+        let workspace_fs = wecom_fs::SandboxedFs::new().with_policy(
+            wecom_fs::Policy::new()
+                .with_allowed_dirs(&allowed_roots)
+                .with_deny(wecom_fs::recommended_deny_rule())
+                .with_deny(wecom_fs::DenyRule::prefix(&config_dir)),
+        );
 
         let transport = transport::build(&cfg).await?.with_extension(cfg);
 
@@ -49,8 +81,11 @@ async fn main() {
         };
 
         let client = builder
+            .private_fs(private_fs)
+            .workspace_fs(std::sync::Arc::new(workspace_fs))
             .transport(transport)
             .bin_name(env!("CARGO_BIN_NAME"))
+            .cwd(&fs_cwd)
             .command(cmd::auth::custom_command())
             .build()?;
 
@@ -122,8 +157,6 @@ mod tests {
     /// 其它错误变体 → 不命中
     #[test]
     fn other_errors_miss() {
-        assert!(!is_subcommand_not_found(&wecom::Error::Validation(
-            "x".into()
-        )));
+        assert!(!is_subcommand_not_found(&wecom::Error::validation("x")));
     }
 }

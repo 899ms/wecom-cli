@@ -64,3 +64,43 @@ mod json_repair {
         include!("cases/repair/001-json-repair-stderr/test.rs");
     }
 }
+// ── sandbox paths ───────────────────────────────────────────
+//
+// 双实例接线（main.rs）：WorkspaceFs 读 cwd+tmp 全域 / 写 cwd+tmp/requests，
+// CLI 配置目录经 extra deny 屏蔽；PrivateFs 走 config_dir roots。
+
+mod sandbox_paths {
+    use super::*;
+    mod external_output_confined_to_roots {
+        use super::*;
+        include!("cases/sandbox_paths/001-external-output-confined-to-roots/test.rs");
+    }
+    mod workspace_roots {
+        use super::*;
+        include!("cases/sandbox_paths/002-workspace-roots/test.rs");
+    }
+    mod symlink_escape {
+        use super::*;
+        include!("cases/sandbox_paths/003-symlink-escape/test.rs");
+    }
+    mod deny_credential_read {
+        use super::*;
+        include!("cases/sandbox_paths/004-deny-credential-read/test.rs");
+    }
+    mod hardlink_alias_threat_model {
+        use super::*;
+        include!("cases/sandbox_paths/005-hardlink-alias-threat-model/test.rs");
+    }
+    mod dangerous_chars {
+        use super::*;
+        include!("cases/sandbox_paths/006-dangerous-chars/test.rs");
+    }
+    mod dotdot_escape {
+        use super::*;
+        include!("cases/sandbox_paths/007-dotdot-escape/test.rs");
+    }
+    mod config_dir_under_cwd_denied {
+        use super::*;
+        include!("cases/sandbox_paths/008-config-dir-under-cwd-denied/test.rs");
+    }
+}

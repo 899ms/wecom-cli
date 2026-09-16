@@ -41,7 +41,7 @@ wecom-cli auth show
 | --- | --- |
 | `--noninteractive` | 跳过交互选择，直接使用扫码接入（CI/脚本/管道等非交互环境适用） |
 | `--no-browser` | 扫码时不自动打开浏览器 |
-| `--output-qrcode <PATH>` | 将二维码输出为 PNG 文件（仅支持当前目录下的路径，如 `qr.png`） |
+| `--output-qrcode <PATH>` | 将二维码输出为 PNG 文件（相对路径基于当前目录解析） |
 | `--manual` | 跳过交互选择，手动输入 Bot ID 和 Secret（需要终端） |
 
 ### `auth show` 参数
@@ -108,13 +108,14 @@ wecom-cli doc search --json '{"keywords":["周报"],"limit":10}'
 | `--page-count <n>` | 启用游标式自动分页，最多拉取 n 页；输出为 NDJSON（每行一页） |
 | `--page-delay <ms>` | 分页请求间隔毫秒数，默认 100 |
 | `--output` / `-o <file>` | 将响应体写入文件 |
-| `--output-dir <dir>` | 将响应与附件写入目录（分页时生成 `<method>.ndjson`） |
+| `--output-dir <dir>` | 指定下载文件的落盘目录（默认当前目录） |
 
 输出形态：
 
 - 默认：compact JSON 输出到 stdout
-- 写文件/下载：stdout 输出 `DownloadResult` JSON（含 `content_type`、`file_path`、`size`），文件以 `0600` 权限落盘
-- 分页：NDJSON 多行输出
+- 下载：下载类方法把文件落盘到当前目录（`--output-dir` 可改目录、`--output` 可指定完整路径），stdout 输出 `DownloadResult` JSON（含 `content_type`、`file_path`、`size`），文件以 `0600` 权限落盘
+- 写文件：任意方法可用 `--output` 把响应体写入指定文件；JSON 响应的落盘只能走 `--output` 或 shell 重定向，`--output-dir` 不产生 JSON 文件
+- 分页：NDJSON 多行输出（`--output` 时写入文件）
 
 ## 内建命令
 
@@ -135,14 +136,13 @@ wecom-cli cache clear                        # 清除所有 discovery 缓存
 | 凭据文件 | `<config_dir>/credentials.enc` | `auth init` 时创建；AES-256-GCM 加密（0600），bot 信息与 token 共存于同一文件 |
 | 加密密钥 | 系统 keyring 或 `<config_dir>/.encryption_key` | 无系统 keyring 时的文件回退（0600） |
 | discovery 缓存 | `<config_dir>/cache` | 服务目录与 schema 缓存，TTL 60 秒 |
-| 临时目录 | `<system_tmp>/wecom` | 媒体下载、请求暂存等；可由 `WECOM_CLI_TMP_DIR` 或 `config.json` 的 `tmp_dir` 覆盖 |
+| 下载目录 | 当前工作目录 | 下载类方法的文件默认落盘位置；单次调用可用 `--output-dir` 覆盖 |
 
 ## 环境变量
 
 | 变量 | 作用 |
 | --- | --- |
 | `WECOM_CLI_CONFIG_DIR` | 覆盖默认配置目录 |
-| `WECOM_CLI_TMP_DIR` | 覆盖临时目录根目录 |
 | `WECOM_CLI_ADDITIONAL_HEADERS` | 额外请求头，值为 JSON object（`Record<string, string>`）；同时支持 `WECOM_CLI_ADDITIONAL_HEADERS_*` 后缀形式的多个变量，取值同为 JSON object |
 | `WECOM_CLI_LOG_LEVEL` | 打开 stderr 文本日志并设置过滤级别（如 `debug`、`wecom=trace`；非法值回退 `warn`） |
 | `WECOM_CLI_LOG_DIR` | 打开 JSON Lines 日志输出，按天写入 `<dir>/ww.log.<日期>`（UTC+8） |
@@ -153,15 +153,13 @@ wecom-cli cache clear                        # 清除所有 discovery 缓存
 
 ```json
 {
-    "headers": { "X-Custom": "value" },
-    "tmp_dir": "/tmp/wecom-custom"
+    "headers": { "X-Custom": "value" }
 }
 ```
 
 | 字段 | 作用 |
 | --- | --- |
 | `headers` | 额外请求头（别名 `additional_headers`） |
-| `tmp_dir` | 覆盖临时目录根目录 |
 
 说明：
 

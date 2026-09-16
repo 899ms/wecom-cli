@@ -16,4 +16,4 @@
 
 ## 关键上下文
 
-- `client/run.rs`：service discovery 循环中跳过与扩展命令同名的服务（`service shadowed by custom command, skipped`）
+- `client/run/execute.rs`：service discovery 循环中跳过与扩展命令同名的服务（`service shadowed by custom command, skipped`）

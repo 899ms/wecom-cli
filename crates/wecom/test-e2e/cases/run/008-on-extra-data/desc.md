@@ -30,4 +30,4 @@ client.run(vec!["wecom", "hr", "department", "list"])
 
 ## 关键上下文
 
-- `client/run.rs`：解析响应时除 result/error 外的字段通过 on_extra_data 回调传递
+- `client/run/mod.rs`：解析响应时除 result/error 外的字段通过 `.on_extra_data()` 回调传递

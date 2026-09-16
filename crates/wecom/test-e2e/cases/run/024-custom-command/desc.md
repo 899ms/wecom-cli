@@ -16,4 +16,4 @@
 
 ## 关键上下文
 
-- `client/run.rs`：`CliRun::execute` 将扩展命令注册在服务发现子命令之前；first_arg 命中扩展命令名时跳过 discovery；dispatch 时优先匹配扩展命令
+- `client/run/execute.rs`：`CliRun::execute` 将扩展命令注册在服务发现子命令之前；first_arg 命中扩展命令名时跳过 discovery；dispatch 时优先匹配扩展命令

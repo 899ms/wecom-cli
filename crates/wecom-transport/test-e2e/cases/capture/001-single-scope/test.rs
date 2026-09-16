@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::prelude::*;
 use wecom_transport::telemetry::{CaptureSpanId, HttpRequestRecord};
 
-/// Collect spans into a Vec through on_request (replacement for old take_spans)
+/// Collect spans into a Vec through on_request
 fn collect_spans(
     scope: &wecom_transport::telemetry::CaptureScope,
 ) -> Arc<Mutex<Vec<HttpRequestRecord>>> {
@@ -13,6 +13,19 @@ fn collect_spans(
         c.lock().unwrap().push(s);
     });
     collected
+}
+
+/// 热身：以当前 subscriber 注册生产 RequestSpan callsite 并重建 interest 缓存。
+///
+/// `RequestSpan` 是 crate 内部类型、e2e 不可见，故改为向 mock server 的未注册
+/// 路径发一次请求（404 可忽略，span 在发送前已创建、mock 计数不受影响）。
+/// 机理同为消除 callsite 惰性注册
+/// 在并行测试间的 never 污染竞态。使用时机：CaptureScope 创建之前。
+async fn warm_up_request_span(base: &str) {
+    let _ = Transport::from(HttpTransportBackend::default())
+        .invoke(ep(base, "/cgi-bin/callsite-warmup"), json!({}))
+        .await;
+    tracing::callsite::rebuild_interest_cache();
 }
 
 #[tokio::test]
@@ -35,6 +48,7 @@ async fn http_single_scope_captures_fields() {
 
     let transport = Transport::from(HttpTransportBackend::default());
 
+    warm_up_request_span(&server.uri()).await;
     let scope = wecom_transport::telemetry::CaptureScope::new();
     let snaps_arc = collect_spans(&scope);
     let _enter = scope.span().enter();
@@ -82,6 +96,7 @@ async fn on_request_fires_once_per_span() {
 
     let transport = Transport::from(HttpTransportBackend::default());
 
+    warm_up_request_span(&server.uri()).await;
     let scope = wecom_transport::telemetry::CaptureScope::new();
     let count: Arc<Mutex<usize>> = Default::default();
     let c = count.clone();
@@ -126,6 +141,7 @@ async fn outside_scope_request_is_dropped() {
         .mount(&server)
         .await;
 
+    warm_up_request_span(&server.uri()).await;
     let scope = wecom_transport::telemetry::CaptureScope::new();
     let snaps_arc = collect_spans(&scope);
     let transport = Transport::from(HttpTransportBackend::default());
@@ -169,6 +185,7 @@ async fn parallel_scopes_strict_isolation() {
     }
 
     let base = server.uri();
+    warm_up_request_span(&base).await;
     let mut handles = Vec::new();
     for i in 0..4 {
         let base = base.clone();
@@ -250,6 +267,7 @@ async fn attach_works_with_custom_span_name() {
 
     let transport = Transport::from(HttpTransportBackend::default());
 
+    warm_up_request_span(&server.uri()).await;
     // Use attach() with a custom span name — NOT "wecom_http_capture"
     let business_span = tracing::info_span!("chat_stream", model = "gpt-4");
     let scope = wecom_transport::telemetry::CaptureScope::attach(&business_span);
@@ -336,6 +354,7 @@ async fn on_request_span_id_is_valid() {
 
     let transport = Transport::from(HttpTransportBackend::default());
 
+    warm_up_request_span(&server.uri()).await;
     let scope = wecom_transport::telemetry::CaptureScope::new();
 
     let span_ids: Arc<Mutex<Vec<CaptureSpanId>>> = Default::default();
@@ -382,6 +401,7 @@ async fn on_request_not_called_when_unregistered() {
     let transport = Transport::from(HttpTransportBackend::default());
 
     // Scope with NO on_request registered
+    warm_up_request_span(&server.uri()).await;
     let scope = wecom_transport::telemetry::CaptureScope::new();
     let _enter = scope.span().enter();
     let result = transport

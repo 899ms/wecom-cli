@@ -51,7 +51,7 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 | `error.rs` | lib 层统一错误（错误码段 893000–893099）；后台 errcode 经 transport 透传 |
 | `telemetry/` | lib 侧 telemetry 事件 |
 
-`ClientBuilder` 主要配置点：`transport`、`endpoint_catalog`（整体/逐 key 覆写端点目录）、`command`（扩展顶层命令，优先于同名服务）、`helper`、`bin_name`、`cwd`/`home_dir`/`tmp_dir`、`readable_dirs`/`writable_dirs`（沙箱）、`path_resolver`。
+`ClientBuilder` 主要配置点：`transport`、`endpoint_catalog`（整体/逐 key 覆写端点目录）、`command`（扩展顶层命令，优先于同名服务）、`helper`、`bin_name`、`cwd`/`default_output_dir`（下载默认落盘目录，缺省 cwd）、`readable_dirs`/`writable_dirs`（沙箱）、`path_resolver`。
 
 ### `crates/wecom-cli`（bin）
 
@@ -87,10 +87,10 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 - **鉴权注入**：`WecomBackend` 持有 token 即注入 Bearer token（无 token 则忽略）；挂 `RequireAuth` 标记的端点先过前置门禁——无 token 直接报错、请求不发出；换取 token 的鉴权引导端点挂 `SuppressAuth` 抑制注入（避免 853004 刷新自死锁）。token 失效（853004）用 bot 凭据静默换 token 并重放一次。
 - **长任务轮询**：响应含 `taskid` 时按 `long_task_poll` 配置轮询（`PollClawLongTask`，`polling_interval_ms`/`task_timeout`），超时返回错误。
 - **指令**：schema 中的 `x-wecom-*` 指令在请求前（媒体上传、multipart）与响应后（file-save、octet-stream 落盘）由 `directive/` 处理。
-- **输出路由**：默认 compact JSON 到 stdout；`--output/-o` 写文件、`--output-dir` 写目录（返回 `DownloadResult` JSON）；`--page-count` 自动分页并输出 NDJSON。
+- **输出路由**：默认 compact JSON 到 stdout；`--output/-o` 把响应体写入指定文件；产生文件的分支（运行时 binary 响应、`x-wecom-file-save` 提取）默认落盘到 `default_output_dir`（缺省 cwd），`--output-dir` 重定向该目录（全局参数，显式声明即走 WriteDir 沙箱校验，纯 JSON 响应不产生文件）；写文件/下载后 stdout 返回 `DownloadResult` JSON；`--page-count` 自动分页并输出 NDJSON。
 - **JSON 修复**：`--json`/`--set` 中的非法 JSON 经 jsonrepair 自动修复，bin 侧监听在 stderr 输出修复前后对照。
 - **错误模型**：三层嵌套 `wecom_cli::Error::Wecom(wecom::Error::Transport(wecom_transport::Error))`；错误码段 893000–893099 / 893100–893199 / 893200–893299，共享兜底 893999；后台 errcode 原样透传；后台返回 10021 时渲染当前命令 help 并以退出码 2 返回。退出码约定：`0` 成功/帮助/版本，`1` 运行时错误，`2` 用法错误。
-- **沙箱 FS**：文件读写经 `Fs` 按沙箱根校验（如 `auth init --output-qrcode` 仅允许解析后落在当前目录内的路径，相对/绝对皆可）。
+- **沙箱 FS**：文件读写经 `Fs` 按沙箱根校验。workspace 实例读写同 roots = `[cwd, 临时目录]`（上传可引用 mktemp/截图等外部产物，下载默认落盘 cwd）——生产接线的临时目录取固定值（`pinned_temp_dir()`：Unix 字面 `/tmp`，Windows 账户 `LocalAppData\Temp`），不信任 `TMPDIR`/`TMP`/`TEMP`；库侧缺省回退 `default_workspace_fs` 仍用 `std::env::temp_dir()`。推荐 deny 表（系统目录 + 凭据形状）双向生效，生产接线另对 `config_dir` 挂 `DenyRule::prefix`（固定目录规则）；deny 恒胜 allow。`auth init --output-qrcode` 与 `--output` 同模式「先创建后请求」：相对路径经 `absolutize` 锚定到 CliRun cwd 后，会话创建前由 workspace fs 排他预留文件（创建即完成 roots + deny 授权），后续经句柄写入。
 
 ## 构建与测试
 
@@ -99,7 +99,8 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 ```bash
 pnpm fmt         # rustfmt +nightly 格式化全部 Rust 代码
 pnpm lint        # cargo clippy --workspace --all-targets -- -D warnings
-pnpm test        # cargo test --workspace --all-targets --features custom-endpoint
+pnpm test        # cargo test --workspace --features custom-endpoint（含 doctest）
+pnpm test:doc    # cargo test --workspace --doc（只跑 doctest）
 pnpm check       # cargo check --workspace --all-targets
 
 # 本地构建并运行
@@ -132,7 +133,6 @@ Git 钩子由 lefthook 管理（`pnpm install` 时自动安装）：pre-commit �
 | `docs/skills.md` | 内置 Agent Skills 导航 |
 | `docs/development.md` | 仓库结构与本地开发说明 |
 | `docs/e2e/` | e2e 框架方案、desc.md 规范与生成手册 |
-| `docs/skill-trimming-guide.md` | Skill 精简指南 |
 
 ## 维护约定
 

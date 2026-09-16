@@ -17,7 +17,9 @@ pub const E_PARSE: i64 = 893103;
 /// Transport configuration error code.
 pub const E_CONFIG_TRANSPORT: i64 = 893106;
 /// Catch-all error code for transport-layer failures.
-pub const E_OTHER: i64 = 893999;
+///
+/// Single source of truth lives in [`wecom_error::codes`].
+pub use wecom_error::codes::E_OTHER;
 
 /// Transport-layer errors — network, HTTP, parse, API, and other failures.
 #[derive(Debug, thiserror::Error)]
@@ -59,7 +61,31 @@ pub enum Error {
         body: Box<serde_json::Value>,
     },
 
-    Other(Box<dyn std::error::Error + Send + Sync>),
+    /// An error retained behind a capability-carrying trait object: either a
+    /// higher-layer error that crossed back down through a transport callback
+    /// boundary (payload factory, json_parse, upload progress, …), or a
+    /// foreign error wrapped in [`wecom_error::OtherError`] via
+    /// [`Error::other`].
+    ///
+    /// The payload retains its full capability set (it implements
+    /// [`wecom_error::WecomError`]), so `code()` / `error_type()` /
+    /// `message()` / `to_json()` delegate straight through — no `downcast`
+    /// required to recover the original variant.
+    Wrapped(Box<dyn wecom_error::WecomError>),
+}
+
+impl Error {
+    /// Catch-all for foreign errors with no
+    /// [`WecomError`](wecom_error::WecomError) implementation (reqwest
+    /// internals, plain strings, `std::io::Error`, …): wraps them in
+    /// [`wecom_error::OtherError`] behind [`Error::Wrapped`].
+    ///
+    /// The concrete `Box<dyn Error>` parameter keeps call sites
+    /// unambiguous — `Error::other("msg".into())` / `Error::other(e.into())`
+    /// / `Error::other(boxed)` all work without type annotations.
+    pub fn other(payload: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Error::Wrapped(Box::new(wecom_error::OtherError(payload)))
+    }
 }
 
 impl Error {
@@ -76,7 +102,10 @@ impl Error {
             Error::Http { .. } => E_HTTP,
             Error::Parse { .. } => E_PARSE,
             Error::Api { code, .. } => code.unwrap_or_default(),
-            Error::Other(_) => E_OTHER,
+            // Delegate straight through — no downcast. `Wrapped` payloads
+            // retain the full capability set, so their `code()` is the
+            // category code assigned at the original construction site.
+            Error::Wrapped(inner) => inner.code(),
         }
     }
 
@@ -88,7 +117,7 @@ impl Error {
             Error::Http { message, .. } => message.clone(),
             Error::Parse { message, .. } => message.clone(),
             Error::Api { message, .. } => message.clone(),
-            Error::Other(error) => error.to_string(),
+            Error::Wrapped(inner) => inner.message(),
         }
     }
 
@@ -158,13 +187,11 @@ impl Error {
 
             Error::Api { body, .. } => body.as_ref().clone(),
 
-            Error::Other(e) => json!({
-                "error": {
-                    "type": "UnknownError",
-                    "code": self.code(),
-                    "message": e.to_string(),
-                },
-            }),
+            // `Wrapped` retains full capability: delegate to the inner
+            // error's own structured representation (which for a `wecom::Error`
+            // round-trip is exactly what the original variant would have
+            // produced — same `type` / `code` / `message` fields).
+            Error::Wrapped(inner) => inner.to_json(),
         }
     }
 
@@ -254,9 +281,11 @@ impl std::fmt::Display for Error {
             Error::Api { action, body, .. } => {
                 write!(f, "ApiError: {body} [code={code}, action={action}]")
             }
-            Error::Other(e) => {
-                write!(f, "{e} [code={code}]")
-            }
+            // Transparent passthrough: the inner error already renders its own
+            // `[code=…]`/message tail. Appending another one here would stack
+            // duplicate suffixes (Wrapped inner = wecom::Error, whose Display
+            // already includes its code).
+            Error::Wrapped(inner) => write!(f, "{inner}"),
         }
     }
 }
@@ -346,6 +375,47 @@ fn error_chain_detail(err: &dyn std::error::Error) -> Vec<String> {
     detail
 }
 
+impl wecom_error::WecomError for Error {
+    fn code(&self) -> i64 {
+        Error::code(self)
+    }
+
+    fn message(&self) -> String {
+        Error::message(self)
+    }
+
+    fn error_type(&self) -> &'static str {
+        match self {
+            Error::Config(_) => "ConfigError",
+            Error::Network { .. } => "NetworkError",
+            Error::Http { .. } => "HTTPError",
+            Error::Parse { .. } => "ParseError",
+            Error::Api { .. } => "ApiError",
+            Error::Wrapped(inner) => inner.error_type(),
+        }
+    }
+
+    // The variant-specific context (`endpoint`, `status`, `source`, …) and
+    // `Api`'s raw-body passthrough do not match the trait's default 3-key
+    // shape, so we delegate to the inherent implementation, which already
+    // encodes the exact byte shape CLI output / e2e / dashboards rely on.
+    fn to_json(&self) -> serde_json::Value {
+        Error::to_json(self)
+    }
+
+    fn render(&self) -> String {
+        Error::render(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! ## 模块摘要：Error（Transport 错误类型）
@@ -373,6 +443,27 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // ── 码段范围门禁 ──
+
+    /// P0：本 crate 分配的专属码全部落在 transport 码段（893100-893199）内
+    ///
+    /// 与 [`wecom_error::codes::range::TRANSPORT`] 保持一致；`E_OTHER` 是
+    /// 全 workspace 共享兜底码（893999），不属于 crate 专属段，故排除。
+    /// transport 新增专属错误码落在段外时，本测试失败而非静默越界。
+    #[test]
+    fn crate_owned_codes_stay_in_transport_range() {
+        let owned = [E_NETWORK, E_HTTP, E_PARSE, E_CONFIG_TRANSPORT];
+        let range = wecom_error::codes::range::TRANSPORT;
+        for code in owned {
+            assert!(
+                range.contains(&code),
+                "transport-owned code {code} escapes range {range:?}"
+            );
+        }
+        // 共享兜底码不受 crate 专属段约束。
+        assert_eq!(E_OTHER, 893999);
+    }
 
     // ── Error Display ──
 
@@ -441,7 +532,7 @@ mod tests {
     /// 断言：格式化字符串包含 "something went wrong"
     #[test]
     fn other_error_display_wraps_inner() {
-        let err = Error::Other("something went wrong".into());
+        let err = Error::other("something went wrong".into());
         let msg = format!("{err}");
         assert!(msg.contains("something went wrong"));
     }
@@ -535,7 +626,7 @@ mod tests {
                 code: None,
                 body: Box::new(serde_json::Value::Null),
             },
-            Error::Other("test".into()),
+            Error::other("test".into()),
         ];
         for v in variants {
             let _dbg = format!("{v:?}");
@@ -590,7 +681,7 @@ mod tests {
             .code(),
             0
         );
-        assert_eq!(Error::Other("x".into()).code(), E_OTHER);
+        assert_eq!(Error::other("x".into()).code(), E_OTHER);
     }
 
     // ── render() / to_json() ──
@@ -641,7 +732,7 @@ mod tests {
     /// 断言：render 反序列化后等于 {error:{type:UnknownError, code:E_OTHER, message}}
     #[test]
     fn render_other_omits_type() {
-        let e = Error::Other("something went wrong".into());
+        let e = Error::other("something went wrong".into());
         let v: Value = serde_json::from_str(&e.render()).unwrap();
         assert_json_eq!(
             v,
@@ -864,14 +955,14 @@ mod tests {
 
     // ── Network variant ──
     // reqwest::Error has no public constructor (new() is pub(crate)).
-    // We use a real (non-routable) connection attempt to obtain an
-    // authentic reqwest::Error for testing the Network variant paths.
+    // An unparsable URL yields an authentic reqwest::Error deterministically,
+    // without network I/O — a live request is environment-dependent (behind
+    // a proxy, e.g. CI macOS runners, it can unexpectedly succeed).
 
-    /// Helper: create a real `reqwest::Error` by attempting to connect to a
-    /// non-routable address.
+    /// Helper: create a real `reqwest::Error` from an unparsable URL.
     fn make_reqwest_error() -> reqwest::Error {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async { reqwest::get("http://0.0.0.0:1").await.unwrap_err() })
+        rt.block_on(async { reqwest::get("not a url").await.unwrap_err() })
     }
 
     /// P0：[Error::Network] code() 返回 E_NETWORK
@@ -974,12 +1065,12 @@ mod tests {
     }
 
     /// P1：[Error::message] Other 变体返回内部错误的 to_string
-    /// 条件：用 io::Error("wrapped io error") 构造 Other
+    /// 条件：构造 Error::other(io::Error("wrapped io error"))
     /// 断言：message() == "wrapped io error"
     #[test]
     fn message_other() {
         let inner = std::io::Error::other("wrapped io error");
-        let e = Error::Other(Box::new(inner));
+        let e = Error::other(Box::new(inner));
         assert_eq!(e.message(), "wrapped io error");
     }
 
@@ -1001,5 +1092,241 @@ mod tests {
     fn fmt_opt_none() {
         let opt: Option<i32> = None;
         assert_eq!(fmt_opt(&opt), "?");
+    }
+
+    // ── WecomError trait equivalence ──
+
+    /// P0：[WecomError] code / message / to_json / render 与 inherent 方法完全等价
+    ///
+    /// 对所有非 feature-gated 变体逐项对比 trait 输出与 inherent 输出，
+    /// 确保两者行为一致。
+    #[test]
+    fn wecom_error_trait_matches_inherent_methods() {
+        use wecom_error::WecomError;
+
+        let cases: Vec<Error> = vec![
+            Error::Config("bad".into()),
+            Error::Network {
+                message: "conn".into(),
+                endpoint: "https://e".into(),
+                source: make_reqwest_error(),
+            },
+            Error::Http {
+                message: "h".into(),
+                endpoint: "/e".into(),
+                status: 503,
+            },
+            Error::Parse {
+                message: "p".into(),
+                endpoint: "/e".into(),
+                body: Box::new(Value::Null),
+                source: None,
+            },
+            Error::Api {
+                message: "a".into(),
+                action: "/a".into(),
+                code: Some(40001),
+                body: Box::new(serde_json::json!({"errcode":40001,"errmsg":"a"})),
+            },
+            Error::other("wrapped".into()),
+        ];
+
+        for e in &cases {
+            assert_eq!(WecomError::code(e), Error::code(e), "code drift on {e:?}");
+            assert_eq!(
+                WecomError::message(e),
+                Error::message(e),
+                "message drift on {e:?}"
+            );
+            assert_eq!(
+                WecomError::to_json(e),
+                Error::to_json(e),
+                "to_json drift on {e:?}"
+            );
+            assert_eq!(
+                WecomError::render(e),
+                Error::render(e),
+                "render drift on {e:?}"
+            );
+        }
+    }
+
+    /// P0：[WecomError::error_type] 各变体均有稳定字面量
+    #[test]
+    fn wecom_error_error_type_stable_labels() {
+        use wecom_error::WecomError;
+
+        assert_eq!(Error::Config("x".into()).error_type(), "ConfigError");
+        assert_eq!(
+            Error::Http {
+                message: "x".into(),
+                endpoint: "/e".into(),
+                status: 500,
+            }
+            .error_type(),
+            "HTTPError"
+        );
+        assert_eq!(
+            Error::Network {
+                message: "x".into(),
+                endpoint: "/e".into(),
+                source: make_reqwest_error(),
+            }
+            .error_type(),
+            "NetworkError"
+        );
+        assert_eq!(
+            Error::Parse {
+                message: "x".into(),
+                endpoint: "/e".into(),
+                body: Box::new(serde_json::Value::Null),
+                source: None,
+            }
+            .error_type(),
+            "ParseError"
+        );
+        assert_eq!(
+            Error::Api {
+                message: "x".into(),
+                action: "/a".into(),
+                code: Some(1),
+                body: Box::new(serde_json::Value::Null),
+            }
+            .error_type(),
+            "ApiError"
+        );
+        assert_eq!(Error::other("x".into()).error_type(), "UnknownError");
+    }
+
+    // ── Wrapped variant (stage 3) ──
+
+    /// P0：[Wrapped] code/message/error_type/to_json 逐级委托内层，零 downcast
+    #[test]
+    fn wrapped_variant_delegates_to_inner() {
+        use wecom_error::WecomError;
+
+        // A minimal inner WecomError implementor.
+        #[derive(Debug)]
+        struct InnerError;
+        impl std::fmt::Display for InnerError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "InnerError: boom")
+            }
+        }
+        impl std::error::Error for InnerError {}
+        impl wecom_error::WecomError for InnerError {
+            fn code(&self) -> i64 {
+                893001
+            }
+            fn message(&self) -> String {
+                "boom".to_string()
+            }
+            fn error_type(&self) -> &'static str {
+                "InnerError"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+                self
+            }
+        }
+
+        let wrapped = Error::Wrapped(Box::new(InnerError));
+        assert_eq!(wrapped.code(), 893001);
+        assert_eq!(wrapped.message(), "boom");
+        assert_eq!(wrapped.error_type(), "InnerError");
+        assert_eq!(
+            wrapped.to_json(),
+            serde_json::json!({
+                "error": {
+                    "type": "InnerError",
+                    "code": 893001,
+                    "message": "boom",
+                }
+            })
+        );
+        // Display 透传内层，不追加 [code=…] 尾巴（避免重复叠加）
+        assert_eq!(wrapped.to_string(), "InnerError: boom");
+        assert!(!wrapped.to_string().contains("code="));
+
+        // as_any / into_any 恢复具体类型（downcast_or 的探针路径）
+        let probe: Box<dyn wecom_error::WecomError> = Box::new(InnerError);
+        assert!(probe.as_any().is::<InnerError>());
+        assert!(probe.into_any().downcast::<InnerError>().is_ok());
+    }
+
+    /// P0：[Wrapped vs Other] 职责边界：Wrapped 透传能力，Other 才走 UnknownError
+    #[test]
+    fn wrapped_and_other_boundary() {
+        use wecom_error::WecomError;
+
+        #[derive(Debug)]
+        struct InnerError(&'static str);
+        impl std::fmt::Display for InnerError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for InnerError {}
+        impl wecom_error::WecomError for InnerError {
+            fn code(&self) -> i64 {
+                893002
+            }
+            fn message(&self) -> String {
+                self.0.to_string()
+            }
+            fn error_type(&self) -> &'static str {
+                "InnerError"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+                self
+            }
+        }
+
+        let wrapped = Error::Wrapped(Box::new(InnerError("inner")));
+        // Other 无 WecomError 能力：code 回落 E_OTHER
+        let other = Error::other("plain foreign".into());
+
+        assert_eq!(wrapped.code(), 893002);
+        assert_eq!(other.code(), E_OTHER);
+        assert_eq!(wrapped.error_type(), "InnerError");
+        assert_eq!(other.error_type(), "UnknownError");
+
+        // 覆盖负载的 Display / message / as_any / into_any 委托路径
+        let boxed: Box<dyn wecom_error::WecomError> = Box::new(InnerError("typed"));
+        assert_eq!(boxed.to_string(), "typed");
+        assert_eq!(boxed.message(), "typed");
+        assert!(boxed.as_any().is::<InnerError>());
+        assert!(boxed.into_any().downcast::<InnerError>().is_ok());
+    }
+
+    /// P1：[network_source_label] is_status 错误暴露 HTTP 状态码
+    /// 条件：mock server 返回 500，经 `error_for_status` 得到 reqwest::Error
+    /// 断言：label 含 "kind=status" 与 "status=500"；无 source 链时兜底追加原始描述
+    #[tokio::test]
+    async fn network_source_label_includes_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/boom"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/boom", server.uri()))
+            .await
+            .expect("mock server should respond");
+        let source = response
+            .error_for_status()
+            .expect_err("500 must be an error");
+        let label = network_source_label(&source);
+        assert!(label.contains("kind=status"), "label = {label}");
+        assert!(label.contains("status=500"), "label = {label}");
     }
 }

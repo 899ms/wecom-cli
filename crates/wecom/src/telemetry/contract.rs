@@ -67,45 +67,26 @@ pub mod unknown_directive {
     pub const FIELD_DIRECTIVES: &str = "directives";
 }
 
-/// Wire contract for the `path_fuzzy_corrected` telemetry event.
-///
-/// Emitted when a file path enters fuzzy-correction (case-insensitive or
-/// partial match resolution) before sandbox validation.  Both success and
-/// failure are emitted so that downstream can compute the correction
-/// success rate.
-///
-/// Payload fields:
-///
-/// | Field       | Type   | Description                                    |
-/// |-------------|--------|------------------------------------------------|
-/// | `outcome`   | string | `"ok_corrected"` or `"err"`                    |
-pub mod path_fuzzy_corrected {
-    /// Event kind name.
-    pub const KIND: &str = "path_fuzzy_corrected";
-
-    /// Payload field: correction outcome.
-    pub const FIELD_OUTCOME: &str = "outcome";
-
-    /// Outcome: fuzzy correction succeeded.
-    pub const OUTCOME_OK_CORRECTED: &str = "ok_corrected";
-
-    /// Outcome: fuzzy correction failed.
-    pub const OUTCOME_ERR: &str = "err";
-}
-
 /// Wire contract for the `json_repair` telemetry event.
 ///
-/// Emitted by `parse_json_lenient` to track JSON repair success rates.
+/// Emitted by `repair_json` to track JSON repair success rates.
 /// Two outcomes are distinguished by the `outcome` payload field:
 ///
 /// | `outcome`        | Meaning                                      |
 /// |------------------|----------------------------------------------|
-/// | `"ok_repaired"`  | Input was repaired by jsonrepair-rs           |
+/// | `"ok_repaired"`  | Input was repaired (see `strategy`)           |
 /// | `"err_repair"`   | Repair attempted but failed                  |
 ///
-/// On the `ok_repaired` outcome the payload also carries the original
-/// (`input`) and repaired (`output`) JSON so consumers (e.g. the CLI
-/// stderr hint) can show what changed.
+/// Payload fields:
+///
+/// | Field          | On        | Description                                  |
+/// |----------------|-----------|----------------------------------------------|
+/// | `outcome`      | both      | See the table above                          |
+/// | `strategy`     | ok only   | Repair candidate that won the unified scoring |
+/// | `candidates`   | ok only   | Strict-valid candidates entering scoring (`>= 2` means genuine ambiguity arbitration happened) |
+///
+/// The raw input / repaired output are **never** reported: `--json` bodies
+/// carry user content (chat ids, message text).
 ///
 /// Valid JSON that parses without repair does NOT emit any event.
 pub mod json_repair {
@@ -115,16 +96,22 @@ pub mod json_repair {
     /// Payload field carrying the repair outcome.
     pub const FIELD_OUTCOME: &str = "outcome";
 
-    /// Payload field carrying the original (broken) JSON input.
-    pub const FIELD_INPUT: &str = "input";
+    /// Payload field carrying which repair strategy produced the output.
+    ///
+    /// `jsonrepair` for the jsonrepair-rs candidate, `unescaped_quotes`
+    /// for the quote-repair fork candidate.
+    pub const FIELD_STRATEGY: &str = "strategy";
 
-    /// Payload field carrying the repaired JSON output.
-    pub const FIELD_OUTPUT: &str = "output";
+    /// Payload field carrying how many strict-valid candidates entered
+    /// the unified scoring.
+    pub const FIELD_CANDIDATES: &str = "candidates";
 
-    /// Outcome: standard parse failed, jsonrepair-rs succeeded.
+    /// Outcome: standard parse failed; a repair candidate (quote-repair or
+    /// jsonrepair-rs) won the unified scoring.
     pub const OUTCOME_OK_REPAIRED: &str = "ok_repaired";
 
-    /// Outcome: standard parse failed, jsonrepair-rs also failed.
+    /// Outcome: standard parse failed and no candidate survived (quote-repair
+    /// found none and jsonrepair-rs failed too).
     pub const OUTCOME_ERR_REPAIR: &str = "err_repair";
 }
 
@@ -183,8 +170,8 @@ pub mod set_path {
 ///
 /// Emitted by the `EmitDefaultOnError` / `EmitVecSkipError` / `EmitMapSkipError`
 /// serde adapters when a discovery-schema field or element fails to deserialize
-/// and is either silently-defaulted or skipped. This is the observable
-/// counterpart of the `serde_with` fallback/skip adapters.
+/// and is either silently-defaulted or skipped, so the otherwise-silent
+/// decision becomes observable.
 ///
 /// The payload carries only a stable `field` label for aggregation.
 /// Diagnostic details (error message, skipped count) are logged via

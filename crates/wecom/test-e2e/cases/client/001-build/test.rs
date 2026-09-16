@@ -1,7 +1,7 @@
 #[test]
 fn run() {
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
+    let out = leaked_tempdir();
 
     let transport = wecom_transport::HttpTransportBackend::builder()
         .base_url("https://custom.api.com")
@@ -10,14 +10,14 @@ fn run() {
         .unwrap();
 
     let client = wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
+        .default_output_dir(&out)
         .transport(transport)
         .build()
         .unwrap();
 
-    assert_eq!(client.home_dir(), home.as_path());
-    assert_eq!(client.tmp_dir(), tmp.as_path());
+    assert_eq!(client.config_dir(), home.as_path());
+    assert_eq!(client.default_output_dir(), Some(out.as_path()));
     // Transport should have Authorization header
     assert!(client.transport().headers().contains_key("authorization"));
 }

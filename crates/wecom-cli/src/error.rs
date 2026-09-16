@@ -3,7 +3,7 @@
 //! 三层嵌套错误模型，每层只定义本层特有的错误变体，下层错误经委托变体逐层透传：
 //!
 //! ```text
-//! wecom_cli::Error::Wecom(wecom::Error::Transport(wecom_transport::Error::Xxx))
+//! wecom_cli::Error::Wecom(wecom::Error::Wrapped(wecom_transport::Error::Xxx))
 //! ```
 //!
 //! 错误码段（总段 893000–893999）：
@@ -189,6 +189,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<wecom_fs::Error> for Error {
+    fn from(e: wecom_fs::Error) -> Self {
+        Error::Wecom(e.into())
+    }
+}
+
 impl From<clap::Error> for Error {
     fn from(e: clap::Error) -> Self {
         // 扩展命令二次解析失败视为用法错误，复用 wecom 层 CliOutput（exit code 2）。
@@ -205,9 +211,9 @@ impl From<clap::Error> for Error {
 impl From<Error> for wecom::Error {
     fn from(e: Error) -> Self {
         match e {
-            // 已委托下层的错误直接拆包，避免 Other 套娃。
+            // 已委托下层的错误直接拆包，避免装箱套娃。
             Error::Wecom(inner) => inner,
-            other => wecom::Error::Other(Box::new(other)),
+            other => wecom::Error::other(Box::new(other)),
         }
     }
 }
@@ -216,9 +222,13 @@ impl From<Error> for wecom_transport::Error {
     fn from(e: Error) -> Self {
         match e {
             // Transport 委托错误直接拆包：保留 Api 等变体的 errcode 语义
-            // （否则 Other 套娃后上层无法再匹配后台错误码）。
-            Error::Wecom(wecom::Error::Transport(inner)) => inner,
-            other => wecom_transport::Error::Other(Box::new(other)),
+            // （否则装箱后上层无法再匹配后台错误码）。`Wrapped` 负载经
+            // downcast 还原具体 transport 错误；无法还原的负载沿链透传，
+            // 其 `code` / `error_type` / `to_json` 能力不丢失。
+            Error::Wecom(wecom::Error::Wrapped(payload)) => {
+                wecom_error::downcast_or(payload, wecom_transport::Error::Wrapped)
+            }
+            other => wecom_transport::Error::other(Box::new(other)),
         }
     }
 }
@@ -255,11 +265,11 @@ mod tests {
     }
 
     /// P0：[Error::code] Wecom 变体委托内层 code
-    /// 条件：构造 Wecom(wecom::Error::Validation)
+    /// 条件：构造 Wecom(wecom::Error::validation)
     /// 断言：code() == 893001（wecom 层 E_VALIDATION）
     #[test]
     fn code_wecom_delegates() {
-        let e = Error::Wecom(wecom::Error::Validation("x".into()));
+        let e = Error::Wecom(wecom::Error::validation("x"));
         assert_eq!(e.code(), 893001);
     }
 
@@ -308,11 +318,11 @@ mod tests {
     }
 
     /// P0：[Error::render] Wecom 变体委托内层 render
-    /// 条件：构造 Wecom(wecom::Error::Validation("field required"))
+    /// 条件：构造 Wecom(wecom::Error::validation("field required"))
     /// 断言：render 输出与内层 render 一致（含 ValidationError）
     #[test]
     fn render_wecom_delegates() {
-        let inner = wecom::Error::Validation("field required".into());
+        let inner = wecom::Error::validation("field required");
         let expected = inner.render();
         let e = Error::Wecom(inner);
         assert_eq!(e.render(), expected);
@@ -368,11 +378,11 @@ mod tests {
     }
 
     /// P1：[Error::Display] Wecom 变体委托内层 Display
-    /// 条件：构造 Wecom(wecom::Error::Config("bad cfg"))
+    /// 条件：构造 Wecom(wecom::Error::config("bad cfg"))
     /// 断言：Display 含 "ConfigError" 与 "bad cfg"
     #[test]
     fn display_wecom_delegates() {
-        let e = Error::Wecom(wecom::Error::Config("bad cfg".into()));
+        let e = Error::Wecom(wecom::Error::config("bad cfg"));
         let s = format!("{e}");
         assert!(s.contains("ConfigError"));
         assert!(s.contains("bad cfg"));
@@ -386,12 +396,7 @@ mod tests {
     #[test]
     fn protocol_constructs_transport_parse() {
         let e = Error::protocol("missing token", "/auth", Value::Null);
-        assert!(matches!(
-            e,
-            Error::Wecom(wecom::Error::Transport(
-                wecom_transport::Error::Parse { .. }
-            ))
-        ));
+        assert!(matches!(e, Error::Wecom(wecom::Error::Wrapped(_))));
         assert_eq!(e.code(), 893103);
         assert_eq!(e.message(), "missing token");
     }
@@ -399,12 +404,12 @@ mod tests {
     // ── From：下层 → 本层 ──
 
     /// P0：[From<wecom::Error>] 统一包裹为 Wecom，不做特判
-    /// 条件：wecom::Error::Other("plain")
+    /// 条件：wecom::Error::other("plain")
     /// 断言：直接匹配 Wecom(Other)，code 为共享兜底 893999
     #[test]
     fn from_wecom_wraps_uniformly() {
-        let e = Error::from(wecom::Error::Other("plain".into()));
-        assert!(matches!(e, Error::Wecom(wecom::Error::Other(_))));
+        let e = Error::from(wecom::Error::other("plain".into()));
+        assert!(matches!(e, Error::Wecom(wecom::Error::Wrapped(_))));
         assert_eq!(e.code(), E_OTHER);
     }
 
@@ -418,10 +423,7 @@ mod tests {
             endpoint: "/x".into(),
             status: 404,
         });
-        assert!(matches!(
-            e,
-            Error::Wecom(wecom::Error::Transport(wecom_transport::Error::Http { .. }))
-        ));
+        assert!(matches!(e, Error::Wecom(wecom::Error::Wrapped(_))));
         assert_eq!(e.code(), 893102);
     }
 
@@ -434,7 +436,7 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "no such file",
         ));
-        assert!(matches!(e, Error::Wecom(wecom::Error::Io { .. })));
+        assert!(e.code() == wecom::E_IO);
         assert_eq!(e.code(), 893003);
     }
 
@@ -455,11 +457,11 @@ mod tests {
 
     /// P0：[From<Error> for wecom::Error] Wecom 变体拆包不套娃
     /// 条件：Error::Wecom(Validation)
-    /// 断言：直接得到 wecom::Error::Validation（非 Other 装箱）
+    /// 断言：拆包不套娃（得到携带原能力集的 Wrapped，而非二次装箱）
     #[test]
     fn into_wecom_unwraps_wecom_variant() {
-        let e: wecom::Error = Error::Wecom(wecom::Error::Validation("x".into())).into();
-        assert!(matches!(e, wecom::Error::Validation(_)));
+        let e: wecom::Error = Error::Wecom(wecom::Error::validation("x")).into();
+        assert!(matches!(e, wecom::Error::Wrapped(_)));
     }
 
     /// P0：[From<Error> for wecom::Error] 本层变体装箱为 Other
@@ -469,12 +471,12 @@ mod tests {
     fn into_wecom_boxes_cli_variant() {
         let e: wecom::Error = Error::Auth("need login".into()).into();
         match e {
-            wecom::Error::Other(boxed) => {
-                assert!(
-                    boxed
-                        .downcast_ref::<Error>()
-                        .is_some_and(|e| { matches!(e, Error::Auth(_)) })
-                );
+            wecom::Error::Wrapped(w) => {
+                let inner = w
+                    .as_any()
+                    .downcast_ref::<wecom_error::OtherError>()
+                    .and_then(|o| o.0.downcast_ref::<Error>());
+                assert!(inner.is_some_and(|e| { matches!(e, Error::Auth(_)) }));
             }
             other => panic!("expected Other, got {other:?}"),
         }
@@ -485,14 +487,15 @@ mod tests {
     /// 断言：直接得到 transport Api 变体，errcode 可匹配
     #[test]
     fn into_transport_unwraps_transport_variant() {
-        let e: wecom_transport::Error =
-            Error::Wecom(wecom::Error::Transport(wecom_transport::Error::Api {
+        let e: wecom_transport::Error = Error::Wecom(wecom::Error::Wrapped(Box::new(
+            wecom_transport::Error::Api {
                 message: "expired".into(),
                 action: "/x".into(),
                 code: Some(853004),
                 body: Box::new(Value::Null),
-            }))
-            .into();
+            },
+        )))
+        .into();
         assert!(matches!(
             e,
             wecom_transport::Error::Api {
@@ -502,21 +505,21 @@ mod tests {
         ));
     }
 
-    /// P1：[From<Error> for wecom_transport::Error] 本层变体装箱为 Other
+    /// P1：[From<Error> for wecom_transport::Error] 本层变体装箱为 OtherError
     /// 条件：Error::Crypto → wecom_transport::Error
-    /// 断言：Other 中可 downcast 回 bin 层错误
+    /// 断言：Wrapped 负载中可 downcast 回 bin 层错误
     #[test]
     fn into_transport_boxes_cli_variant() {
         let e: wecom_transport::Error = Error::Crypto("x".into()).into();
         match e {
-            wecom_transport::Error::Other(boxed) => {
-                assert!(
-                    boxed
-                        .downcast_ref::<Error>()
-                        .is_some_and(|e| { matches!(e, Error::Crypto(_)) })
-                );
+            wecom_transport::Error::Wrapped(w) => {
+                let inner = w
+                    .as_any()
+                    .downcast_ref::<wecom_error::OtherError>()
+                    .and_then(|o| o.0.downcast_ref::<Error>());
+                assert!(inner.is_some_and(|e| { matches!(e, Error::Crypto(_)) }));
             }
-            other => panic!("expected Other, got {other:?}"),
+            other => panic!("expected Wrapped, got {other:?}"),
         }
     }
 
@@ -529,7 +532,7 @@ mod tests {
     fn boxed_cli_error_keeps_display_message() {
         let wecom_err: wecom::Error = Error::Auth("need login".into()).into();
         let back = Error::from(wecom_err);
-        assert!(matches!(back, Error::Wecom(wecom::Error::Other(_))));
+        assert!(matches!(back, Error::Wecom(wecom::Error::Wrapped(_))));
         assert_eq!(back.code(), E_OTHER);
         let msg = back.message();
         assert!(msg.contains("AuthError"));
@@ -542,12 +545,14 @@ mod tests {
     #[test]
     fn wecom_transport_api_code_delegates() {
         let body = json!({"errcode": 40001, "errmsg": "invalid credential"});
-        let e = Error::Wecom(wecom::Error::Transport(wecom_transport::Error::Api {
-            message: "invalid credential".into(),
-            action: "/x".into(),
-            code: Some(40001),
-            body: Box::new(body.clone()),
-        }));
+        let e = Error::Wecom(wecom::Error::Wrapped(Box::new(
+            wecom_transport::Error::Api {
+                message: "invalid credential".into(),
+                action: "/x".into(),
+                code: Some(40001),
+                body: Box::new(body.clone()),
+            },
+        )));
         assert_eq!(e.code(), 40001);
         assert_eq!(e.to_json(), body);
     }
@@ -558,7 +563,7 @@ mod tests {
     #[test]
     fn source_chain() {
         use std::error::Error as _;
-        let e = Error::Wecom(wecom::Error::Validation("x".into()));
+        let e = Error::Wecom(wecom::Error::validation("x"));
         assert!(e.source().is_some());
         let e = Error::Other(std::io::Error::other("io").into());
         assert!(e.source().is_some());

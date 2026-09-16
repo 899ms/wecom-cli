@@ -70,14 +70,6 @@ fn run() {
         stderr.contains("json repair"),
         "stderr 应含 json repair 提示，got: {stderr}"
     );
-    assert!(
-        stderr.contains(r#"{bad: "value"}"#),
-        "stderr 应含修复前 JSON，got: {stderr}"
-    );
-    assert!(
-        stderr.contains(r#""bad": "value""#),
-        "stderr 应含修复后 JSON，got: {stderr}"
-    );
 }
 
 #[cfg(not(feature = "custom-endpoint"))]

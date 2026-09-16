@@ -13,19 +13,29 @@ use crate::{RequestOptions, TransportBackend};
 ///
 /// # Construction
 ///
-/// ```ignore
+/// ```rust
+/// use std::sync::Arc;
+/// use wecom_transport::{HttpTransportBackend, RequestOptions, Transport};
+///
 /// // From an existing Arc:
-/// let transport = Transport::new(Arc::new(MyBackend::new()), RequestOptions::default());
+/// let transport = Transport::new(
+///     Arc::new(HttpTransportBackend::default()),
+///     RequestOptions::default(),
+/// );
 ///
 /// // From any TransportBackend implementor (auto-wraps in Arc):
 /// let transport: Transport = HttpTransportBackend::default().into();
+/// # let _ = transport;
 /// ```
 ///
 /// # Example
 ///
-/// ```ignore
-/// let t = client.transport().clone();
+/// ```rust,no_run
+/// # use wecom_transport::Transport;
+/// # fn example(transport: &Transport) {
+/// let t = transport.clone();
 /// tokio::spawn(async move { t.headers(); });
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct Transport {
@@ -74,8 +84,18 @@ impl Transport {
     /// (e.g. to layer cross-cutting concerns such as auth-header injection or
     /// error-driven retry on top of an existing backend).
     ///
-    /// ```ignore
-    /// let transport = transport.wrap_backend(|inner| Arc::new(MyBackend::new(inner)));
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use wecom_transport::{HttpTransportBackend, Transport, TransportBackend};
+    ///
+    /// # fn example(transport: Transport) {
+    /// let transport = transport.wrap_backend(|inner| {
+    ///     // e.g. `Arc::new(RetryBackend::new(inner))`
+    ///     let _ = inner;
+    ///     Arc::new(HttpTransportBackend::default()) as Arc<dyn TransportBackend>
+    /// });
+    /// # let _ = transport;
+    /// # }
     /// ```
     #[must_use]
     pub fn wrap_backend(
@@ -119,8 +139,12 @@ impl Transport {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use wecom_transport::Transport;
+    /// # fn example(transport: Transport, trace_id: &str) -> Result<(), wecom_transport::Error> {
     /// let transport = transport.with_header("X-Trace", trace_id)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_header(
         self,
@@ -138,8 +162,8 @@ impl Transport {
         value: impl crate::IntoHeaderValue,
         sensitive: bool,
     ) -> crate::Result<Self> {
-        let name = name.try_into_header_name().map_err(crate::Error::Other)?;
-        let mut value = value.try_into_header_value().map_err(crate::Error::Other)?;
+        let name = name.try_into_header_name().map_err(crate::Error::other)?;
+        let mut value = value.try_into_header_value().map_err(crate::Error::other)?;
         if sensitive {
             value.set_sensitive(true);
         }
@@ -159,13 +183,17 @@ impl Transport {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust
+    /// # use wecom_transport::Transport;
+    /// # fn example(transport: Transport) {
     /// let mut headers = reqwest::header::HeaderMap::new();
     /// headers.insert(
     ///     reqwest::header::HeaderName::from_static("x-trace"),
     ///     reqwest::header::HeaderValue::from_static("abc"),
     /// );
     /// let transport = transport.with_headers(headers);
+    /// # let _ = transport;
+    /// # }
     /// ```
     #[must_use]
     pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
@@ -201,8 +229,15 @@ impl Transport {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust
+    /// # use wecom_transport::Transport;
+    /// # fn example(transport: Transport) {
+    /// #[derive(Debug)]
+    /// struct RetryConfig { max_retries: u32 }
+    ///
     /// let transport = transport.with_extension(RetryConfig { max_retries: 3 });
+    /// # let _ = transport;
+    /// # }
     /// ```
     #[must_use]
     pub fn with_extension<T>(mut self, value: T) -> Self
@@ -249,8 +284,14 @@ impl Transport {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use wecom_transport::{Endpoint, HttpEndpoint, Transport};
+    /// # async fn example(transport: Transport) -> Result<(), Box<dyn std::error::Error>> {
+    /// let endpoint = Endpoint::new().with(HttpEndpoint::new("/cgi-bin/action"));
+    /// let payload = serde_json::json!({});
     /// transport.invoke(&endpoint, &payload).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn invoke<'a, E, P>(&'a self, endpoint: E, payload: P) -> crate::TransportRequest<'a>
     where
@@ -287,8 +328,8 @@ mod tests {
     //! - [Transport::name] 委托给内部 trait object
     //!
     //! ### 上下游交互
-    //! - 上游：`wecom/client/builder.rs` 的 [build] 方法创建 Transport 实例
-    //! - 下游：`wecom/error.rs` 的 [render] 方法使用 Transport 相关信息
+    //! - 上游：`wecom/client/builder.rs` 的 `build` 方法创建 Transport 实例
+    //! - 下游：`wecom/error.rs` 的 `render` 方法使用 Transport 相关信息
 
     use super::*;
     use crate::http::HttpTransportBackend;

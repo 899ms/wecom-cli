@@ -73,8 +73,8 @@ pub type PollCallback = std::sync::Arc<dyn Fn(&PollEvent<'_>) + Send + Sync + 's
 /// request data, providing builder methods and `IntoFuture`.
 ///
 /// This is the single request builder for all transport backends.
-/// Created by [`Transport::invoke`], or directly by backend-specific
-/// `invoke()` methods.
+/// Created by [`Transport::invoke`](crate::Transport::invoke), or directly by
+/// backend-specific `invoke()` methods.
 pub struct TransportRequest<'a> {
     /// Transport backend to dispatch to.
     pub(crate) backend: &'a (dyn crate::traits::TransportBackend + 'static),

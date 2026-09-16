@@ -4,8 +4,11 @@
 //!
 //! # Quick start
 //!
-//! ```ignore
-//! let client = wecom::Client::from_defaults()?;
+//! ```rust,no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let client = wecom::Client::builder()
+//!     .workspace_fs(std::sync::Arc::new(wecom_fs::SandboxedFs::new()))
+//!     .build()?;
 //!
 //! // CLI-style invocation via argv
 //! let argv = vec!["wecom", "contact", "users", "list", "--json", "{}"]
@@ -16,6 +19,8 @@
 //! let svc = client.service("contact").await?;
 //! let method = svc.method(&["users", "list"])?;
 //! method.invoke(serde_json::json!({})).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Feature Flags
@@ -31,11 +36,14 @@ pub use clap::Error as ClapError;
 pub use clap::error::ErrorKind as ClapErrorKind;
 pub use client::{
     CliRun, CliRunOutput, Client, ClientBuilder, ClientInvokeRequest, ClientUploadMediaRequest,
-    CustomCommand, EndpointCatalog, EndpointKey, PayloadStringReq, Writer,
+    CustomCommand, EndpointCatalog, EndpointKey, PayloadStringReq, Writer, default_private_fs,
+    default_workspace_fs,
 };
 pub use constants::{CLI_INFO, CliInfo, DEFAULT_BIN_NAME};
 pub use error::*;
-pub use fs::{Fs, PathResolver};
+pub use fs::{
+    DirEntry, FileMeta, FileReader, FileWriter, Fs, FsFuture, FsRead, FsWrite, absolutize,
+};
 pub use helpers::{Helper, HelperMeta, HelperRegistry};
 pub use registry::ServiceInfo;
 pub use schema::{AdditionalProperties, JsonSchema};

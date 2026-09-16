@@ -22,10 +22,8 @@ async fn run() {
     );
 
     let home = leaked_tempdir();
-    let tmp = leaked_tempdir();
     let client = wecom::Client::builder()
-        .home_dir(&home)
-        .tmp_dir(&tmp)
+        .config_dir(&home)
         .transport(build_test_http_transport("test-token", &server.uri()))
         .command(custom)
         .build()

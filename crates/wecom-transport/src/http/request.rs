@@ -321,7 +321,7 @@ mod tests {
     use crate::traits::TransportResponse;
     use crate::{Endpoint, HttpTransportBackend, PollEvent, Transport};
 
-    /// 测试用自定义请求侧信封（见 03 §4.2）。
+    /// 测试用自定义请求侧信封：把 payload 包进 `{"payload": "<json-string>"}`。
     #[derive(Debug, Clone, Copy, Default)]
     struct WrapPayloadReq;
     impl RequestEnvelope for WrapPayloadReq {
@@ -657,7 +657,7 @@ mod tests {
 
     /// P0：[HttpTransportBackend::post] raw post 纯透传，调用方 headers 中的 Range 照发
     /// 条件：headers 手工带 Range: bytes=10-19，端点无 range_size
-    /// 断言：wire 上 Range 恰为 bytes=10-19（发送链不再派生，也不剥离）
+    /// 断言：wire 上 Range 恰为 bytes=10-19（发送链不派生、不剥离）
     #[tokio::test]
     async fn raw_post_headers_range_passthrough() {
         let server = MockServer::start().await;
@@ -1363,11 +1363,12 @@ mod tests {
     async fn composed_factory_propagates_build_error() {
         let endpoint = ep("https://x.com", "/p").with_req_envelope(WrapPayloadReq);
         let inner = HttpRequestPayload::new(HttpRequestPayloadKind::Json, || async {
-            Err::<HttpRequestBody, _>(Error::Other("boom".into()))
+            Err::<HttpRequestBody, _>(Error::other("boom".into()))
         });
         let composed = with_request_envelope(&endpoint, inner);
         let err = composed.build().await.unwrap_err();
-        assert!(matches!(err, Error::Other(_)));
+        assert_eq!(err.code(), crate::E_OTHER);
+        assert_eq!(err.message(), "boom");
     }
 
     /// P1: [with_request_envelope] a form factory passes through the

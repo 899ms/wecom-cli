@@ -30,4 +30,4 @@ client.run(vec!["wecom", "hr", "department", "list", "--page-count", "2", "--pag
 
 ## 关键上下文
 
-- `client/run.rs`：分页模式下每页响应独立触发 on_extra_data
+- `client/run/mod.rs`：分页模式下每页响应独立触发 on_extra_data

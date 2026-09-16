@@ -146,7 +146,7 @@ mod tests {
     //!
     //! ### 上下游交互
     //! - 上游：外部 JSON Schema 数据通过本模块反序列化为 Rust 结构体
-    //! - 下游：`resolve.ts` 和 `ts_doc.rs` 消费 JsonSchema 数据结构进行展开和 TS 代码生成
+    //! - 下游：`resolve.rs` 和 `ts_doc.rs` 消费 JsonSchema 数据结构进行展开和 TS 代码生成
 
     use assert_json_diff::assert_json_eq;
     use serde_json::json;
@@ -315,7 +315,7 @@ mod tests {
 
     // ── Arc 序列化/反序列化往返测试 ──
 
-    /// P1：[JsonSchema::] Arc 包裹的嵌套 schema 序列化/反序列化往返
+    /// P1：[JsonSchema] Arc 包裹的嵌套 schema 序列化/反序列化往返
     /// 条件：构建含 Arc 包裹 properties、one_of、items 的 JsonSchema 并序列化再反序列化
     /// 断言：往返后各嵌套字段的 schema_type 保持一致
     #[test]

@@ -1,9 +1,8 @@
 //! Transport trait definitions — open extension points.
 //!
 //! This module defines the trait shape for transport backends.
-//! Concrete implementations are provided by the built-in reference
-//! transport (`HttpTransportBackend`) and, in the future,
-//! by external crates.
+//! The built-in implementation is [`HttpTransportBackend`](crate::HttpTransportBackend);
+//! external crates may supply their own.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -31,7 +30,7 @@ pub trait TransportBackend: Debug + Send + Sync + Any {
     /// Accepts both JSON and multipart form payloads via [`HttpRequestPayload`]
     /// (lazy materialization happens in the sending chain). Implementations
     /// that only support JSON should build the payload and reject non-JSON
-    /// by matching [`HttpRequestBody`].
+    /// by matching [`HttpRequestBody`](crate::HttpRequestBody).
     fn execute<'a>(
         &'a self,
         endpoint: Cow<'a, Endpoint>,
@@ -78,7 +77,7 @@ pub enum TransportResponse {
 
 impl TransportResponse {
     /// Extract [`ExecuteOutput`] from a JSON response, or return
-    /// [`Error::Parse`] for a binary response.
+    /// [`Error::Parse`](crate::Error::Parse) for a binary response.
     pub fn into_json(self) -> Result<ExecuteOutput> {
         match self {
             Self::Json(output) => Ok(output),
@@ -92,13 +91,13 @@ impl TransportResponse {
     }
 
     /// Extract the business `result` field from a JSON response, or return
-    /// [`Error::Parse`] for a binary response.
+    /// [`Error::Parse`](crate::Error::Parse) for a binary response.
     pub fn into_result(self) -> Result<serde_json::Value> {
         self.into_json().map(|o| o.result)
     }
 
     /// Extract the raw [`HttpResponse`] from a binary response, or return
-    /// [`Error::Parse`] for a JSON response.
+    /// [`Error::Parse`](crate::Error::Parse) for a JSON response.
     pub fn into_binary(self) -> Result<HttpResponse> {
         match self {
             Self::Binary(resp) => Ok(resp),

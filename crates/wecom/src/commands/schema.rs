@@ -25,7 +25,7 @@ pub async fn handle_schema_cmd(run: &CliRun<'_>, matches: &ArgMatches) -> Result
     match SchemaSubcmd::from_arg_matches(matches) {
         Ok(SchemaSubcmd::List) => handle_schema_list(run, output).await,
         Ok(SchemaSubcmd::Get { method_path }) => handle_schema_get(run, &method_path, output).await,
-        _ => Err(Error::Other("Unknown schema subcommand".into())),
+        _ => Err(Error::other("Unknown schema subcommand".into())),
     }
 }
 
@@ -54,12 +54,12 @@ async fn handle_schema_get(
 ) -> Result<()> {
     let segments: Vec<_> = method_path.split('.').collect();
     if segments.is_empty() {
-        return Err(Error::Validation("方法路径至少需要包含一段".into()));
+        return Err(Error::validation("方法路径至少需要包含一段"));
     }
 
     let service_name = segments[0];
     if service_name.is_empty() {
-        return Err(Error::Validation("服务名不能为空".into()));
+        return Err(Error::validation("服务名不能为空"));
     }
     let method_segments = &segments[1..];
 
@@ -104,7 +104,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        Client::builder().home_dir(&dir).cwd(&dir).build().unwrap()
+        Client::builder().config_dir(&dir).build().unwrap()
     }
 
     /// P1：[build_schema_cmd] schema 命令构建出正确的子命令结构
@@ -120,7 +120,7 @@ mod tests {
 
     /// P1：[handle_schema_get] 空路径或不存在服务名时 get 命令返回错误
     /// 条件：传入空字符串作为方法路径
-    /// 断言：函数返回 Err(Error::Validation) 且不发网络请求
+    /// 断言：函数返回 Err（错误码 E_VALIDATION）且不发网络请求
     #[tokio::test]
     async fn handle_schema_get_returns_error_for_empty_or_missing_service() {
         // 空路径在本地校验阶段即被拒绝，不会发起网络请求
@@ -129,15 +129,16 @@ mod tests {
         let output = CliRunOutput::new(std::io::sink());
         let result = handle_schema_get(&run, "", &output).await;
         assert!(result.is_err(), "empty path should return an error");
-        assert!(
-            matches!(result.unwrap_err(), Error::Validation(_)),
+        assert_eq!(
+            result.unwrap_err().code(),
+            crate::E_VALIDATION,
             "expected Validation error for empty service name"
         );
     }
 
     /// P1：[handle_schema_cmd] handle_schema_cmd 未知子命令返回错误
     /// 条件：传入不含子命令的 schema 命令参数（触发 required 错误）
-    /// 断言：错误类型为 Error::Other(_)
+    /// 断言：错误类型为 Error::other(_)
     #[test]
     fn handle_schema_cmd_unknown_returns_error() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -151,10 +152,10 @@ mod tests {
                         let cli_run = client.run(vec!["wecom".into(), "schema".into()]);
                         handle_schema_cmd(&cli_run, &m).await
                     }
-                    Err(e) => Err(Error::Other(e.to_string().into())),
+                    Err(e) => Err(Error::other(e.to_string().into())),
                 }
             })
             .unwrap_err();
-        assert!(matches!(err, Error::Other(_)));
+        assert_eq!(err.code(), crate::E_OTHER);
     }
 }

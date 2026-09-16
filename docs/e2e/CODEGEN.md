@@ -165,7 +165,7 @@ let tmp = tempfile::tempdir().unwrap();
 如果需要 `config.json`：
 
 ```rust
-setup_config_json(tmp.path(), &json!({"tmp_dir": "/tmp/wecom-custom"}));
+setup_config_json(tmp.path(), &json!({"headers": {"X-Custom": "val"}}));
 ```
 
 ### 3f. Test client（library-level）

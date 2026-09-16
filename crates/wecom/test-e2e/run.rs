@@ -47,6 +47,11 @@ mod client {
         use super::*;
         include!("cases/client/007-set-base-url-discovery/test.rs");
     }
+
+    mod default_fallback_sandbox {
+        use super::*;
+        include!("cases/client/008-default-fallback-sandbox/test.rs");
+    }
 }
 
 // ── run (argv-driven) ───────────────────────────────────────
@@ -205,6 +210,11 @@ mod error {
         use super::*;
         include!("cases/error/003-json-repair/test.rs");
     }
+
+    mod unescaped_quotes_dry_run {
+        use super::*;
+        include!("cases/error/004-unescaped-quotes-dry-run/test.rs");
+    }
 }
 
 // ── pagination ──────────────────────────────────────────────
@@ -289,6 +299,11 @@ mod directive {
         use super::*;
         include!("cases/directive/003-octet-stream/test.rs");
     }
+
+    mod file_save_malicious_name {
+        use super::*;
+        include!("cases/directive/004-file-save-malicious-name/test.rs");
+    }
 }
 
 // ── output ──────────────────────────────────────────────────
@@ -301,9 +316,9 @@ mod output {
         include!("cases/output/001-file/test.rs");
     }
 
-    mod dir {
+    mod output_dir_non_download {
         use super::*;
-        include!("cases/output/002-dir/test.rs");
+        include!("cases/output/002-output-dir-non-download/test.rs");
     }
 
     mod binary {
@@ -311,26 +326,18 @@ mod output {
         include!("cases/output/003-binary/test.rs");
     }
 
-    mod tmp_dir {
+    mod default_cwd {
         use super::*;
-        include!("cases/output/004-tmp-dir/test.rs");
-    }
-}
-
-// ── fs ───────────────────────────────────────────────────────
-
-mod fs {
-    use wecom::PathResolver;
-
-    use super::*;
-
-    mod path_resolver_via_builder {
-        use super::*;
-        include!("cases/fs/001-path-resolver-via-builder/test.rs");
+        include!("cases/output/004-default-cwd/test.rs");
     }
 
-    mod path_resolver_via_run {
+    mod output_dir_shapes {
         use super::*;
-        include!("cases/fs/002-path-resolver-via-run/test.rs");
+        include!("cases/output/005-output-dir-shapes/test.rs");
+    }
+
+    mod dry_run_output_dir_gate {
+        use super::*;
+        include!("cases/output/006-dry-run-output-dir-gate/test.rs");
     }
 }

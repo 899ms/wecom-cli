@@ -134,6 +134,9 @@ mod platform {
         })
     }
 
+    // SAFETY: 读取内核 procfs 的进程元数据（`/proc/<pid>/stat`、`/proc/<pid>/comm`），
+    // 仅用于还原父进程链。路径由 pid 派生、非用户输入，且 /proc 不在任何沙箱根之内。
+    #[allow(clippy::disallowed_methods)]
     #[cfg(target_os = "linux")]
     pub(super) fn info(pid: u32) -> Option<NodeInfo> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

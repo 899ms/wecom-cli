@@ -16,4 +16,4 @@
 
 ## 关键上下文
 
-- `client/run.rs`：扩展命令的 clap 定义整体并入命令树，子命令帮助由 clap 原生渲染
+- `client/run/execute.rs`：扩展命令的 clap 定义整体并入命令树，子命令帮助由 clap 原生渲染

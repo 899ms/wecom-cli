@@ -18,8 +18,7 @@ fn build_transport_with_headers(
 /// Helper: build a client with the given transport.
 fn build_client_with_transport(transport: wecom_transport::Transport) -> wecom::Client {
     wecom::Client::builder()
-        .home_dir(leaked_tempdir())
-        .tmp_dir(leaked_tempdir())
+        .config_dir(leaked_tempdir())
         .transport(transport)
         .build()
         .unwrap()
