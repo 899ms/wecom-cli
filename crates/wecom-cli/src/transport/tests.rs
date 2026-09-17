@@ -5,9 +5,9 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-use wecom_transport::{HttpTransportBackend, RequestOptions, ResponseEnvelope, Transport};
+use wecom_transport::{HttpTransportBackend, ResponseEnvelope, Transport};
 
-use super::backend::{TOKEN_EXPIRED_ERRCODE, is_token_expired, set_bearer_token};
+use super::backend::tests::new_with_material;
 use super::capability::{RequireAuth, SuppressAuth};
 use super::envelope::{FlatRes, NestedRes};
 use super::*;
@@ -36,88 +36,13 @@ fn wrapped_transport(
         .base_url(base_url)
         .build()
         .expect("valid")
-        .wrap_backend(|backend| {
-            Arc::new(WecomBackend::new(
-                backend,
-                bot,
-                token.map(str::to_owned),
-                auth_ep(auth_endpoint),
-            ))
-        })
+        .wrap_backend(|backend| Arc::new(new_with_material(backend, bot, token, auth_endpoint)))
 }
 
 /// 构造带 base_url / envelope 的 HTTP endpoint（鉴权能力由各用例自行挂载）。
 fn ep(base: &str, path: &str) -> wecom_transport::Endpoint {
     wecom_transport::Endpoint::new()
         .with(wecom_transport::HttpEndpoint::new(path).with_service(base))
-}
-
-/// 装配鉴权引导端点（与 auth 侧引导端点等价：FlatRes 信封 + SuppressAuth）。
-fn auth_ep(url: &str) -> wecom_transport::Endpoint {
-    wecom_transport::Endpoint::new()
-        .with(wecom_transport::HttpEndpoint::from_url(url).with_res_envelope(FlatRes))
-        .with(SuppressAuth)
-}
-
-fn api_error(code: Option<i64>) -> wecom_transport::Error {
-    wecom_transport::Error::Api {
-        message: "err".into(),
-        action: "test".into(),
-        code,
-        body: Box::new(serde_json::Value::Null),
-    }
-}
-
-/// P0：[is_token_expired] 853004 命中刷新
-/// 条件：构造 code=853004 的 Api 错误
-/// 断言：is_token_expired() 返回 true
-#[test]
-fn token_expired_errcode_matches() {
-    assert!(is_token_expired(&api_error(Some(TOKEN_EXPIRED_ERRCODE))));
-}
-
-/// P0：[is_token_expired] 其它业务错误码 / code 缺失 / 非 Api 变体均不命中
-/// 条件：分别构造 code=40001、code=None、Error::Other
-/// 断言：is_token_expired() 均返回 false
-#[test]
-fn other_errors_do_not_match() {
-    assert!(!is_token_expired(&api_error(Some(40001))));
-    assert!(!is_token_expired(&api_error(None)));
-    assert!(!is_token_expired(&wecom_transport::Error::other(
-        "x".into()
-    )));
-}
-
-/// P0：[set_bearer_token] 写入 Bearer 头且标记敏感
-/// 条件：默认 options 写入 tok-1
-/// 断言：写入后 Authorization == "Bearer tok-1"，且 is_sensitive()
-#[test]
-fn set_bearer_token_marks_sensitive() {
-    let mut options = RequestOptions::default();
-    set_bearer_token(&mut options, "tok-1");
-    let value = options
-        .wire
-        .headers
-        .get(reqwest::header::AUTHORIZATION)
-        .unwrap();
-    assert_eq!(value.to_str().unwrap(), "Bearer tok-1");
-    assert!(value.is_sensitive(), "token 头应标记敏感");
-}
-
-/// P1：[set_bearer_token] 覆写已有 Authorization 头
-/// 条件：先写 "old" 再写 "new"
-/// 断言：Authorization == "Bearer new"
-#[test]
-fn set_bearer_token_overwrites() {
-    let mut options = RequestOptions::default();
-    set_bearer_token(&mut options, "old");
-    set_bearer_token(&mut options, "new");
-    let value = options
-        .wire
-        .headers
-        .get(reqwest::header::AUTHORIZATION)
-        .unwrap();
-    assert_eq!(value.to_str().unwrap(), "Bearer new");
 }
 
 /// P1：[WecomBackend] 经 wrap_backend 装饰后 name 委托内层
@@ -130,11 +55,11 @@ fn wrap_backend_decorates_in_place() {
         .build()
         .expect("valid");
     let transport = transport.wrap_backend(|backend| {
-        Arc::new(WecomBackend::new(
+        Arc::new(new_with_material(
             backend,
             Some(auth::Bot::new("bot1".into(), "secret1".into())),
-            Some("tok-1".into()),
-            auth_ep(TEST_AUTH_ENDPOINT),
+            Some("tok-1"),
+            TEST_AUTH_ENDPOINT,
         ))
     });
     assert_eq!(transport.name(), "http");
@@ -145,30 +70,15 @@ fn wrap_backend_decorates_in_place() {
 /// 断言：Debug 输出不含这两个敏感值
 #[test]
 fn debug_does_not_leak_secrets() {
-    let backend = WecomBackend::new(
+    let backend = new_with_material(
         Arc::new(HttpTransportBackend::default()),
         Some(auth::Bot::new("bot1".into(), "super-secret".into())),
-        Some("cached-token".into()),
-        auth_ep(TEST_AUTH_ENDPOINT),
+        Some("cached-token"),
+        TEST_AUTH_ENDPOINT,
     );
     let dbg = format!("{backend:?}");
     assert!(!dbg.contains("super-secret"), "secret 泄露: {dbg}");
     assert!(!dbg.contains("cached-token"), "token 泄露: {dbg}");
-}
-
-/// P1：[WecomBackend] 无 bot 凭据时 bot 为 None，token 缓存保持正常
-/// 条件：构造 bot=None、token=Some("cached-token") 的 WecomBackend
-/// 断言：bot 为 None；cached_token() == Some("cached-token")
-#[test]
-fn no_bot_credentials_token_cached() {
-    let backend = WecomBackend::new(
-        Arc::new(HttpTransportBackend::default()),
-        None,
-        Some("cached-token".into()),
-        auth_ep(TEST_AUTH_ENDPOINT),
-    );
-    assert!(backend.bot.is_none());
-    assert_eq!(backend.cached_token().as_deref(), Some("cached-token"));
 }
 
 // ── 动态 Authorization 注入 ───────────────────────────────
@@ -202,6 +112,7 @@ async fn injects_auth_when_require_auth_and_token_available() {
 /// P0：[WecomBackend] 挂 RequireAuth + 无 token → Err(Error::Auth)，请求不发出
 /// 条件：endpoint 挂 RequireAuth，无 token；mock expect(0)
 /// 断言：invoke 返回 Err(Wrapped(OtherError(CliError::Auth)))，mock 未被调用
+#[cfg(not(feature = "skip-auth-check"))]
 #[tokio::test]
 async fn rejects_require_auth_without_token() {
     let server = MockServer::start().await;
@@ -228,6 +139,34 @@ async fn rejects_require_auth_without_token() {
         }
         other => panic!("expected Wrapped(CliError::Auth), got {other:?}"),
     }
+    server.verify().await;
+}
+
+/// P0：[WecomBackend] skip-auth-check 下挂 RequireAuth + 无 token → 跳过门禁，
+/// 请求不注入 Authorization 照常发出（由后台鉴权错误兜底）
+/// 条件：endpoint 挂 RequireAuth，无 token；mock expect(1)
+/// 断言：invoke 成功返回，mock 被调用一次
+#[cfg(feature = "skip-auth-check")]
+#[tokio::test]
+async fn skips_require_auth_gate_without_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .and(NoAuthorization)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": "{\"ok\":true}"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let transport = wrapped_transport(&server.uri(), None, None, TEST_AUTH_ENDPOINT);
+    let endpoint = ep(&server.uri(), "/auth").with(RequireAuth);
+    let v = transport
+        .invoke(&endpoint, json!({}))
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    assert_json_eq!(v, json!({"ok": true}));
     server.verify().await;
 }
 
@@ -482,44 +421,188 @@ async fn refresh_reuses_execute_options_without_stale_auth() {
     }
 }
 
-// ── WECOM_CLI_ACCESS_TOKEN 覆盖 ─────────────────────────────
-
-/// P0：[resolve_access_token] WECOM_CLI_ACCESS_TOKEN 覆盖 auth 提供的 token
-/// 条件：设置 WECOM_CLI_ACCESS_TOKEN=env-tok，隔离凭据目录（auth::load_token 返回 None）
-/// 断言：resolve_access_token() == Some("env-tok")
-#[cfg(feature = "custom-endpoint")]
+/// P0：[WecomBackend] 引导端点自身返回 853004 时不得重入刷新（自死锁回归）
+/// 条件：业务请求（携带 token）返回 853004；引导端点也返回 853004（FlatRes
+///       信封将其转为 Error::Api{853004}）
+/// 断言：调用在超时内返回原错误（不得挂起）；引导端点仅命中一次
 #[tokio::test]
-async fn access_token_env_overrides_auth_token() {
+async fn bootstrap_853004_does_not_reenter_refresh() {
+    // 隔离凭据目录：避免命中本机真实 credentials.enc 干扰刷新路径。
     let _guard = crate::env::TEST_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     unsafe {
         std::env::set_var(crate::env::CONFIG_DIR, dir.path());
-        std::env::set_var(crate::env::ACCESS_TOKEN, "env-tok");
     }
-    let r = resolve_access_token();
+    async {
+        let server = MockServer::start().await;
+        let auth_url = format!("{}/bootstrap", server.uri());
+
+        // 1. 业务请求：旧 token → 853004
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {"code": 853004, "message": "token expired"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 2. 引导端点同样返回 853004：挂 SuppressAuth（不携带 token），
+        //    不得再次触发刷新（否则在 refresh_lock 上自死锁）。
+        Mock::given(method("POST"))
+            .and(path("/bootstrap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errcode": 853004, "errmsg": "token expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = wrapped_transport(
+            &server.uri(),
+            Some(auth::Bot::new("bot1".into(), "secret1".into())),
+            Some("tok-old"),
+            &auth_url,
+        );
+        let endpoint = ep(&server.uri(), "/api").with(RequireAuth);
+
+        // 超时兜底：若重入刷新自死锁，invoke 将永不返回。
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transport.invoke(&endpoint, json!({})),
+        )
+        .await
+        .expect("must not deadlock on bootstrap 853004")
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                wecom_transport::Error::Api {
+                    code: Some(853004),
+                    ..
+                }
+            ),
+            "expected the original 853004 error, got {err:?}"
+        );
+        server.verify().await;
+    }
+    .await;
     unsafe {
-        std::env::remove_var(crate::env::ACCESS_TOKEN);
         std::env::remove_var(crate::env::CONFIG_DIR);
     }
-    assert_eq!(r.as_deref(), Some("env-tok"));
 }
 
-/// P1：[resolve_access_token] 环境变量为空时回退 auth 提供的 token
-/// 条件：WECOM_CLI_ACCESS_TOKEN=""，隔离凭据目录（无凭据 → load_token 返回 None）
-/// 断言：resolve_access_token() == None（空环境变量不生效，走回退路径）
-#[cfg(feature = "custom-endpoint")]
+/// P0：[WecomBackend] env 来源 token 命中 853004 → 返回 Error::Auth 提示更新
+/// WECOM_CLI_ACCESS_TOKEN，不发起鉴权引导换取
+/// 条件：AuthSession 持 Env 变体；业务端点返回 853004；引导端点 expect(0)
+/// 断言：错误为 Other(CliError::Auth) 且文案含 WECOM_CLI_ACCESS_TOKEN
 #[tokio::test]
-async fn access_token_env_empty_falls_back_to_auth() {
+async fn env_token_expired_returns_auth_hint_without_bootstrap() {
+    let server = MockServer::start().await;
+    let auth_url = format!("{}/bootstrap", server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "error": {"code": 853004, "message": "token expired"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bootstrap"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"errcode": 0, "token": "t"})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let session = Arc::new(auth::AuthSession::new(
+        Some(auth::ResolvedAuthorization::Env {
+            token: "env-tok".into(),
+        }),
+        auth::auth_endpoint(&auth_url),
+    ));
+    let transport = HttpTransportBackend::builder()
+        .base_url(server.uri())
+        .build()
+        .expect("valid")
+        .wrap_backend(|backend| Arc::new(WecomBackend::new(backend, session)));
+    let endpoint = ep(&server.uri(), "/api").with(RequireAuth);
+
+    let err = transport.invoke(&endpoint, json!({})).await.unwrap_err();
+    match err {
+        wecom_transport::Error::Wrapped(w) => {
+            let inner = w
+                .as_any()
+                .downcast_ref::<wecom_error::OtherError>()
+                .and_then(|o| o.0.downcast_ref::<CliError>());
+            assert!(
+                inner.is_some_and(
+                    |e| matches!(e, CliError::Auth(msg) if msg.contains(crate::env::ACCESS_TOKEN))
+                ),
+                "expected CliError::Auth mentioning WECOM_CLI_ACCESS_TOKEN, got {inner:?}"
+            );
+        }
+        other => panic!("expected Wrapped(CliError::Auth), got {other:?}"),
+    }
+    server.verify().await;
+}
+
+/// P0：[WecomBackend] 文件来源但无 bot 凭据命中 853004 → 不参与刷新，回传原始 853004
+/// 条件：AuthSession 持 Credentials{ bot: None, token: Some }；业务端点返回 853004；
+///       引导端点 expect(0)
+/// 断言：错误为 Error::Api{ code: 853004 }（原始业务错误）
+#[tokio::test]
+async fn missing_bot_credentials_returns_original_853004() {
+    // 隔离凭据目录：避免命中本机真实 credentials.enc 干扰刷新双检。
     let _guard = crate::env::TEST_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     unsafe {
         std::env::set_var(crate::env::CONFIG_DIR, dir.path());
-        std::env::set_var(crate::env::ACCESS_TOKEN, "");
     }
-    let r = resolve_access_token();
+    async {
+        let server = MockServer::start().await;
+        let auth_url = format!("{}/bootstrap", server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {"code": 853004, "message": "token expired"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bootstrap"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"errcode": 0, "token": "t"})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let transport = wrapped_transport(&server.uri(), None, Some("tok-old"), &auth_url);
+        let endpoint = ep(&server.uri(), "/api").with(RequireAuth);
+        let err = transport.invoke(&endpoint, json!({})).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                wecom_transport::Error::Api {
+                    code: Some(853004),
+                    ..
+                }
+            ),
+            "expected the original 853004 error, got {err:?}"
+        );
+        server.verify().await;
+    }
+    .await;
     unsafe {
-        std::env::remove_var(crate::env::ACCESS_TOKEN);
         std::env::remove_var(crate::env::CONFIG_DIR);
     }
-    assert_eq!(r, None);
 }
+
+// ── token/bot 同源对齐 ────────────────────────────────────────
+// 授权材料的同源解析（env 覆盖 / 文件同源 / bot-only 保留）已由
+// `auth::resolve::resolve_authorization` 的单元测试覆盖（见 auth/resolve.rs），
+// 会话层 refreshable/token 缓存见 auth/session.rs，此处不再重复。

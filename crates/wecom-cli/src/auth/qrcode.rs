@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::bot::Bot;
+use super::types::Bot;
 use crate::{Error, Result};
 
 const SOURCE: &str = "wecom_cli_external";

@@ -1,25 +1,18 @@
-//! 本地凭据总账：bot 信息与 Bearer token 共存于单一加密文件（`credentials.enc`）。
+//! 本地凭据总账持久化：bot 信息与 Bearer token 共存于单一加密文件（`credentials.enc`）。
 
 use std::fs;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::Result;
 use crate::config::default_home_dir;
 
-use super::bot::Bot;
 use super::crypto;
-
-/// 本地凭据总账：bot 信息与 Bearer token 共存于同一加密文件，保证原子更新。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Credentials {
-    pub bot: Option<Bot>,
-    pub token: Option<String>,
-}
+use super::types::Credentials;
 
 /// Return the file path for the encrypted credentials file.
-pub(crate) fn credentials_path() -> PathBuf {
+///
+/// 路径受 `WECOM_CLI_CONFIG_DIR` 控制（见 [`default_home_dir`]）。
+pub fn credentials_path() -> PathBuf {
     default_home_dir().join("credentials.enc")
 }
 
@@ -78,10 +71,10 @@ pub fn clear_credentials() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! ## 模块摘要：credentials（本地凭据总账）
+    //! ## 模块摘要：store（本地凭据总账持久化）
     //!
     //! ### 关键接口
-    //! - [Credentials] — bot 信息与 Bearer token 共存的联合结构
+    //! - [Credentials] — bot 信息与 Bearer token 共存的联合结构（见 [`super::types`]）
     //! - [load_credentials] — 读取凭据文件（缺失/解密失败返回 None）
     //! - [save_credentials] — 加密落盘；bot 与 token 皆空时删除文件
     //! - [clear_credentials] — 删除凭据文件（缺失时 no-op）
@@ -94,12 +87,12 @@ mod tests {
     //!
     //! ### 上下游交互
     //! - 上游：`auth init` 等命令经 [save_credentials] 写入
-    //! - 下游：`auth::token::load_token` / `auth::bot::get_bot_info` 读取
+    //! - 下游：`auth::resolve::resolve_authorization` / `auth::session` 读取
 
     use base64::prelude::*;
 
     use super::*;
-    use crate::auth::{bot, token};
+    use crate::auth::types::Bot;
 
     /// 在临时 `WECOM_CLI_CONFIG_DIR` 下执行异步闭包（按值传入路径，避免借用跨 await），结束后清理环境变量。
     ///
@@ -206,7 +199,6 @@ mod tests {
     #[tokio::test]
     async fn clear_missing_file_noop() {
         with_temp_dir(|dir| async move {
-            write_key(&dir, &fresh_key());
             clear_credentials().unwrap();
             assert!(!dir.join("credentials.enc").exists());
         })
@@ -285,9 +277,9 @@ mod tests {
 
     /// P1：密钥不符时 token 读取返回 None
     /// 条件：用密钥 A 保存凭据后，将本地密钥替换为密钥 B
-    /// 断言：token::load_token() 返回 None（密文无法解密）
+    /// 断言：load_credentials() 返回 None（密文无法解密）
     #[tokio::test]
-    async fn load_token_wrong_key_returns_none() {
+    async fn wrong_key_returns_none() {
         with_temp_dir(|dir| async move {
             let key_a = fresh_key();
             let key_b = fresh_key();
@@ -297,7 +289,7 @@ mod tests {
             save_credentials(&c).await.unwrap();
 
             write_key(&dir, &key_b); // 替换密钥 → 密文无法解密
-            assert!(token::load_token().is_none());
+            assert!(load_credentials().is_none());
         })
         .await;
     }
@@ -316,8 +308,8 @@ mod tests {
             // 模拟 handle_init 失败回滚：清空凭据。
             clear_credentials().unwrap();
             assert!(!dir.join("credentials.enc").exists());
-            assert!(bot::get_bot_info().is_none());
-            assert!(token::load_token().is_none());
+            assert!(load_credentials().and_then(|c| c.bot).is_none());
+            assert!(load_credentials().and_then(|c| c.token).is_none());
         })
         .await;
     }

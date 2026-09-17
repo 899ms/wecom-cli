@@ -17,9 +17,9 @@ use wecom_transport::Transport;
 use crate::Result;
 
 use super::bootstrap::{BindSource, fetch_auth};
-use super::bot::Bot;
-use super::credentials::{Credentials, legacy_paths, save_credentials};
 use super::crypto;
+use super::store::{legacy_paths, save_credentials};
+use super::types::{Bot, Credentials};
 
 /// 启动时尝试迁移旧版凭据（`bot.enc` → `credentials.enc`）。
 ///
@@ -33,14 +33,14 @@ use super::crypto;
 ///
 /// 仅当最终落盘（[`save_credentials`]）失败时返回 `Err`（本地 IO 属系统级异常）。
 ///
-/// 读取旧凭据文件为 app 内部存储，不经沙箱（同 [`credentials`](super::credentials)）。
+/// 读取旧凭据文件为 app 内部存储，不经沙箱（同 [`store`](super::store)）。
 #[allow(clippy::disallowed_methods)]
 pub async fn try_migrate_legacy_credentials(
     transport: &Transport,
     auth_endpoint: &wecom_transport::Endpoint,
 ) -> Result<bool> {
     // 1. 已有新凭据 → 不迁移（不碰 legacy 文件）。
-    if super::credentials::credentials_path().exists() {
+    if super::store::credentials_path().exists() {
         return Ok(false);
     }
 
@@ -116,7 +116,7 @@ mod tests {
 
     use super::*;
     use crate::auth::bootstrap::auth_endpoint;
-    use crate::auth::{load_credentials, load_token};
+    use crate::auth::load_credentials;
     use crate::env::TEST_ENV_LOCK;
 
     /// 在临时 `WECOM_CLI_CONFIG_DIR` 下执行异步闭包，结束后清理环境变量。
@@ -161,7 +161,7 @@ mod tests {
     /// P0：无 credentials.enc + 有 bot.enc + 引导端点返回 token → 迁移成功
     /// 条件：预置旧 bot.enc（含 botid/secret），wiremock 返回 token
     /// 断言：返回 true；credentials.enc 生成；legacy 文件**保留**；
-    ///       后续 load_credentials/load_token 可读回新凭据
+    ///       后续 load_credentials 可读回新凭据
     #[tokio::test]
     async fn migrates_legacy_credentials() {
         with_temp_dir(|dir| async move {
@@ -203,7 +203,6 @@ mod tests {
             let creds = load_credentials().expect("credentials readable");
             assert_eq!(creds.bot.as_ref().unwrap().id, "bot-legacy");
             assert_eq!(creds.token.as_deref(), Some("tok-migrated"));
-            assert_eq!(load_token().as_deref(), Some("tok-migrated"));
 
             server.verify().await;
         })

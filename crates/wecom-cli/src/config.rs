@@ -129,9 +129,25 @@ pub fn apply_config(mut builder: ClientBuilder, _cfg: &ConfigFile) -> Result<Cli
 
 // ── Resolution helpers ───────────────────────────────────────────
 
-/// Resolve: non-empty env var > non-empty config value.
+/// 端点 URL 统一解析（优先级高 → 低）：
+/// 1. `runtime`：运行时来源（env > config.json，仅 `custom-endpoint` feature
+///    下由调用方经 `runtime_endpoint` 求值，否则传 `None`）
+/// 2. `compile_time`：编译期环境变量值（调用方经 `option_env!` 传入；空值视为未设置）
+/// 3. `default` 兜底
+pub fn resolve_endpoint(
+    runtime: Option<String>,
+    compile_time: Option<&str>,
+    default: &str,
+) -> String {
+    runtime
+        .filter(|v| !v.is_empty())
+        .or_else(|| compile_time.filter(|v| !v.is_empty()).map(str::to_owned))
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// 运行时端点来源解析：非空 env > 非空 config 值（`custom-endpoint` feature 专用）。
 #[cfg(feature = "custom-endpoint")]
-pub fn env_or_config(env_name: &str, cfg_val: Option<&str>) -> Option<String> {
+pub fn runtime_endpoint(env_name: &str, cfg_val: Option<&str>) -> Option<String> {
     std::env::var(env_name)
         .ok()
         .filter(|v| !v.is_empty())
@@ -294,6 +310,47 @@ mod tests {
         let cfg: ConfigFile = serde_json::from_value(raw).unwrap();
         #[cfg(feature = "custom-endpoint")]
         assert_eq!(cfg.base_url, Some("http://a.com".to_string()));
+    }
+
+    // ========== resolve_endpoint ==========
+
+    /// P0：[resolve_endpoint] 运行时来源优先级最高
+    /// 条件：runtime / compile_time / default 均有值
+    /// 断言：返回 runtime 值
+    #[test]
+    fn resolve_endpoint_runtime_wins() {
+        assert_eq!(
+            resolve_endpoint(Some("rt".to_string()), Some("ct"), "def"),
+            "rt"
+        );
+    }
+
+    /// P0：[resolve_endpoint] 运行时空串跳级到编译期来源
+    /// 条件：runtime 为空串，compile_time 有值
+    /// 断言：返回 compile_time 值
+    #[test]
+    fn resolve_endpoint_empty_runtime_falls_to_compile_time() {
+        assert_eq!(
+            resolve_endpoint(Some(String::new()), Some("ct"), "def"),
+            "ct"
+        );
+    }
+
+    /// P0：[resolve_endpoint] 仅编译期来源生效
+    /// 条件：runtime 为 None，compile_time 有值
+    /// 断言：返回 compile_time 值
+    #[test]
+    fn resolve_endpoint_compile_time_only() {
+        assert_eq!(resolve_endpoint(None, Some("ct"), "def"), "ct");
+    }
+
+    /// P0：[resolve_endpoint] 全空（含编译期空串）回落 default
+    /// 条件：runtime 为 None，compile_time 为 None 或空串
+    /// 断言：返回 default
+    #[test]
+    fn resolve_endpoint_all_empty_falls_back_to_default() {
+        assert_eq!(resolve_endpoint(None, None, "def"), "def");
+        assert_eq!(resolve_endpoint(None, Some(""), "def"), "def");
     }
 
     // ========== absolutize_external_path ==========

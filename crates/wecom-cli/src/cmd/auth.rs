@@ -84,10 +84,10 @@ async fn handle_auth_cmd(run: &wecom::CliRun<'_>, matches: &ArgMatches) -> Resul
 /// 输出当前授权状态（纯文本，经 [`wecom::CliRunOutput`] 写出以支持 writer 注入）。
 fn handle_show(run: &wecom::CliRun<'_>, args: ShowArgs) -> Result<()> {
     let output = run.get_output();
-    let bot = auth::get_bot_info();
+    let auth = auth::resolve_authorization();
 
     if args.status {
-        output.print(if bot.is_some() {
+        output.print(if auth.is_some() {
             "authorized"
         } else {
             "unauthorized"
@@ -95,10 +95,15 @@ fn handle_show(run: &wecom::CliRun<'_>, args: ShowArgs) -> Result<()> {
         return Ok(());
     }
 
-    match bot {
-        Some(bot) => {
+    // 授权来源对齐：env token 生效时无配套 bot，不展示 Bot ID；文件来源
+    // 时展示同源 bot（两者分属不同身份，同源语义见 auth::ResolvedAuthorization）。
+    match auth {
+        Some(auth::ResolvedAuthorization::Env { .. }) => output.print("Status: authorized"),
+        Some(auth::ResolvedAuthorization::Credentials(creds)) => {
             output.print("Status: authorized");
-            output.print(&format!("Bot ID: {}", bot.id));
+            if let Some(bot) = creds.bot {
+                output.print(&format!("Bot ID: {}", bot.id));
+            }
         }
         None => output.print("Status: unauthorized"),
     }

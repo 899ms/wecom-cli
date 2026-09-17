@@ -13,31 +13,42 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
-use super::bot::Bot;
+use super::types::Bot;
 
 // ---------------------------------------------------------------------------
 // Endpoint / Cli-Info
 // ---------------------------------------------------------------------------
 
 /// 鉴权引导端点（botid+secret 签名调用换取 Bearer token），默认 product/正式环境。
+///
+/// 解析优先级（高 → 低）：
+/// 1. 运行时 `WECOM_CLI_AUTH_ENDPOINT` 环境变量（`custom-endpoint` feature）
+/// 2. `config.json` 的 `auth_endpoint`（`custom-endpoint` feature）
+/// 3. 编译期 `WECOM_CLI_AUTH_ENDPOINT` 环境变量
+/// 4. 本常量兜底
 const DEFAULT_AUTH_ENDPOINT: &str = "https://qyapi.weixin.qq.com/cgi-bin/aibot/cli/get_cli_config";
 
-/// 解析并装配鉴权引导端点：`custom-endpoint` feature 下按
-/// `WECOM_CLI_AUTH_ENDPOINT` env > `config.json` 的 `auth_endpoint` > 默认
-/// 解析 URL，再经 [`auth_endpoint`] 装配（扁平信封 + 抑制注入）。
+/// 解析并装配鉴权引导端点（优先级见 [`DEFAULT_AUTH_ENDPOINT`]），
+/// 再经 [`auth_endpoint`] 装配（扁平信封 + 抑制注入）。
 ///
 /// `cfg` 为调用方已加载（或经 Client 扩展袋注入）的配置，可缺省：
-/// `None`（未注入）时直接回退默认端点，不报错。
-#[cfg_attr(not(feature = "custom-endpoint"), allow(unused_variables))]
+/// `None`（未注入）时跳过 config.json 一级，不报错。
 pub fn resolve_auth_endpoint(cfg: Option<&crate::config::ConfigFile>) -> wecom_transport::Endpoint {
     #[cfg(feature = "custom-endpoint")]
-    let resolved = crate::config::env_or_config(
+    let runtime = crate::config::runtime_endpoint(
         crate::env::AUTH_ENDPOINT,
         cfg.and_then(|c| c.auth_endpoint.as_deref()),
-    )
-    .unwrap_or_else(|| DEFAULT_AUTH_ENDPOINT.to_string());
+    );
     #[cfg(not(feature = "custom-endpoint"))]
-    let resolved = DEFAULT_AUTH_ENDPOINT.to_string();
+    let runtime = {
+        let _ = cfg;
+        None
+    };
+    let resolved = crate::config::resolve_endpoint(
+        runtime,
+        option_env!("WECOM_CLI_AUTH_ENDPOINT"),
+        DEFAULT_AUTH_ENDPOINT,
+    );
     auth_endpoint(&resolved)
 }
 
@@ -216,7 +227,7 @@ mod tests {
     //! - [sha256_hex] — SHA-256 小写零填充 hex
     //! - [FetchAuthRequest::build] — 构建带签名的请求体（time/nonce/signature/bind_source）
     //! - [BindSource] — 绑定来源枚举（Interactive=1 / Qrcode=2，序列化为数字）
-    //! - [resolve_auth_endpoint] — 鉴权端点解析（基于已加载的 ConfigFile，`custom-endpoint` feature 下 env > config.json > 默认）
+    //! - [resolve_auth_endpoint] — 鉴权端点解析（运行时 env > config.json（均限 `custom-endpoint` feature）> 编译期 env > 默认）
     //! - [fetch_auth] — 复用 Client::transport 调用 get_cli_config 换取 Bearer token（未直接单测，走 e2e）
     //!
     //! ### 关键分支与异常路径

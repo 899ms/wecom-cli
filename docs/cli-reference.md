@@ -143,6 +143,7 @@ wecom-cli cache clear                        # 清除所有 discovery 缓存
 | 变量 | 作用 |
 | --- | --- |
 | `WECOM_CLI_CONFIG_DIR` | 覆盖默认配置目录 |
+| `WECOM_CLI_ACCESS_TOKEN` | 直接指定 Bearer access token，优先于 `credentials.enc` 文件来源（空串视为未设置）。无配套 bot 凭据：token 失效（853004）时不参与静默刷新，直接返回错误，需自行更新该环境变量 |
 | `WECOM_CLI_ADDITIONAL_HEADERS` | 额外请求头，值为 JSON object（`Record<string, string>`）；同时支持 `WECOM_CLI_ADDITIONAL_HEADERS_*` 后缀形式的多个变量，取值同为 JSON object |
 | `WECOM_CLI_LOG_LEVEL` | 打开 stderr 文本日志并设置过滤级别（如 `debug`、`wecom=trace`；非法值回退 `warn`） |
 | `WECOM_CLI_LOG_DIR` | 打开 JSON Lines 日志输出，按天写入 `<dir>/ww.log.<日期>`（UTC+8） |
@@ -164,7 +165,7 @@ wecom-cli cache clear                        # 清除所有 discovery 缓存
 说明：
 
 - 环境变量优先级高于配置文件。
-- access token 不允许经 `config.json` 配置，仅来自 `credentials.enc`。
+- access token 不允许经 `config.json` 配置，来自 `WECOM_CLI_ACCESS_TOKEN` 环境变量（优先）或 `credentials.enc`。
 
 ## 退出码与错误格式
 

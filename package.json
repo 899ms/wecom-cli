@@ -29,7 +29,9 @@
     "lint": "cargo clippy --workspace --all-targets --features custom-endpoint -- -D warnings",
     "lint:all": "cargo hack clippy --workspace --all-targets --feature-powerset -- -D warnings",
     "prepare": "lefthook install",
-    "test": "cargo test --workspace --all-targets --features custom-endpoint",
+    "test": "pnpm test:default && pnpm test:skip-auth-check",
+    "test:default": "cargo test --workspace --all-targets --features custom-endpoint",
+    "test:skip-auth-check": "cargo test --workspace --all-targets --features custom-endpoint,skip-auth-check",
     "test:doc": "cargo test --workspace --doc"
   },
   "devDependencies": {

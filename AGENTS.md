@@ -58,9 +58,9 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 | 模块 | 职责 |
 | --- | --- |
 | `main.rs` | 装配入口：加载 `.env` 与 `config.json` → 初始化日志与 telemetry → 构建 transport 与 `Client` → `client.run(argv)`；命令未找到时在 stderr 追加 skill 更新提示 |
-| `auth/` | 鉴权体系：`credentials.rs` 单一凭据总账 `credentials.enc`（bot + token，AES-256-GCM，0600）；`crypto/` 密钥管理（系统 keyring，回退 `.encryption_key` 文件）；`qrcode.rs` 扫码会话（终端/Unicode/PNG 渲染，轮询 3s、5 分钟超时）；`bootstrap.rs` botid+secret 签名换 token（`sha256(secret+bot_id+time+nonce)`）；`legacy_migration.rs` 启动时旧版 `bot.enc` 自动迁移（失败静默降级、旧文件保留） |
+| `auth/` | 鉴权体系（分层：数据 → 持久 → 解析 → 协议 → 会话）：`types.rs` 数据类型（`Bot` / `Credentials` 凭据总账 / `ResolvedAuthorization` 授权材料枚举，来源内聚于变体）；`store.rs` 单一凭据总账 `credentials.enc` 持久化（bot + token，AES-256-GCM，0600）；`crypto/` 密钥管理（系统 keyring，回退 `.encryption_key` 文件）；`resolve.rs` 授权材料解析（`resolve_authorization`：`WECOM_CLI_ACCESS_TOKEN` 优先、文件回退，文件来源携带同源 bot 凭据）；`bootstrap.rs` botid+secret 签名换 token（`sha256(secret+bot_id+time+nonce)`，无状态协议）；`qrcode.rs` 扫码会话网络流程（轮询 3s、5 分钟超时；渲染在 `cmd/auth.rs`）；`session.rs` `AuthSession` 运行时授权会话（token 内存缓存 + 853004 静默刷新编排，供 `WecomBackend` 委托）；`legacy_migration.rs` 启动时旧版 `bot.enc` 自动迁移（失败静默降级、旧文件保留） |
 | `cmd/auth.rs` | `auth init` / `auth show` 的 clap 定义与处理，经 `CustomCommand` 挂载 |
-| `transport/` | `backend.rs` `WecomBackend`：持有 token 即注入 `Authorization: Bearer`（无 token 忽略；挂 `RequireAuth` 的端点为前置门禁，换取 token 的引导端点挂 `SuppressAuth` 抑制注入），命中 853004 时静默刷新 token 并重放一次（载荷经 `HttpRequestPayload` 工厂重放，multipart 重建表单）；`catalog.rs` 产品层端点目录覆写；`envelope.rs` 网关扁平响应信封 `NestedRes` 与 `FlatRes`；`capability.rs` 鉴权能力标记（`RequireAuth` 门禁 / `SuppressAuth` 抑制注入） |
+| `transport/` | `backend.rs` `WecomBackend` 纯出网装饰器：持有 token 即注入 `Authorization: Bearer`（无 token 忽略；挂 `RequireAuth` 的端点为前置门禁，换取 token 的引导端点挂 `SuppressAuth` 抑制注入）；命中 853004 委托 `auth::AuthSession` 静默刷新并重放一次（载荷经 `HttpRequestPayload` 工厂重放，multipart 重建表单；同源语义——仅 `ResolvedAuthorization::Credentials` 携带同源 bot 可刷新，`Env` 变体直接返回原错误）；`catalog.rs` 产品层端点目录覆写；`envelope.rs` 网关扁平响应信封 `NestedRes` 与 `FlatRes`；`capability.rs` 鉴权能力标记（`RequireAuth` 门禁 / `SuppressAuth` 抑制注入） |
 | `config.rs` | `config.json` 解析（全字段可选）与环境变量应用；env 优先级高于配置文件 |
 | `env.rs` | `WECOM_CLI_*` 环境变量常量 |
 | `logging.rs` | `WECOM_CLI_LOG_LEVEL`（stderr 文本日志）与 `WECOM_CLI_LOG_DIR`（JSON Lines 按天滚动，前缀 `ww.log`，UTC+8） |
@@ -84,7 +84,7 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 - **服务发现**：`/service/discovery` 下发服务目录与 schema；结果缓存于 `<config_dir>/cache`（TTL 60 秒），`cache status`/`cache clear` 管理。
 - **信封双轴**：请求侧 `RequestEnvelope::wrap` 与响应侧 `ResponseEnvelope::parse` 为正交 trait，挂在 `HttpEndpoint` 上。transport 仅含默认实现；网关扁平协议（请求 `{"payload": "<stringified-json>"}`、响应 `{errcode, errmsg, results_json}`）由产品层注入：`PayloadStringReq` 在 `wecom/src/client/catalog.rs`，`NestedRes`/`FlatRes` 在 `wecom-cli/src/transport/envelope.rs`。
 - **端点目录**：非 schema 驱动的 endpoint（服务发现、媒体上传/下载、轮询、schema 方法默认信封）统一登记在 `EndpointCatalog`；`EndpointKey::builtin_default` 提供内建默认，`wecom-cli` 经 `transport::endpoint_catalog()` 覆写（附鉴权能力与扁平信封）。
-- **鉴权注入**：`WecomBackend` 持有 token 即注入 Bearer token（无 token 则忽略）；挂 `RequireAuth` 标记的端点先过前置门禁——无 token 直接报错、请求不发出；换取 token 的鉴权引导端点挂 `SuppressAuth` 抑制注入（避免 853004 刷新自死锁）。token 失效（853004）用 bot 凭据静默换 token 并重放一次。
+- **鉴权注入**：`WecomBackend` 持有 token 即注入 Bearer token（无 token 则忽略）；挂 `RequireAuth` 标记的端点先过前置门禁——无 token 直接报错、请求不发出；换取 token 的鉴权引导端点挂 `SuppressAuth` 抑制注入（避免 853004 刷新自死锁）。token 失效（853004）用同源 bot 凭据静默换 token 并重放一次（仅文件来源 token 可刷新；`WECOM_CLI_ACCESS_TOKEN` 环境变量来源无配套 bot，命中 853004 直接返回原错误）。
 - **长任务轮询**：响应含 `taskid` 时按 `long_task_poll` 配置轮询（`PollClawLongTask`，`polling_interval_ms`/`task_timeout`），超时返回错误。
 - **指令**：schema 中的 `x-wecom-*` 指令在请求前（媒体上传、multipart）与响应后（file-save、octet-stream 落盘）由 `directive/` 处理。
 - **输出路由**：默认 compact JSON 到 stdout；`--output/-o` 把响应体写入指定文件；产生文件的分支（运行时 binary 响应、`x-wecom-file-save` 提取）默认落盘到 `default_output_dir`（缺省 cwd），`--output-dir` 重定向该目录（全局参数，显式声明即走 WriteDir 沙箱校验，纯 JSON 响应不产生文件）；写文件/下载后 stdout 返回 `DownloadResult` JSON；`--page-count` 自动分页并输出 NDJSON。
@@ -99,7 +99,7 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 ```bash
 pnpm fmt         # rustfmt +nightly 格式化全部 Rust 代码
 pnpm lint        # cargo clippy --workspace --all-targets -- -D warnings
-pnpm test        # cargo test --workspace --features custom-endpoint（含 doctest）
+pnpm test        # 串行跑 test:default + test:skip-auth-check（cargo test --workspace --all-targets，feature 组合见 package.json）
 pnpm test:doc    # cargo test --workspace --doc（只跑 doctest）
 pnpm check       # cargo check --workspace --all-targets
 
@@ -122,7 +122,10 @@ Git 钩子由 lefthook 管理（`pnpm install` 时自动安装）：pre-commit �
 
 - 单元测试随源码 `#[cfg(test)]` 模块组织。
 - e2e 分两层：library-level（`crates/wecom/test-e2e/`，wiremock）与 process-level（`crates/wecom-cli/test-e2e/`，assert_cmd + mockito）。每个用例为 `cases/<group>/<NNN>-<slug>/{desc.md,test.rs}`，`desc.md` 规范见 `docs/e2e/DESC_SPEC.md`，代码生成手册见 `docs/e2e/CODEGEN.md`。
-- `custom-endpoint` 为内部 feature（注入 `WECOM_CLI_BASE_URL` 等测试端点），仅用于开发与 e2e，不随发布构建启用，也不写入用户文档。
+- 内部 feature（`wecom-cli` 定义，仅用于开发与测试，不随发布构建启用）：
+  - `custom-endpoint`：允许经环境变量 / `config.json` 覆盖测试端点（`WECOM_CLI_BASE_URL`、`WECOM_CLI_AUTH_ENDPOINT`）。
+  - `skip-auth-check`：跳过 `RequireAuth` 端点的前置 token 门禁（无 token 也放行请求，由后台鉴权错误兜底）。
+- 新增任何 `option_env!` / `env!` 读取的编译期变量，必须同步在 `crates/wecom-cli/build.rs` 登记 `cargo::rerun-if-env-changed`，否则变量变动不触发重编译、缓存产物会烘焙进旧值。
 
 ## 文档地图
 

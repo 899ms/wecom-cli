@@ -27,17 +27,12 @@ fn get_target_platform() -> String {
 
 fn get_build_version() -> String {
     println!("cargo::rerun-if-env-changed=BUILD_SUFFIX");
-    println!("cargo::rerun-if-env-changed=BUILD_COVERAGE");
 
     let mut build_version = env!("CARGO_PKG_VERSION").to_string();
 
     if let Ok(suffix) = std::env::var("BUILD_SUFFIX") {
         build_version.push('-');
         build_version.push_str(&suffix);
-    }
-
-    if std::env::var("BUILD_COVERAGE").unwrap_or_default() == "true" {
-        build_version.push_str("-coverage");
     }
 
     build_version
