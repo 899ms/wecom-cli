@@ -104,7 +104,7 @@ async fn main() {
 }
 
 /// 命令未找到时的提示文案。
-const SKILL_HINT: &str = "该接口不存在，可能未接口命令错误，请更新到最新 skill 后重试";
+const SKILL_HINT: &str = "该接口不存在，可能为接口命令错误，请更新到最新 skill 后重试";
 
 /// 是否为"命令未找到"类错误。
 fn is_subcommand_not_found(err: &wecom::Error) -> bool {
