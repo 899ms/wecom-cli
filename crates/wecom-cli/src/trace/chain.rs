@@ -5,6 +5,12 @@ const MAX_DEPTH: usize = 64;
 struct NodeInfo {
     name: Option<String>,
     ppid: Option<u32>,
+    path: Option<String>,
+}
+
+struct ProcessNode {
+    name: String,
+    path: Option<String>,
 }
 
 enum ChainEnd {
@@ -15,13 +21,18 @@ enum ChainEnd {
 }
 
 struct ProcessChain {
-    names: Vec<String>,
+    nodes: Vec<ProcessNode>,
     end: ChainEnd,
 }
 
 impl ProcessChain {
     fn render(&self, max_len: Option<usize>) -> String {
-        let mut parts: Vec<&str> = self.names.iter().map(|s| s.as_str()).collect();
+        let mut names: Vec<String> = self.nodes.iter().map(|node| node.name.clone()).collect();
+        if cfg!(target_os = "macos") {
+            decorate_macos_process_names(&mut names, &self.nodes);
+        }
+
+        let mut parts: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         match self.end {
             ChainEnd::Root => {}
             ChainEnd::Exited => parts.push("(exited?)"),
@@ -47,41 +58,104 @@ impl ProcessChain {
     }
 }
 
+fn decorate_macos_process_names(names: &mut [String], nodes: &[ProcessNode]) {
+    let app_names: Vec<Option<String>> = nodes
+        .iter()
+        .map(|node| node.path.as_deref().and_then(app_bundle_names))
+        .collect();
+
+    if app_names.iter().any(Option::is_some) {
+        for (name, app_names) in names.iter_mut().zip(app_names) {
+            if let Some(app_names) = app_names {
+                name.push('[');
+                name.push_str(&app_names);
+                name.push(']');
+            }
+        }
+        return;
+    }
+
+    if let Some((index, path)) = nodes.iter().enumerate().rev().find_map(|(index, node)| {
+        node.path
+            .as_deref()
+            .map(|path| (index, redact_macos_username(path)))
+    }) {
+        names[index].push_str("[path=");
+        names[index].push_str(&path);
+        names[index].push(']');
+    }
+}
+
+fn app_bundle_names(path: &str) -> Option<String> {
+    let names = std::path::Path::new(path)
+        .components()
+        .filter_map(|component| {
+            let component = component.as_os_str().to_string_lossy();
+            (component.len() > ".app".len() && component.ends_with(".app"))
+                .then(|| component.into_owned())
+        })
+        .collect::<Vec<_>>();
+
+    (!names.is_empty()).then(|| names.join(" - "))
+}
+
+fn redact_macos_username(path: &str) -> String {
+    const USERS_PREFIX: &str = "/users/";
+
+    let Some(prefix) = path.get(..USERS_PREFIX.len()) else {
+        return path.to_string();
+    };
+    if !prefix.eq_ignore_ascii_case(USERS_PREFIX) {
+        return path.to_string();
+    }
+
+    let rest = &path[USERS_PREFIX.len()..];
+    match rest.find('/') {
+        Some(end) if end > 0 => format!("{}*{}", &path[..USERS_PREFIX.len()], &rest[end..]),
+        None if !rest.is_empty() => format!("{}*", &path[..USERS_PREFIX.len()]),
+        _ => path.to_string(),
+    }
+}
+
 fn build_chain<F>(start: u32, lookup: F) -> ProcessChain
 where
     F: Fn(u32) -> Option<NodeInfo>,
 {
-    let mut names = Vec::new();
+    let mut nodes = Vec::new();
     let mut visited = HashSet::new();
     let mut cur = start;
 
     for _ in 0..MAX_DEPTH {
         let Some(info) = lookup(cur) else {
             return ProcessChain {
-                names,
+                nodes,
                 end: ChainEnd::Exited,
             };
         };
 
         if !visited.insert(cur) {
             return ProcessChain {
-                names,
+                nodes,
                 end: ChainEnd::Loop,
             };
         }
 
-        names.push(info.name.unwrap_or_else(|| "[unknown]".to_string()));
+        let NodeInfo { name, ppid, path } = info;
+        nodes.push(ProcessNode {
+            name: name.unwrap_or_else(|| "[unknown]".to_string()),
+            path,
+        });
 
-        match info.ppid {
+        match ppid {
             None => {
                 return ProcessChain {
-                    names,
+                    nodes,
                     end: ChainEnd::Root,
                 };
             }
             Some(ppid) if ppid == 0 || ppid == cur => {
                 return ProcessChain {
-                    names,
+                    nodes,
                     end: ChainEnd::Root,
                 };
             }
@@ -90,7 +164,7 @@ where
     }
 
     ProcessChain {
-        names,
+        nodes,
         end: ChainEnd::DepthLimited,
     }
 }
@@ -131,7 +205,31 @@ mod platform {
         Some(NodeInfo {
             name,
             ppid: Some(bsd.pbi_ppid),
+            path: process_path(pid),
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_path(pid: u32) -> Option<String> {
+        let mut buffer = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let size = unsafe {
+            libc::proc_pidpath(
+                pid as i32,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len() as u32,
+            )
+        };
+        if size <= 0 {
+            return None;
+        }
+
+        let bytes = &buffer[..size as usize];
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        let path = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        (!path.is_empty()).then_some(path)
     }
 
     // /proc 是内核虚拟文件系统而非用户文件，不纳入 Fs 沙箱（沙箱根不可能包含
@@ -149,6 +247,7 @@ mod platform {
         Some(NodeInfo {
             name,
             ppid: Some(ppid),
+            path: None,
         })
     }
 
@@ -182,6 +281,7 @@ mod platform {
                         result = Some(NodeInfo {
                             name: (!name.is_empty()).then_some(name),
                             ppid: Some(entry.th32ParentProcessID),
+                            path: None,
                         });
                         break;
                     }
@@ -203,6 +303,7 @@ mod platform {
                 .ok()
                 .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())),
             ppid: None,
+            path: None,
         })
     }
 }
@@ -227,8 +328,115 @@ mod tests {
             m.get(&pid).map(|(name, ppid)| NodeInfo {
                 name: name.map(|s| s.to_string()),
                 ppid: *ppid,
+                path: None,
             })
         }
+    }
+
+    fn node(name: &str, path: &str) -> ProcessNode {
+        ProcessNode {
+            name: name.to_string(),
+            path: Some(path.to_string()),
+        }
+    }
+
+    #[test]
+    fn macos_path_collects_all_app_bundle_names() {
+        assert_eq!(
+            app_bundle_names(
+                "/Applications/MyApp.app/Contents/Frameworks/Electron.app/Contents/MacOS/Electron"
+            ),
+            Some("MyApp.app - Electron.app".to_string())
+        );
+        assert_eq!(app_bundle_names("/usr/local/bin/node"), None);
+    }
+
+    #[test]
+    fn macos_decorates_each_process_with_all_app_bundle_names() {
+        let nodes = vec![
+            node(
+                "Electron",
+                "/Applications/MyApp.app/Contents/Frameworks/Electron.app/Contents/MacOS/Electron",
+            ),
+            node("helper", "/Applications/Helper.app/Contents/MacOS/helper"),
+            node("launchd", "/sbin/launchd"),
+        ];
+        let mut names = nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<Vec<_>>();
+
+        decorate_macos_process_names(&mut names, &nodes);
+
+        assert_eq!(
+            names,
+            [
+                "Electron[MyApp.app - Electron.app]",
+                "helper[Helper.app]",
+                "launchd"
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_without_app_reports_users_path_with_redacted_username() {
+        let nodes = vec![
+            node("wecom-cli", "/opt/wecom/bin/wecom-cli"),
+            node("node", "/usr/local/bin/node"),
+            node("Electron", "/Users/alice/tools/Electron"),
+        ];
+        let mut names = nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<Vec<_>>();
+
+        decorate_macos_process_names(&mut names, &nodes);
+
+        assert_eq!(
+            names,
+            [
+                "wecom-cli",
+                "node",
+                "Electron[path=/Users/*/tools/Electron]"
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_users_path_redacts_only_username() {
+        assert_eq!(
+            redact_macos_username("/Users/alice/workspace/project/bin"),
+            "/Users/*/workspace/project/bin"
+        );
+        assert_eq!(
+            redact_macos_username("/users/alice/Electron"),
+            "/users/*/Electron"
+        );
+        assert_eq!(redact_macos_username("/Users/alice"), "/Users/*");
+        assert_eq!(redact_macos_username("/Users/"), "/Users/");
+        assert_eq!(
+            redact_macos_username("/UsersBackup/alice/Electron"),
+            "/UsersBackup/alice/Electron"
+        );
+    }
+
+    #[test]
+    fn macos_without_app_reports_non_users_full_path_unchanged() {
+        let nodes = vec![
+            node("wecom-cli", "/opt/wecom/bin/wecom-cli"),
+            node("Electron", "/opt/agent/bin/Electron"),
+        ];
+        let mut names = nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<Vec<_>>();
+
+        decorate_macos_process_names(&mut names, &nodes);
+
+        assert_eq!(
+            names,
+            ["wecom-cli", "Electron[path=/opt/agent/bin/Electron]"]
+        );
     }
 
     #[test]
