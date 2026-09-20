@@ -1,5 +1,21 @@
 # @wecom/cli-win32-x64
 
+## 1.3.1
+
+### Patch Changes
+
+- 5ee712c: 修正两处面向用户可感知的行为
+  - env 来源 token 过期（后台 errcode 853004）时返回鉴权错误，指明 `WECOM_CLI_ACCESS_TOKEN` 已过期、需更新该环境变量后重试（此前该提示因刷新裁决前置门禁而不可达，用户只能看到原始业务错误）。
+  - 修正编译期端点注入的构建缓存问题：`build.rs` 补登记 `WECOM_CLI_BASE_URL` / `WECOM_CLI_AUTH_ENDPOINT` 的 `rerun-if-env-changed`，构建时改动这两个变量现在会触发重新编译，不再复用缓存产物、把旧端点烘焙进二进制。
+- 5ee712c: 支持在构建时通过 WECOM_CLI_BASE_URL 指定默认请求端点
+  - 构建时设置该环境变量即烘焙为默认 base URL，无需启用 `custom-endpoint` feature。
+  - 优先级：运行时来源（`custom-endpoint` 下的 `WECOM_CLI_BASE_URL` 环境变量 / `config.json`）> 构建时值 > 内置默认端点。
+- bdb0677: 优化调用链信息
+- 5ee712c: 支持 WECOM_CLI_ACCESS_TOKEN 环境变量直接指定 Bearer token
+  - 设置该环境变量即直接提供 access token，优先于 `credentials.enc` 中保存的 token；空值视为未设置，回退文件来源。
+  - 该来源不配套 bot 凭据：token 失效（后台 errcode 853004）时不发起静默刷新，返回鉴权错误提示更新该环境变量后重试。
+  - 取消 `custom-access-token` 编译开关，所有构建均生效。
+
 ## 1.3.0
 
 ### Minor Changes
