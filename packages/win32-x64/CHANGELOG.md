@@ -1,5 +1,11 @@
 # @wecom/cli-win32-x64
 
+## 1.3.2
+
+### Patch Changes
+
+- a373c49: 优化调用链信息
+
 ## 1.3.1
 
 ### Patch Changes
