@@ -1,6 +1,11 @@
 use std::collections::HashSet;
 
 const MAX_DEPTH: usize = 64;
+const DSH_ENV_MARKERS: [(&str, &str); 3] = [
+    ("DSH_SHELL", "dsh-shell"),
+    ("DSH_SESSION_ID", "dsh-session"),
+    ("DSH_HOME", "dsh-home"),
+];
 
 struct NodeInfo {
     name: Option<String>,
@@ -26,11 +31,20 @@ struct ProcessChain {
 }
 
 impl ProcessChain {
+    #[cfg(test)]
     fn render(&self, max_len: Option<usize>) -> String {
+        self.render_with_env(max_len, |_| false)
+    }
+
+    fn render_with_env<F>(&self, max_len: Option<usize>, env_exists: F) -> String
+    where
+        F: FnMut(&str) -> bool,
+    {
         let mut names: Vec<String> = self.nodes.iter().map(|node| node.name.clone()).collect();
         if cfg!(target_os = "macos") {
             decorate_macos_process_names(&mut names, &self.nodes);
         }
+        decorate_current_process_name(&mut names, env_exists);
 
         let mut parts: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         match self.end {
@@ -55,6 +69,25 @@ impl ProcessChain {
             out.push_str(p);
         }
         out
+    }
+}
+
+fn decorate_current_process_name<F>(names: &mut [String], mut env_exists: F)
+where
+    F: FnMut(&str) -> bool,
+{
+    let Some(name) = names.first_mut() else {
+        return;
+    };
+
+    let markers = DSH_ENV_MARKERS
+        .into_iter()
+        .filter_map(|(env_name, marker)| env_exists(env_name).then_some(marker))
+        .collect::<Vec<_>>();
+    if !markers.is_empty() {
+        name.push('[');
+        name.push_str(&markers.join(","));
+        name.push(']');
     }
 }
 
@@ -170,7 +203,8 @@ where
 }
 
 pub fn capture_current_capped(max_len: usize) -> String {
-    build_chain(std::process::id(), platform::info).render(Some(max_len))
+    build_chain(std::process::id(), platform::info)
+        .render_with_env(Some(max_len), |name| std::env::var_os(name).is_some())
 }
 
 mod platform {
@@ -338,6 +372,58 @@ mod tests {
             name: name.to_string(),
             path: Some(path.to_string()),
         }
+    }
+
+    #[test]
+    fn dsh_env_markers_cover_all_combinations() {
+        let chain = build_chain(
+            10,
+            map_lookup(HashMap::from([
+                (10, (Some("wecom-cli"), Some(20))),
+                (20, (Some("parent"), Some(0))),
+            ])),
+        );
+        let cases: &[(&[&str], &str)] = &[
+            (&[], "wecom-cli < parent"),
+            (&["DSH_SHELL"], "wecom-cli[dsh-shell] < parent"),
+            (&["DSH_SESSION_ID"], "wecom-cli[dsh-session] < parent"),
+            (&["DSH_HOME"], "wecom-cli[dsh-home] < parent"),
+            (
+                &["DSH_SHELL", "DSH_SESSION_ID"],
+                "wecom-cli[dsh-shell,dsh-session] < parent",
+            ),
+            (
+                &["DSH_SHELL", "DSH_HOME"],
+                "wecom-cli[dsh-shell,dsh-home] < parent",
+            ),
+            (
+                &["DSH_SESSION_ID", "DSH_HOME"],
+                "wecom-cli[dsh-session,dsh-home] < parent",
+            ),
+            (
+                &["DSH_SHELL", "DSH_SESSION_ID", "DSH_HOME"],
+                "wecom-cli[dsh-shell,dsh-session,dsh-home] < parent",
+            ),
+        ];
+
+        for &(present, expected) in cases {
+            assert_eq!(
+                chain.render_with_env(None, |name| present.contains(&name)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn dsh_env_markers_only_decorate_current_process() {
+        let mut names = vec!["wecom-cli".to_string(), "parent".to_string()];
+
+        decorate_current_process_name(&mut names, |_| true);
+
+        assert_eq!(
+            names,
+            ["wecom-cli[dsh-shell,dsh-session,dsh-home]", "parent"]
+        );
     }
 
     #[test]
