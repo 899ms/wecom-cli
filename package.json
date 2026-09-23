@@ -1,6 +1,6 @@
 {
   "name": "@wecom/cli",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "The official CLI for WeCom",
   "keywords": [
     "wecom-cli"
