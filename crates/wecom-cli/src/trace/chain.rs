@@ -1,10 +1,17 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, ffi::OsStr};
 
 const MAX_DEPTH: usize = 64;
-const DSH_ENV_MARKERS: [(&str, &str); 3] = [
-    ("DSH_SHELL", "dsh-shell"),
-    ("DSH_SESSION_ID", "dsh-session"),
-    ("DSH_HOME", "dsh-home"),
+const ENV_PREFIX_MARKERS: [(&str, &str); 10] = [
+    ("DSH_", "DSH"),
+    ("QODER_", "QODER"),
+    ("QODERCN_", "QODER"),
+    ("QODERCLI_", "QODER"),
+    ("TRAE_", "TRAE"),
+    ("COMATE_", "COMATE"),
+    ("CODEBUDDY_", "CODEBUDDY"),
+    ("KNOT_", "KNOT"),
+    ("WORKBUDDY_", "WORKBUDDY"),
+    ("ZCODE_", "ZCODE"),
 ];
 
 struct NodeInfo {
@@ -33,18 +40,19 @@ struct ProcessChain {
 impl ProcessChain {
     #[cfg(test)]
     fn render(&self, max_len: Option<usize>) -> String {
-        self.render_with_env(max_len, |_| false)
+        self.render_with_env(max_len, std::iter::empty::<&str>())
     }
 
-    fn render_with_env<F>(&self, max_len: Option<usize>, env_exists: F) -> String
+    fn render_with_env<I, S>(&self, max_len: Option<usize>, env_names: I) -> String
     where
-        F: FnMut(&str) -> bool,
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
     {
         let mut names: Vec<String> = self.nodes.iter().map(|node| node.name.clone()).collect();
         if cfg!(target_os = "macos") {
             decorate_macos_process_names(&mut names, &self.nodes);
         }
-        decorate_current_process_name(&mut names, env_exists);
+        decorate_current_process_name(&mut names, env_names);
 
         let mut parts: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         match self.end {
@@ -72,18 +80,29 @@ impl ProcessChain {
     }
 }
 
-fn decorate_current_process_name<F>(names: &mut [String], mut env_exists: F)
+fn decorate_current_process_name<I, S>(names: &mut [String], env_names: I)
 where
-    F: FnMut(&str) -> bool,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
 {
     let Some(name) = names.first_mut() else {
         return;
     };
 
-    let markers = DSH_ENV_MARKERS
-        .into_iter()
-        .filter_map(|(env_name, marker)| env_exists(env_name).then_some(marker))
-        .collect::<Vec<_>>();
+    let mut prefix_matches = [false; ENV_PREFIX_MARKERS.len()];
+    for env_name in env_names {
+        let env_name = env_name.as_ref().to_string_lossy().to_ascii_uppercase();
+        for (index, (prefix, _)) in ENV_PREFIX_MARKERS.iter().enumerate() {
+            prefix_matches[index] |= env_name.starts_with(prefix);
+        }
+    }
+    let mut markers = Vec::new();
+    for (index, (_, marker)) in ENV_PREFIX_MARKERS.into_iter().enumerate() {
+        if prefix_matches[index] && !markers.contains(&marker) {
+            markers.push(marker);
+        }
+    }
+
     if !markers.is_empty() {
         name.push('[');
         name.push_str(&markers.join(","));
@@ -204,7 +223,7 @@ where
 
 pub fn capture_current_capped(max_len: usize) -> String {
     build_chain(std::process::id(), platform::info)
-        .render_with_env(Some(max_len), |name| std::env::var_os(name).is_some())
+        .render_with_env(Some(max_len), std::env::vars_os().map(|(name, _)| name))
 }
 
 mod platform {
@@ -374,56 +393,177 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dsh_env_markers_cover_all_combinations() {
-        let chain = build_chain(
+    fn single_node_chain() -> ProcessChain {
+        build_chain(
             10,
-            map_lookup(HashMap::from([
-                (10, (Some("wecom-cli"), Some(20))),
-                (20, (Some("parent"), Some(0))),
-            ])),
-        );
-        let cases: &[(&[&str], &str)] = &[
-            (&[], "wecom-cli < parent"),
-            (&["DSH_SHELL"], "wecom-cli[dsh-shell] < parent"),
-            (&["DSH_SESSION_ID"], "wecom-cli[dsh-session] < parent"),
-            (&["DSH_HOME"], "wecom-cli[dsh-home] < parent"),
-            (
-                &["DSH_SHELL", "DSH_SESSION_ID"],
-                "wecom-cli[dsh-shell,dsh-session] < parent",
-            ),
-            (
-                &["DSH_SHELL", "DSH_HOME"],
-                "wecom-cli[dsh-shell,dsh-home] < parent",
-            ),
-            (
-                &["DSH_SESSION_ID", "DSH_HOME"],
-                "wecom-cli[dsh-session,dsh-home] < parent",
-            ),
-            (
-                &["DSH_SHELL", "DSH_SESSION_ID", "DSH_HOME"],
-                "wecom-cli[dsh-shell,dsh-session,dsh-home] < parent",
-            ),
-        ];
+            map_lookup(HashMap::from([(10, (Some("wecom-cli"), Some(0)))])),
+        )
+    }
 
-        for &(present, expected) in cases {
+    struct EnvMarkerCase {
+        marker: &'static str,
+        detected: &'static [&'static str],
+        ignored: &'static [&'static str],
+    }
+
+    const ENV_MARKER_CASES: &[EnvMarkerCase] = &[
+        EnvMarkerCase {
+            marker: "DSH",
+            detected: &["DSH_SHELL", "DSH_SESSION_ID", "DSH_HOME", "DSH_FUTURE"],
+            ignored: &["DSH", "OTHER_DSH_VALUE"],
+        },
+        EnvMarkerCase {
+            marker: "QODER",
+            detected: &[
+                "QODER_SECURITY_SCAN_SETTINGS_JSON",
+                "QODER_WINDOWS_SHELL_KIND",
+                "QODERCN_AGENT",
+                "QODERCN_CLI",
+                "QODERCLI_RUNTIME_PACKAGING",
+            ],
+            ignored: &["QODER", "QODERCN", "QODERCLI", "OTHER_QODER_VALUE"],
+        },
+        EnvMarkerCase {
+            marker: "TRAE",
+            detected: &[
+                "TRAE_USER_CLOUDIDE_TOKEN_BLOB",
+                "TRAE_BRAND_NAME",
+                "TRAE_STATIC_CLIENT_TYPE",
+                "TRAE_SANDBOX_SBOX_ID",
+                "TRAE_SANDBOX_LOG_DIR",
+            ],
+            ignored: &["TRAE", "OTHER_TRAE_VALUE"],
+        },
+        EnvMarkerCase {
+            marker: "COMATE",
+            detected: &[
+                "COMATE_CLIENT_SCENE",
+                "COMATE_CLIENT_TYPE",
+                "COMATE_ENGINE_PLATFORM",
+                "COMATE_VERSION",
+            ],
+            ignored: &["COMATE", "OTHER_COMATE_VALUE"],
+        },
+        EnvMarkerCase {
+            marker: "CODEBUDDY",
+            detected: &[
+                "CODEBUDDY_CONVERSATION_MESSAGE_ID",
+                "CODEBUDDY_COPILOT_INTERNET_ENVIRONMENT",
+                "CODEBUDDY_SAFE_DELETE_ENABLED",
+                "CODEBUDDY_SESSION_ID",
+                "CODEBUDDY_TOOL_CALL_ID",
+            ],
+            ignored: &["CODEBUDDY", "OTHER_CODEBUDDY_VALUE"],
+        },
+        EnvMarkerCase {
+            marker: "KNOT",
+            detected: &["KNOT_JWT_TOKEN", "KNOT_AGENT_ID"],
+            ignored: &["KNOT", "OTHER_KNOT_VALUE"],
+        },
+        EnvMarkerCase {
+            marker: "WORKBUDDY",
+            detected: &[
+                "WORKBUDDY_CONNECTOR_PROXY_FINGERPRINT",
+                "WORKBUDDY_PRODUCT_NAME",
+                "WORKBUDDY_RESOURCES_PATH",
+                "WORKBUDDY_STARTUP_PID",
+                "WORKBUDDY_USER_DATA_DIR",
+            ],
+            ignored: &["WORKBUDDY", "OTHER_WORKBUDDY_VALUE", "WebStorm"],
+        },
+        EnvMarkerCase {
+            marker: "ZCODE",
+            detected: &[
+                "ZCODE_APP_VERSION",
+                "ZCODE_PROCESS_LABEL",
+                "ZCODE_WINDOWS_APP_INSTALL_DIR",
+            ],
+            ignored: &[
+                "ZCODE",
+                "OTHER_ZCODE_VALUE",
+                "ZAI_BUSINESS_BASE_URL",
+                "ZAI_OAUTH_CLIENT_ID",
+            ],
+        },
+    ];
+
+    #[test]
+    fn env_marker_cases_cover_every_marker_in_the_table() {
+        let mut expected: Vec<&str> = ENV_PREFIX_MARKERS.iter().map(|(_, m)| *m).collect();
+        expected.dedup();
+        let actual: Vec<&str> = ENV_MARKER_CASES.iter().map(|c| c.marker).collect();
+        assert_eq!(actual, expected, "测试表与 ENV_PREFIX_MARKERS 不一致");
+    }
+
+    #[test]
+    fn env_marker_is_detected_once_per_brand() {
+        let chain = single_node_chain();
+        for case in ENV_MARKER_CASES {
             assert_eq!(
-                chain.render_with_env(None, |name| present.contains(&name)),
-                expected
+                chain.render_with_env(None, case.detected),
+                format!("wecom-cli[{}]", case.marker),
+                "marker={}",
+                case.marker
             );
         }
     }
 
     #[test]
-    fn dsh_env_markers_only_decorate_current_process() {
-        let mut names = vec!["wecom-cli".to_string(), "parent".to_string()];
+    fn env_marker_requires_the_underscore() {
+        let chain = single_node_chain();
+        for case in ENV_MARKER_CASES {
+            assert_eq!(
+                chain.render_with_env(None, case.ignored),
+                "wecom-cli",
+                "marker={}",
+                case.marker
+            );
+        }
+    }
 
-        decorate_current_process_name(&mut names, |_| true);
+    #[test]
+    fn env_marker_prefix_is_case_insensitive() {
+        assert_eq!(
+            single_node_chain().render_with_env(
+                None,
+                ["dsh_shell", "Trae_Brand_Name", "CodeBuddy_Session_Id"],
+            ),
+            "wecom-cli[DSH,TRAE,CODEBUDDY]"
+        );
+    }
+
+    #[test]
+    fn with_env_prefix_is_not_a_marker() {
+        assert_eq!(
+            single_node_chain().render_with_env(
+                None,
+                ["WITH_BUNDLE_IDENTIFIER", "WITH_HOST_PID", "WITH_OPENSSL"],
+            ),
+            "wecom-cli"
+        );
+    }
+
+    #[test]
+    fn env_markers_share_one_decoration_in_table_order() {
+        let mut env_names: Vec<&str> = ENV_MARKER_CASES
+            .iter()
+            .flat_map(|case| case.detected.iter().copied())
+            .collect();
+        env_names.reverse();
 
         assert_eq!(
-            names,
-            ["wecom-cli[dsh-shell,dsh-session,dsh-home]", "parent"]
+            single_node_chain().render_with_env(None, env_names),
+            "wecom-cli[DSH,QODER,TRAE,COMATE,CODEBUDDY,KNOT,WORKBUDDY,ZCODE]"
         );
+    }
+
+    #[test]
+    fn env_markers_only_decorate_current_process() {
+        let mut names = vec!["wecom-cli".to_string(), "parent".to_string()];
+
+        decorate_current_process_name(&mut names, ["DSH_SHELL", "KNOT_JWT_TOKEN"]);
+
+        assert_eq!(names, ["wecom-cli[DSH,KNOT]", "parent"]);
     }
 
     #[test]

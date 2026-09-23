@@ -64,7 +64,7 @@ Cargo workspace（`resolver = "3"`，edition 2024）+ pnpm workspace（仅管理
 | `config.rs` | `config.json` 解析（全字段可选）与环境变量应用；env 优先级高于配置文件 |
 | `env.rs` | `WECOM_CLI_*` 环境变量常量 |
 | `logging.rs` | `WECOM_CLI_LOG_LEVEL`（stderr 文本日志）与 `WECOM_CLI_LOG_DIR`（JSON Lines 按天滚动，前缀 `ww.log`，UTC+8） |
-| `trace/` | 调用链追踪：`chain.rs` 采集进程父链（自身→父→…→根，仅进程名、超长截断，macOS/Linux/Windows 三平台取父进程）；`trace_id.rs` 生成辅助唯一 ID（base64 GUID）；`mod.rs` 拼装并 base64 编码为 `X-WeCom-Trace` 头值（`main.rs` 注入为默认请求头） |
+| `trace/` | 调用链追踪：`chain.rs` 采集进程父链（自身→父→…→根，以进程名为主并附带少量运行环境标记，超长截断，macOS/Linux/Windows 三平台取父进程）；`trace_id.rs` 生成辅助唯一 ID（base64 GUID）；`mod.rs` 拼装并 base64 编码为 `X-WeCom-Trace` 头值（`main.rs` 注入为默认请求头） |
 | `telemetry.rs` | JSON 自动修复监听：修复成功时向 stderr 输出修复前后对照 |
 | `error.rs` | bin 层统一错误（错误码段 893200–893299） |
 
