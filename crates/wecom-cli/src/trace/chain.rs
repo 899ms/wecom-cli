@@ -402,19 +402,19 @@ mod tests {
 
     struct EnvMarkerCase {
         marker: &'static str,
-        detected: &'static [&'static str],
+        matched_tags: &'static [&'static str],
         ignored: &'static [&'static str],
     }
 
     const ENV_MARKER_CASES: &[EnvMarkerCase] = &[
         EnvMarkerCase {
             marker: "DSH",
-            detected: &["DSH_SHELL", "DSH_SESSION_ID", "DSH_HOME", "DSH_FUTURE"],
+            matched_tags: &["DSH_SHELL", "DSH_SESSION_ID", "DSH_HOME", "DSH_FUTURE"],
             ignored: &["DSH", "OTHER_DSH_VALUE"],
         },
         EnvMarkerCase {
             marker: "QODER",
-            detected: &[
+            matched_tags: &[
                 "QODER_SECURITY_SCAN_SETTINGS_JSON",
                 "QODER_WINDOWS_SHELL_KIND",
                 "QODERCN_AGENT",
@@ -425,7 +425,7 @@ mod tests {
         },
         EnvMarkerCase {
             marker: "TRAE",
-            detected: &[
+            matched_tags: &[
                 "TRAE_USER_CLOUDIDE_TOKEN_BLOB",
                 "TRAE_BRAND_NAME",
                 "TRAE_STATIC_CLIENT_TYPE",
@@ -436,7 +436,7 @@ mod tests {
         },
         EnvMarkerCase {
             marker: "COMATE",
-            detected: &[
+            matched_tags: &[
                 "COMATE_CLIENT_SCENE",
                 "COMATE_CLIENT_TYPE",
                 "COMATE_ENGINE_PLATFORM",
@@ -446,7 +446,7 @@ mod tests {
         },
         EnvMarkerCase {
             marker: "CODEBUDDY",
-            detected: &[
+            matched_tags: &[
                 "CODEBUDDY_CONVERSATION_MESSAGE_ID",
                 "CODEBUDDY_COPILOT_INTERNET_ENVIRONMENT",
                 "CODEBUDDY_SAFE_DELETE_ENABLED",
@@ -457,12 +457,12 @@ mod tests {
         },
         EnvMarkerCase {
             marker: "KNOT",
-            detected: &["KNOT_JWT_TOKEN", "KNOT_AGENT_ID"],
+            matched_tags: &["KNOT_JWT_TOKEN", "KNOT_AGENT_ID"],
             ignored: &["KNOT", "OTHER_KNOT_VALUE"],
         },
         EnvMarkerCase {
             marker: "WORKBUDDY",
-            detected: &[
+            matched_tags: &[
                 "WORKBUDDY_CONNECTOR_PROXY_FINGERPRINT",
                 "WORKBUDDY_PRODUCT_NAME",
                 "WORKBUDDY_RESOURCES_PATH",
@@ -473,7 +473,7 @@ mod tests {
         },
         EnvMarkerCase {
             marker: "ZCODE",
-            detected: &[
+            matched_tags: &[
                 "ZCODE_APP_VERSION",
                 "ZCODE_PROCESS_LABEL",
                 "ZCODE_WINDOWS_APP_INSTALL_DIR",
@@ -496,11 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn env_marker_is_detected_once_per_brand() {
+    fn env_marker_has_matched_tags_once_per_brand() {
         let chain = single_node_chain();
         for case in ENV_MARKER_CASES {
             assert_eq!(
-                chain.render_with_env(None, case.detected),
+                chain.render_with_env(None, case.matched_tags),
                 format!("wecom-cli[{}]", case.marker),
                 "marker={}",
                 case.marker
@@ -547,7 +547,7 @@ mod tests {
     fn env_markers_share_one_decoration_in_table_order() {
         let mut env_names: Vec<&str> = ENV_MARKER_CASES
             .iter()
-            .flat_map(|case| case.detected.iter().copied())
+            .flat_map(|case| case.matched_tags.iter().copied())
             .collect();
         env_names.reverse();
 
