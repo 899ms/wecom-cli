@@ -1,5 +1,11 @@
 # @wecom/cli
 
+## 1.3.3
+
+### Patch Changes
+
+- 4a1ec97: 增强 trace 调用来源识别能力，支持识别更多客户端，并统一同品牌来源标记。
+
 ## 1.3.2
 
 ### Patch Changes
